@@ -412,14 +412,14 @@ getForBookmark: highlightsProcedure
 // packages/shared/types/highlights.ts
 {
   id: string,
+  userId: string,         // 高亮创建者ID
   bookmarkId: string,
-  text: string,           // 高亮的文本内容
+  text: string | null,    // 高亮的文本内容（可空）
   startOffset: number,    // HTML中的起始位置（文本字符偏移）
   endOffset: number,      // HTML中的结束位置（文本字符偏移）
-  color: string,          // 高亮颜色 (#hex)
-  note: string | null,    // 用户批注
+  color: "yellow" | "red" | "green" | "blue",  // 高亮颜色枚举（默认yellow）
+  note: string | null,    // 用户批注（可空）
   createdAt: Date,
-  updatedAt: Date,
 }
 ```
 
@@ -602,14 +602,19 @@ getForBookmark: highlightsProcedure
 3. **可扩展性**：可单独支持高亮搜索、导出、分享等功能
 4. **并发友好**：多个用户可各自添加高亮，互不干扰
 
-### 4.3 阅读进度设计
+### 4.3 高亮定位设计
 
-**偏移量设计**：使用字节偏移量 (`startOffset`, `endOffset`) 而非 DOM 节点定位
+**偏移量设计**：使用文本字符偏移量 (`startOffset`, `endOffset`) 而非 DOM 节点定位
+
+**核心实现逻辑**（`BookmarkHtmlHighlighter.tsx`）：
+- **正向计算**（创建高亮）：TreeWalker 遍历所有文本节点，累积 `textContent.length` 计算全局偏移
+- **反向定位**（还原高亮）：根据偏移量反查文本节点，计算局部偏移后用 `splitText()` 拆分 DOM 节点
 
 **优势**：
-1. 与HTML解析库解耦，跨端兼容（Web React / React Native）
-2. 不受前端渲染框架影响
-3. 支持大文档快速定位（无需解析完整DOM）
+1. 与HTML解析库解耦，跨端兼容（Web React / React Native WebView）
+2. 不受前端渲染框架影响，纯 DOM API 实现
+3. 支持大文档快速定位（无需解析完整 DOM，TreeWalker 高效遍历）
+4. 高亮数据可序列化存储，便于数据迁移和导出
 
 ---
 
