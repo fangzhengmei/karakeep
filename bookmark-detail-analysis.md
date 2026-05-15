@@ -414,14 +414,23 @@ getForBookmark: highlightsProcedure
   id: string,
   bookmarkId: string,
   text: string,           // 高亮的文本内容
-  startOffset: number,    // HTML中的起始位置（字节）
-  endOffset: number,      // HTML中的结束位置（字节）
+  startOffset: number,    // HTML中的起始位置（文本字符偏移）
+  endOffset: number,      // HTML中的结束位置（文本字符偏移）
   color: string,          // 高亮颜色 (#hex)
   note: string | null,    // 用户批注
   createdAt: Date,
   updatedAt: Date,
 }
 ```
+
+**偏移值计算依据**（基于 DOM Range API）：
+1. 使用 `document.createTreeWalker` 遍历 HTML 中所有文本节点（`NodeFilter.SHOW_TEXT`）
+2. 累积每个文本节点的 `textContent.length`，计算每个文本节点的全局偏移量
+3. 用户选中文本后，通过 `window.getSelection().getRangeAt(0)` 获取 DOM Range
+4. **公式**：
+   - `startOffset = 文本节点全局偏移量 + range.startOffset`
+   - `endOffset = 文本节点全局偏移量 + range.endOffset`
+5. 反向定位时，根据偏移量找到对应文本节点和局部位置，再用 `range.setStart()`/`setEnd()` 还原选区
 
 #### 3.5 阅读模式渲染落点
 
