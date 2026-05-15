@@ -2,15 +2,16 @@
 
 ## 一、整体架构概述
 
-Karakeep 采用现代化的全栈架构，前端使用 React + React Native，后端使用 tRPC + Drizzle ORM，实现端到端的类型安全。
+Karakeep 采用现代化的全栈架构，移动端使用 React Native + Expo Router，后端使用 tRPC + Drizzle ORM，实现端到端的类型安全。
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         客户端层                                   │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐     │
-│  │ React Page  │───▶│ React Query │───▶│ tRPC Client     │     │
-│  │ (Next.js)   │    │ (TanStack)  │    │ (Type-Safe)     │     │
-│  └─────────────┘    └─────────────┘    └─────────────────┘     │
+│                         客户端层（React Native）                   │
+│  ┌────────────────┐    ┌─────────────┐    ┌─────────────────┐   │
+│  │ Expo Router    │───▶│ React Query │───▶│ tRPC Client     │   │
+│  │ (File-based    │    │ (TanStack)  │    │ (Type-Safe)     │   │
+│  │  Routing)      │    │             │    │                 │   │
+│  └────────────────┘    └─────────────┘    └─────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼ HTTP
@@ -42,7 +43,7 @@ const onOpenBookmark = (bookmark: ZBookmark) => {
     bookmark.content.type === BookmarkTypes.LINK &&
     settings.defaultBookmarkView === "externalBrowser"
   ) {
-    // 分支A：直接调用系统浏览器打开
+    // 分支A：直接调用系统浏览器打开（React Native Linking API）
     void Linking.openURL(bookmark.content.url).catch(() => {
       // 兜底：外部浏览器打开失败时，仍然跳转详情页
       toast({ message: "Failed to open link", variant: "destructive" });
@@ -51,7 +52,7 @@ const onOpenBookmark = (bookmark: ZBookmark) => {
     return;
   }
 
-  // 分支B：正常跳转到应用内详情页
+  // 分支B：正常跳转到应用内详情页（Expo Router 文件路由）
   router.push(`/dashboard/bookmarks/${bookmark.id}`);
 };
 ```
@@ -60,7 +61,7 @@ const onOpenBookmark = (bookmark: ZBookmark) => {
 **文件位置**：`apps/mobile/lib/settings.ts:37-63`
 
 ```typescript
-// 设置 Schema 定义
+// 设置 Schema 定义（Zod + SecureStore 持久化）
 const zSettingsSchema = z.object({
   defaultBookmarkView: z
     .enum(["reader", "browser", "externalBrowser"])
@@ -88,8 +89,8 @@ const zSettingsSchema = z.object({
         │                    │
         ▼                    ▼
 ┌───────────────┐  ┌──────────────────┐
-│ Linking.openURL│  │ router.push(详情页) │
-│ (系统浏览器)   │  │ 应用内渲染        │
+│ Linking.openURL│  │ Expo Router      │
+│ (系统浏览器)   │  │ router.push(详情页) │
 └───────┬───────┘  └──────────────────┘
         │
         ▼ 失败兜底
@@ -104,21 +105,24 @@ const zSettingsSchema = z.object({
 | 参数 | 来源 | 说明 | 渲染落点 |
 |------|------|------|----------|
 | `bookmark.content.type` | 书签数据 | 书签类型枚举 | 分支判断条件 |
-| `settings.defaultBookmarkView` | SecureStore 本地存储 | 用户偏好设置 | 视图模式选择 |
-| `bookmark.content.url` | 书签内容 | 网页 URL | 外部浏览器参数 |
-| `bookmark.id` | 书签元数据 | 书签唯一标识 | 路由参数 |
+| `settings.defaultBookmarkView` | Expo SecureStore 本地存储 | 用户偏好设置 | 视图模式选择 |
+| `bookmark.content.url` | 书签内容 | 网页 URL | React Native Linking API 参数 |
+| `bookmark.id` | 书签元数据 | 书签唯一标识 | Expo Router 路由参数 |
 
 ---
 
 ### 流程二：详情页首次请求（获取元数据）
 
 #### 2.1 触发条件
-- **触发时机**：进入 `apps/mobile/app/dashboard/bookmarks/[slug]/index.tsx` 页面时
+- **触发时机**：进入 `apps/mobile/app/dashboard/bookmarks/[slug]/index.tsx` 页面时（Expo Router 文件路由）
 - **触发位置**：`index.tsx:42-57`
 
 #### 2.2 请求参数详解
 ```typescript
-// 详情页首次请求
+// 详情页首次请求（React Native 页面初始化）
+const { slug } = useLocalSearchParams(); // Expo Router 路由参数 Hook
+const api = useTRPC();
+
 const { data: bookmark, error, refetch } = useQuery(
   api.bookmarks.getBookmark.queryOptions({
     bookmarkId: slug,          // 路由参数：书签ID
@@ -226,7 +230,7 @@ static async fromId(ctx, bookmarkId, includeContent) {
 
 ```typescript
 // index.tsx:67-141
-// 根据书签类型分发渲染组件
+// 根据书签类型分发渲染组件（React Native Native Components）
 switch (bookmark.content.type) {
   case BookmarkTypes.LINK:
     comp = (
@@ -246,20 +250,20 @@ switch (bookmark.content.type) {
 ```
 
 **底部操作栏渲染**：
-- 所有模式下都立即渲染 BottomActions
-- 包含收藏、归档、标签管理、列表管理、分享等操作
+- 所有模式下都立即渲染 BottomActions（React Native View 组件）
+- 包含收藏、归档、标签管理、列表管理、分享等操作按钮
 - 不依赖 HTML 内容
 
 #### 2.6 首次请求数据流图
 ```
-router.push("/[slug]")
+router.push("/dashboard/bookmarks/[slug]")
         │
         ▼
-┌─────────────────────────┐
-│ Expo Router 页面初始化   │
-│ useLocalSearchParams()  │
-│ slug = bookmarkId       │
-└─────────────┬───────────┘
+┌─────────────────────────────────────┐
+│ Expo Router 页面初始化               │
+│ useLocalSearchParams()              │
+│ slug = bookmarkId                   │
+└─────────────┬───────────────────────┘
               │
               ▼
 ┌─────────────────────────────────────┐
@@ -296,11 +300,12 @@ router.push("/[slug]")
               │
               ▼
 ┌─────────────────────────────────────┐
-│ 渲染页面框架                         │
-│ - 导航栏 (标题、设置按钮)            │
+│ React Native 渲染页面框架            │
+│ - Stack Navigation 导航栏           │
+│   (标题、Stack.Screen options)      │
 │ - BookmarkLinkView                  │
 │   → BookmarkLinkReaderPreview (待加载) │
-│ - BottomActions (收藏/归档等)        │
+│ - BottomActions (收藏/归档等按钮)    │
 └─────────────────────────────────────┘
 ```
 
@@ -309,7 +314,7 @@ router.push("/[slug]")
 ### 流程三：阅读模式二次请求（获取内容 + 高亮数据）
 
 #### 3.1 触发条件
-- **触发时机**：`BookmarkLinkReaderPreview` 组件挂载时
+- **触发时机**：`BookmarkLinkReaderPreview` 组件挂载时（React Native 组件生命周期）
 - **前置条件**：
   1. 首次请求已完成，获取了书签元数据
   2. `bookmarkLinkType === "reader"`（用户选择阅读模式，或默认）
@@ -420,7 +425,7 @@ getForBookmark: highlightsProcedure
 
 #### 3.5 阅读模式渲染落点
 
-**核心渲染组件**：`BookmarkHtmlHighlighterDom`
+**核心渲染组件**：`BookmarkHtmlHighlighterDom`（React Native WebView 封装）
 ```typescript
 // BookmarkLinkPreview.tsx:209-243
 <BookmarkHtmlHighlighterDom
@@ -438,7 +443,7 @@ getForBookmark: highlightsProcedure
   onSavePosition={onSavePosition}
   onScrollPositionChange={onScrollPositionChange}
   
-  // 交互回调
+  // 交互回调（React Native Native Events）
   onLinkPress={handleLinkPress}
   onImagePress={handleImagePress}
   onHighlight={(h) => createHighlight({ ... })}
@@ -451,11 +456,12 @@ getForBookmark: highlightsProcedure
 
 #### 3.6 二次请求数据流图
 ```
-首次请求完成（元数据已渲染）
+首次请求完成（元数据已渲染，React Native 视图已挂载）
         │
         ▼
 ┌─────────────────────────────────────────┐
 │ BookmarkLinkReaderPreview 组件挂载       │
+│ (React Native Component Lifecycle)       │
 └───────────────────┬─────────────────────┘
                     │
     ┌───────────────┴───────────────┐
@@ -485,16 +491,16 @@ getForBookmark: highlightsProcedure
                           │
                           ▼
 ┌──────────────────────────────────────────────────┐
-│ 阅读模式完整渲染                                  │
+│ React Native 阅读模式完整渲染                     │
 │ ┌─────────────────────────────────────────────┐  │
-│ │ 阅读进度横幅（上次阅读到x%）                  │  │
+│ │ 阅读进度横幅（上次阅读到x%，View 组件）      │  │
 │ └─────────────────────────────────────────────┘  │
 │ ┌─────────────────────────────────────────────┐  │
 │ │ BookmarkHtmlHighlighterDom                    │  │
-│ │ - WebView 加载完整HTML                       │  │
-│ │ - 注入高亮样式（用start/endOffset定位）       │  │
-│ │ - 支持选中文本创建新高亮                      │  │
-│ │ - 阅读进度追踪与保存                          │  │
+│ │ - React Native WebView 加载完整HTML          │  │
+│ │ - 注入JS高亮样式（用start/endOffset定位）      │  │
+│ │ - 支持选中文本→创建新高亮                      │  │
+│ │ - 阅读进度恢复/追踪                          │  │
 │ └─────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────┘
 ```
@@ -504,66 +510,66 @@ getForBookmark: highlightsProcedure
 ## 三、完整时序图（三段流程整合）
 
 ```
-┌────────┐                                                       ┌──────────┐
-│ 用户    │                                                       │ 服务端   │
-└───┬────┘                                                       └─────┬────┘
-    │                                                                    │
-    │ 1. 点击列表中 BookmarkCard                                         │
-    │───────────────────────────────────▶                                │
-    │                                                                    │
-    │    ┌──────────────────────────────────────────────────────────┐   │
-    │    │ 流程一：列表→详情跳转判断                                  │   │
-    │    │ ──────────────────────────────────────                   │   │
-    │    │  IF (type == LINK && defaultBookmarkView == external)    │   │
-    │    │    → Linking.openURL(外部浏览器)                          │   │
-    │    │    → 失败兜底: router.push(详情页)                        │   │
-    │    │  ELSE                                                     │   │
-    │    │    → router.push(详情页)                                  │   │
-    │    └──────────────────────────────────────────────────────────┘   │
-    │                                                                    │
-    │ 2. 详情页加载，首次API请求                                         │
-    │    (includeContent: false)                                        │
-    │───────────────────────────────────▶                                │
-    │                                                                    │
-    │    ┌──────────────────────────────────────────────────────────┐   │
-    │    │ 流程二：首次请求（元数据）                                  │   │
-    │    │ ──────────────────────────────────────                   │   │
-    │    │  tRPC: bookmarks.getBookmark                             │   │
-    │    │    → ensureBookmarkAccess (权限验证)                      │   │
-    │    │    → Bookmark.fromId (Drizzle关联查询)                    │   │
-    │    │    → 返回: 元数据 + tags + assets (无HTML)                │   │
-    │    └──────────────────────────────────────────────────────────┘   │
-    │                                                                    │
-    │ ◀───────────────────────────────────                                │
-    │    返回元数据，渲染页面框架                                        │
-    │                                                                    │
-    │ 3. 阅读模式组件挂载，二次并行请求                                  │
-    │───────────────────────────────────▶                                │
-    │                                                                    │
-    │    ┌──────────────────────────────────────────────────────────┐   │
-    │    │ 流程三：阅读模式二次请求                                    │   │
-    │    │ ──────────────────────────────────────                   │   │
-    │    │  调用A: getBookmark (includeContent: true)               │   │
-    │    │    → Bookmark.getBookmarkHtmlContent                      │   │
-    │    │    → 从 assets 读取大HTML或内联HTML                        │   │
-    │    │                                                           │   │
-    │    │  调用B: highlights.getForBookmark (并行)                   │   │
-    │    │    → HighlightsService.getForBookmark                     │   │
-    │    │    → 查询所有高亮记录                                      │   │
-    │    └──────────────────────────────────────────────────────────┘   │
-    │                                                                    │
-    │ ◀───────────────────────────────────                                │
-    │    返回HTML内容 + 高亮数据                                          │
-    │                                                                    │
-    │ 4. 完整阅读模式渲染                                                │
-    │    ┌─────────────────────────────────────────┐                   │
-    │    │ BookmarkHtmlHighlighterDom               │                   │
-    │    │ - WebView 加载 HTML                      │                   │
-    │    │ - 注入高亮样式 (start/endOffset)         │                   │
-    │    │ - 阅读进度恢复/追踪                      │                   │
-    │    │ - 选中文本→创建高亮                      │                   │
-    │    └─────────────────────────────────────────┘                   │
-    │                                                                    │
+┌────────────────┐                                              ┌──────────┐
+│ 用户 (iOS/Android) │                                           │ 服务端   │
+└────────┬───────┘                                              └─────┬────┘
+         │                                                                │
+         │ 1. 点击列表中 BookmarkCard（React Native Pressable）          │
+         │───────────────────────────────────▶                                │
+         │                                                                    │
+         │    ┌──────────────────────────────────────────────────────────┐   │
+         │    │ 流程一：列表→详情跳转判断                                  │   │
+         │    │ ──────────────────────────────────────                   │   │
+         │    │  IF (type == LINK && defaultBookmarkView == external)    │   │
+         │    │    → React Native Linking.openURL(外部浏览器)             │   │
+         │    │    → 失败兜底: Expo Router.push(详情页)                   │   │
+         │    │  ELSE                                                     │   │
+         │    │    → Expo Router.push(详情页)                             │   │
+         │    └──────────────────────────────────────────────────────────┘   │
+         │                                                                    │
+         │ 2. 详情页加载，首次API请求                                         │
+         │    (includeContent: false)                                        │
+         │───────────────────────────────────▶                                │
+         │                                                                    │
+         │    ┌──────────────────────────────────────────────────────────┐   │
+         │    │ 流程二：首次请求（元数据）                                  │   │
+         │    │ ──────────────────────────────────────                   │   │
+         │    │  tRPC: bookmarks.getBookmark                             │   │
+         │    │    → ensureBookmarkAccess (权限验证)                      │   │
+         │    │    → Bookmark.fromId (Drizzle关联查询)                    │   │
+         │    │    → 返回: 元数据 + tags + assets (无HTML)                │   │
+         │    └──────────────────────────────────────────────────────────┘   │
+         │                                                                    │
+         │ ◀───────────────────────────────────                                │
+         │    返回元数据，渲染页面框架                                        │
+         │                                                                    │
+         │ 3. 阅读模式组件挂载，二次并行请求                                  │
+         │───────────────────────────────────▶                                │
+         │                                                                    │
+         │    ┌──────────────────────────────────────────────────────────┐   │
+         │    │ 流程三：阅读模式二次请求                                    │   │
+         │    │ ──────────────────────────────────────                   │   │
+         │    │  调用A: getBookmark (includeContent: true)               │   │
+         │    │    → Bookmark.getBookmarkHtmlContent                      │   │
+         │    │    → 从 assets 读取大HTML或内联HTML                        │   │
+         │    │                                                           │   │
+         │    │  调用B: highlights.getForBookmark (并行)                   │   │
+         │    │    → HighlightsService.getForBookmark                     │   │
+         │    │    → 查询所有高亮记录                                      │   │
+         │    └──────────────────────────────────────────────────────────┘   │
+         │                                                                    │
+         │ ◀───────────────────────────────────                                │
+         │    返回HTML内容 + 高亮数据                                          │
+         │                                                                    │
+         │ 4. 完整阅读模式渲染                                                │
+         │    ┌─────────────────────────────────────────┐                   │
+         │    │ React Native WebView 渲染                 │                   │
+         │    │ - BookmarkHtmlHighlighterDom             │                   │
+         │    │ - 注入高亮样式 (start/endOffset)         │                   │
+         │    │ - 阅读进度恢复/追踪                      │                   │
+         │    │ - 选中文本→创建高亮                      │                   │
+         │    └─────────────────────────────────────────┘                   │
+         │                                                                    │
 ```
 
 ---
@@ -574,8 +580,8 @@ getForBookmark: highlightsProcedure
 
 | 策略 | 说明 | 优势 |
 |------|------|------|
-| **首次请求** | `includeContent: false` | 1. 快速响应，页面秒开<br>2. 减少首屏数据传输<br>3. 非阅读模式（如截图、PDF）不需要HTML |
-| **二次请求** | `includeContent: true` | 1. 按需加载，节省流量<br>2. 大HTML异步获取，不阻塞UI<br>3. 缓存命中时可直接使用 |
+| **首次请求** | `includeContent: false` | 1. 快速响应，React Native 页面秒开<br>2. 减少首屏数据传输<br>3. 非阅读模式（如截图、PDF）不需要HTML |
+| **二次请求** | `includeContent: true` | 1. 按需加载，节省流量<br>2. 大HTML异步获取，不阻塞UI<br>3. React Query 缓存命中时可直接使用 |
 
 ### 4.2 高亮数据独立存储
 
@@ -592,7 +598,7 @@ getForBookmark: highlightsProcedure
 **偏移量设计**：使用字节偏移量 (`startOffset`, `endOffset`) 而非 DOM 节点定位
 
 **优势**：
-1. 与HTML解析库解耦，跨端兼容
+1. 与HTML解析库解耦，跨端兼容（Web React / React Native）
 2. 不受前端渲染框架影响
 3. 支持大文档快速定位（无需解析完整DOM）
 
@@ -603,10 +609,10 @@ getForBookmark: highlightsProcedure
 | 层级 | 文件路径 | 核心职责 |
 |------|---------|---------|
 | **列表→详情跳转** | `apps/mobile/components/bookmarks/BookmarkCard.tsx:461-479` | 点击事件处理，外部浏览器分支判断 |
-| **用户设置** | `apps/mobile/lib/settings.ts:37-63` | defaultBookmarkView 配置定义与持久化 |
-| **详情页入口** | `apps/mobile/app/dashboard/bookmarks/[slug]/index.tsx` | 首次请求，路由参数，视图分发 |
-| **阅读模式组件** | `apps/mobile/components/bookmarks/BookmarkLinkPreview.tsx:103-246` | 二次请求（HTML + 高亮），阅读模式渲染 |
+| **用户设置存储** | `apps/mobile/lib/settings.ts:37-63` | defaultBookmarkView 配置定义，Zod + Expo SecureStore 持久化 |
+| **路由入口** | `apps/mobile/app/dashboard/bookmarks/[slug]/index.tsx` | Expo Router 页面，首次请求发起，视图分发 |
+| **阅读模式组件** | `apps/mobile/components/bookmarks/BookmarkLinkPreview.tsx:103-246` | 二次请求（HTML + 高亮），阅读模式渲染入口 |
+| **WebView 高亮渲染** | `packages/shared-react/components/BookmarkHtmlHighlighter.tsx` | React Native WebView 封装，JS 注入高亮，选中文本交互 |
 | **高亮Hook** | `packages/shared-react/hooks/highlights.ts` | useCreateHighlight / useUpdateHighlight / useDeleteHighlight |
 | **高亮tRPC** | `packages/trpc/routers/highlights.ts` | getForBookmark / create / update / delete procedures |
 | **高亮Service** | `packages/trpc/models/highlights.service.ts` | 业务逻辑层 |
-| **高亮渲染** | `packages/shared-react/components/BookmarkHtmlHighlighter.tsx` | WebView 注入高亮，选中文本交互 |
