@@ -474,7 +474,185 @@ await db.update(assets).set({ ... }).where(eq(assets.id, asset.assetId));
 - 记录错误日志，继续处理下一个资产
 - 元数据未更新，下次执行时会再次尝试
 
-### 5.3 队列层重试
+#### 场景4：整任务失败触发重试（中段失败）
+
+**触发条件**：
+- 任务级别的异常（如 `getAllAssets()` 遍历失败、参数解析失败）
+- 未被任务层 `try-catch` 捕获的异常（如数据库连接池耗尽）
+- 触发队列层重试机制，整个任务从头开始重跑
+
+**重试配置**：`numRetries: 1`
+
+**重试生命周期**：
+```
+第1次执行 (runNumber=0, numRetriesLeft=1)
+    │
+    ├─ 处理资产 1~N
+    │    ├─ 资产 1~500 处理成功
+    │    └─ 资产 501 处理时抛出未捕获异常
+    │
+    └─ 任务失败 → onError 回调
+         │
+         ├─ workerStatsCounter: failed +1
+         └─ 日志: Job failed: ...
+             
+延迟 1000ms 后重试
+    │
+    ▼
+第2次执行 (runNumber=1, numRetriesLeft=0)
+    │
+    ├─ 重新遍历所有资产（从资产 1 开始）
+    │    ├─ 资产 1~500 重复处理
+    │    ├─ 资产 501 再次尝试
+    │    └─ ...
+    │
+    └─ 如果成功 → onComplete 回调
+              │
+              └─ workerStatsCounter: completed +1
+              
+       如果再次失败 → onError 回调
+              │
+              ├─ workerStatsCounter: failed +1
+              ├─ workerStatsCounter: failed_permanent +1
+              └─ 任务永久失败
+```
+
+### 5.3 重试语义深度分析
+
+#### 5.3.1 重试机制详解
+
+位置：`packages/plugins/queue-restate/src/dispatcher.ts:92-207`
+
+**重试循环**：
+```typescript
+let runNumber = 0;
+while (runNumber <= NUM_RETRIES) {  // NUM_RETRIES=1 时循环执行2次
+  // 执行任务
+  const res = await tryCatch(runner.run(jobData));
+  
+  if (result.type === "error") {
+    await ctx.sleep(1000, "error retry");  // 固定1秒延迟
+    runNumber++;
+    continue;
+  }
+  break;
+}
+```
+
+**关键参数传递**：
+- `runNumber`：当前执行次数（0 = 首次，1 = 第1次重试）
+- `numRetriesLeft`：剩余重试次数（NUM_RETRIES - runNumber）
+- 每次重试都会传递给 Worker，可通过 `job.runNumber` 和 `job.numRetriesLeft` 访问
+
+#### 5.3.2 删除分支（cleanDanglingAssets=true）的重试幂等性
+
+**代码路径**：`tidyAssets.ts:28-33`
+
+```typescript
+if (!dbRow) {
+  if (request.cleanDanglingAssets) {
+    await deleteAsset({ userId: asset.userId, assetId: asset.assetId });
+    logger.info(`[adminMaintenance:tidy_assets][${jobId}] Asset ${asset.assetId} not found in DB. Deleting.`);
+  }
+}
+```
+
+**存储层删除实现**：`assetdb.ts:306-312`
+```typescript
+async deleteAsset({ userId, assetId }) {
+  const assetDir = this.getAssetDir(userId, assetId);
+  if (!(await this.isPathExists(assetDir))) {
+    return;  // 不存在则直接返回，不报错
+  }
+  await fs.promises.rm(assetDir, { recursive: true });
+}
+```
+
+**中段失败后的重跑行为**：
+
+| 阶段 | 资产状态 | 操作结果 | 可观测信号 |
+|------|---------|---------|-----------|
+| 第1次执行 | 存储存在，DB不存在 | 从存储删除成功<br>打 INFO 日志 | `Asset xxx not found in DB. Deleting.` |
+| 第2次重试 | 存储已删除，DB不存在 | `deleteAsset` 检测到不存在，静默返回<br>仍然打 INFO 日志 | **重复日志**：`Asset xxx not found in DB. Deleting.` |
+
+**幂等性结论**：✅ **删除操作完全幂等**
+
+**潜在副作用**：
+- 重复的 INFO 日志输出，可能干扰日志分析
+- 重复执行 `isPathExists` 检查，产生轻微 I/O 开销
+- S3 模式下产生额外的 HEAD 请求费用
+
+#### 5.3.3 元数据同步分支（syncAssetMetadata=true）的重试幂等性
+
+**代码路径**：`tidyAssets.ts:42-50`
+
+```typescript
+if (dbRow && request.syncAssetMetadata) {
+  await db.update(assets).set({
+    contentType: asset.contentType,
+    fileName: asset.fileName,
+    size: asset.size,
+  }).where(eq(assets.id, asset.assetId));
+  logger.info(`[adminMaintenance:tidy_assets][${jobId}] Updated metadata for asset ${asset.assetId}`);
+}
+```
+
+**中段失败后的重跑行为**：
+
+| 阶段 | 状态 | 操作结果 | 可观测信号 |
+|------|------|---------|-----------|
+| 第1次执行 | DB元数据与存储不一致 | UPDATE 成功<br>打 INFO 日志 | `Updated metadata for asset xxx` |
+| 第2次重试 | DB元数据已与存储一致 | 执行相同的 UPDATE 操作<br>数据库无实际变化（值相同）<br>仍然打 INFO 日志 | **重复日志**：`Updated metadata for asset xxx` |
+
+**幂等性结论**：✅ **元数据同步最终一致幂等**
+
+**潜在副作用**：
+- 重复的 UPDATE 语句执行，产生写入放大
+- 重复的 INFO 日志输出
+- 数据库写入负载增加（虽然值无变化，但仍需执行 SQL）
+- 可能触发数据库的 WAL 日志写入
+
+#### 5.3.4 重试的可观测信号
+
+**日志信号**：
+
+| 事件 | 日志内容 | 级别 |
+|------|---------|------|
+| 任务开始 | `[adminMaintenance:tidy_assets][${jobId}] Starting...` | INFO |
+| 删除悬空资产 | `[adminMaintenance:tidy_assets][${jobId}] Asset ${assetId} not found in DB. Deleting.` | INFO |
+| 跳过悬空资产 | `[adminMaintenance:tidy_assets][${jobId}] Asset ${assetId} not found in DB. Skipping.` | WARN |
+| 更新元数据 | `[adminMaintenance:tidy_assets][${jobId}] Updated metadata for asset ${assetId}` | INFO |
+| 单个资产失败 | `[adminMaintenance:tidy_assets][${jobId}] Failed to tidy asset ${assetId}: ${error}` | ERROR |
+| 任务完成 | `[adminMaintenance:tidy_assets][${jobId}] Completed successfully` | INFO |
+| 任务失败 | `[adminMaintenance:tidy_assets][${jobId}] Job failed: ${error}` | ERROR |
+
+**指标信号**（Prometheus 格式）：
+
+```
+# HELP worker_stats_counter Worker task completion counter
+# TYPE worker_stats_counter counter
+worker_stats_counter{task="adminMaintenance:tidy_assets",status="completed"} 1
+worker_stats_counter{task="adminMaintenance:tidy_assets",status="failed"} 1
+worker_stats_counter{task="adminMaintenance:tidy_assets",status="failed_permanent"} 0
+```
+
+**重试识别方法**：
+1. 相同 `job.id` 出现多次 `Starting...` 日志
+2. 相同 assetId 出现多次 `Deleting` 或 `Updated metadata` 日志
+3. `runNumber` 字段可从日志上下文推断（首次=0，重试=1）
+
+#### 5.3.5 重试副作用总结
+
+| 维度 | 影响程度 | 说明 |
+|------|---------|------|
+| 数据正确性 | ✅ 无影响 | 操作幂等，最终结果一致 |
+| 日志清晰度 | ⚠️ 中等 | 重复日志可能干扰问题排查 |
+| 存储 I/O | ⚠️ 低 | 重复的路径存在性检查 |
+| 数据库负载 | ⚠️ 低-中 | 重复的 UPDATE 语句 |
+| S3 API 成本 | ⚠️ 低 | 重复的 LIST/HEAD 请求 |
+| 任务总耗时 | ⚠️ 高 | 完整重跑，已处理部分重复执行 |
+
+### 5.4 队列层重试
 
 位置：`packages/shared/queueing.ts:10`
 
@@ -619,6 +797,7 @@ await client.admin.runAdminMaintenanceTask.mutate({
 | 资产存储接口 | `packages/shared/assetdb.ts` | 87-128 |
 | 本地存储实现 | `packages/shared/assetdb.ts` | 134-344 |
 | S3 存储实现 | `packages/shared/assetdb.ts` | 346-621 |
+| assetId 生成 | `packages/shared/assetdb.ts` | 130-132 |
 | 数据库 Schema | `packages/db/schema.ts` | 295-325 |
 | Admin API | `packages/trpc/routers/admin.ts` | 321-325 |
 | 前端触发按钮 | `apps/web/components/admin/BackgroundJobs.tsx` | 454-466 |
