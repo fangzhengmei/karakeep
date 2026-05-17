@@ -243,7 +243,45 @@ async function handleAsset(asset: AssetInfo, request: ZTidyAssetsRequest, jobId:
 
 > **重要提示**：Web 管理后台默认使用 **组合4** (`cleanDanglingAssets: true, syncAssetMetadata: true`)
 
-### 3.4 资产存储遍历
+### 3.4 assetId 唯一性前提与跨用户安全性
+
+#### 3.4.1 assetId 生成机制
+
+位置：`packages/shared/assetdb.ts:130-132`
+
+```typescript
+export function newAssetId() {
+  return crypto.randomUUID();
+}
+```
+
+**关键特性**：
+- 使用标准 `crypto.randomUUID()` 生成 RFC 4122 版本 4 UUID
+- 基于加密安全的随机数生成器 (CSPRNG)
+- 理论碰撞概率极低：每年生成 1 万亿个 UUID，碰撞概率约为 1/500亿
+- 全局唯一性，不依赖任何用户上下文
+
+#### 3.4.2 跨用户误判安全性论证
+
+**查询逻辑**（`tidyAssets.ts:25-27`）：
+```typescript
+const dbRow = await db.query.assets.findFirst({
+  where: eq(assets.id, asset.assetId),
+});
+```
+
+**安全性论证**：
+
+1. **主键唯一性约束**：`assets.id` 是数据库主键，全局唯一
+2. **UUID 全局唯一**：`assetId` 由 `randomUUID()` 生成，确保跨用户不重复
+3. **无需 userId 过滤**：由于 `assetId` 全局唯一，仅按 `assetId` 查询即可准确定位资产，不会出现用户A的资产ID匹配到用户B的资产记录的情况
+4. **删除安全**：即使存储中存在两个不同用户的同名资产（实际不会发生），数据库查询也只会匹配到正确的记录
+
+**结论**：✅ **仅按 assetId 查库不会产生跨用户误判**，系统设计是安全的。
+
+> **补充说明**：虽然查询时不需要 userId，但删除操作 `deleteAsset({ userId, assetId })` 仍然传入了 userId，这是因为存储层按 `userId/assetId` 路径组织文件，传入 userId 是为了定位存储路径，而非安全检查。
+
+### 3.5 资产存储遍历
 
 位置：`packages/shared/assetdb.ts:323-343` (LocalFileSystem) 和 `packages/shared/assetdb.ts:566-612` (S3)
 
