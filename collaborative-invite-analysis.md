@@ -529,6 +529,159 @@ const invalidateListCaches = () =>
 - 邀请令牌使用一次性机制
 - 严格的输入校验（邮箱格式、角色枚举等）
 
+### 6. 邮件链接参数的设计与现状
+- `pendingInvitation` 参数已预置但未实际消费
+- 实际展示依赖 `lists.getPendingInvitations` 查询
+- 参数仅起到跳转到正确页面的作用，无业务逻辑依赖
+
+---
+
+## 边界行为与用户感知偏差说明
+
+### 核心边界场景分析（结合代码事实）
+
+---
+
+#### 场景一：链接携带 listId 但页面展示全部待处理邀请
+
+**触发条件：**
+- 用户点击邮件中的链接：`/dashboard/lists?pendingInvitation={listId}`
+- 该用户同时有多个待处理邀请
+
+**代码事实：**
+1. 邮件链接生成（`email.ts:203`）：
+   ```typescript
+   const inviteUrl = `${serverConfig.publicUrl}/dashboard/lists?pendingInvitation=${encodeURIComponent(listId)}`;
+   ```
+2. 列表页面（`page.tsx:36`）：直接渲染 `<PendingInvitationsCard />`，**不读取任何 searchParams**
+3. 待处理邀请卡片（`PendingInvitationsCard.tsx:144-146`）：
+   ```typescript
+   const { data: invitations, isLoading } = useQuery(
+     api.lists.getPendingInvitations.queryOptions(),
+   );
+   ```
+4. 后端查询（`listInvitations.ts:296-300`）：
+   ```sql
+   WHERE listInvitations.userId = currentUserId 
+     AND listInvitations.status = 'pending'
+   ```
+   **不包含**对 `listId` 的过滤条件
+
+**页面表现：**
+- 页面顶部展示该用户的**所有**待处理邀请卡片
+- 邮件中提到的特定列表邀请不会被高亮、排序到顶部或有任何特殊标记
+- 如果用户有 N 个待处理邀请，全部都会显示
+
+**潜在误导点：**
+- 用户期望："我点击了这个列表的邀请链接，应该只看到这个列表的邀请"
+- 实际体验：需要在多个邀请中自行寻找邮件中提到的那个
+- 感知偏差：用户可能疑惑"为什么给我看其他邀请？"
+
+---
+
+#### 场景二：pendingInvitation 无效或过期时无任何提示
+
+**触发条件：**
+- 链接中的 `listId` 对应的邀请已被接受
+- 链接中的 `listId` 对应的邀请已被拒绝
+- 链接中的 `listId` 对应的邀请已被所有者撤销
+- 链接中的 `listId` 对应的列表已被删除
+
+**代码事实：**
+1. `pendingInvitation` 参数**完全未被消费**，前端不会校验该参数的有效性
+2. `PendingInvitationsCard.tsx:152-154`：
+   ```typescript
+   if (!invitations || invitations.length === 0) {
+     return null; // 无待处理邀请时直接不渲染
+   }
+   ```
+3. 后端 `getPendingInvitations` 只返回状态为 `pending` 的邀请
+
+**页面表现：**
+- 页面静默跳转到 `/dashboard/lists`
+- 如果用户当前没有其他待处理邀请：**页面上不会出现任何与邀请相关的元素**，就像什么都没发生过
+- 如果用户有其他待处理邀请：只显示那些仍有效的邀请，不会提示"你点击的那个邀请已失效"
+- 没有任何错误提示、警告信息或 toast 通知
+
+**潜在误导点：**
+- 用户可能以为链接无效、系统出问题，或者自己"错过了"邀请
+- 无法区分"邀请已被处理"和"链接根本没生效"两种情况
+- 用户可能反复点击链接，困惑为什么没有反应
+
+---
+
+#### 场景三：非被邀请用户打开链接时的可见结果
+
+**触发条件：**
+- 邀请发送到用户 A 的邮箱（链接中的 listId 对应的邀请属于用户 A）
+- 当前登录的是用户 B（不是被邀请者）
+- 或用户使用了与邀请邮箱不同的账号登录
+
+**代码事实：**
+1. 邀请创建时（`listInvitations.ts:198-207`）：通过邮箱查询用户 ID 并绑定到邀请记录
+   ```typescript
+   const user = await ctx.db.query.users.findFirst({
+     where: eq(users.email, email),
+   });
+   if (!user) { /* 抛出 NOT_FOUND 错误 */ }
+   ```
+2. 待处理邀请查询（`listInvitations.ts:297-299`）：
+   ```sql
+   WHERE listInvitations.userId = currentUserId 
+     AND listInvitations.status = 'pending'
+   ```
+3. `page.tsx` 不读取 URL 参数，不做任何跨用户校验
+
+**页面表现：**
+- 用户 B 打开链接后，页面只显示**用户 B 自己的**待处理邀请（如果有的话）
+- 不会出现任何提示告知"这个邀请不是发给你的"
+- 如果用户 B 没有待处理邀请：页面无任何邀请相关内容，静默失败
+- 被邀请者用户 A 登录后，在自己的待处理邀请列表中能看到该邀请
+
+**潜在误导点：**
+- 用户可能以为"邀请链接失效了"，但实际上是登录错了账号
+- 多人共用设备时容易出现这种混淆
+- 没有任何机制提示用户"你需要使用 xxx@example.com 邮箱登录才能看到此邀请"
+
+---
+
+### 其他边界场景
+
+#### 4. 未登录用户点击邀请链接
+**现象：** 未登录用户点击邮件邀请链接，会被重定向到登录页面，登录后可能不会自动跳回列表页面。
+
+**原因：** 邀请链接没有携带 `callbackUrl` 参数，NextAuth 的默认登录流程可能丢失原始目标路径。
+
+#### 5. 拒绝后重新邀请的状态变化
+**现象：** 用户拒绝邀请后，所有者可以重新发送邀请。此时 `listInvitations` 记录不会重新创建，而是将 `status` 从 "declined" 更新为 "pending"。
+
+**潜在问题：** 邀请的 `invitedAt` 字段会被更新为最新时间，用户无法看到最初邀请的时间。
+
+#### 6. 协作者被移除后的数据保留
+**现象：** 协作者被移除后，他们添加到列表中的书签会保留在列表中。
+
+**代码事实：** `bookmarksInLists` 表的 `listMembershipId` 字段设置了 `ON DELETE CASCADE`（`schema.ts:517-521`），但删除协作者时只会删除 `listCollaborators` 记录，不会主动级联删除书签关联。实际上书签是独立实体，属于其创建者。
+
+#### 7. 智能列表不支持协作
+**现象：** 只有 `type = "manual"` 的列表可以邀请协作者，智能列表（`type = "smart"`）不支持协作。
+
+**代码校验：** `listInvitations.ts:216-221` 明确检查列表类型。
+
+#### 8. 邀请接受的幂等性
+**现象：** 用户多次点击接受邀请按钮，第一次成功后第二次会报错。
+
+**代码事实：** 事务中先删除邀请再插入协作者（`listInvitations.ts:122-136`），第二次点击时邀请已不存在，会抛出 "Invitation not found"。
+
+#### 9. 列表删除后的邀请失效
+**现象：** 列表被删除后，相关的邀请记录会通过外键 `ON DELETE CASCADE` 自动删除。
+
+#### 10. 待处理邀请的隐私保护
+**现象：** 列表所有者查看协作者列表时，待处理邀请的用户姓名显示为 "Pending User"，而不是真实姓名。
+
+**代码事实：** `listInvitations.ts:373` 硬编码返回 "Pending User"。
+
+---
+
 ## 代码溯源
 
 | 功能模块 | 文件路径 | 关键行号 |
