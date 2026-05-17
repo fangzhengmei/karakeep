@@ -166,7 +166,7 @@ Feed Worker 的全局并发数配置为 1（`feedWorker.ts:123`），这意味�
 
 ### 2.5.6 队列重试机制
 
-FeedQueue 配置了 1 次重试（`shared-server/src/queues.ts:230`）：
+FeedQueue 默认配置了 **1 次重试**（`shared-server/src/queues.ts:230`）：
 ```typescript
 export const FeedQueue = createDeferredQueue<ZFeedRequestSchema>("feed_queue", {
   defaultJobArgs: {
@@ -176,9 +176,12 @@ export const FeedQueue = createDeferredQueue<ZFeedRequestSchema>("feed_queue", {
 });
 ```
 
-- 定时任务和手动任务共享此重试配置
-- 失败任务会重试一次，之后标记为永久失败
-- 失败的定时任务不会影响下一小时的调度
+**重试与调度的关系**：
+- 定时任务和手动任务共享此重试配置，无差异
+- 任务失败后会**立即重试 1 次**（无延迟），若再次失败则标记为永久失败
+- 队列层面的重试是**同一次调度内的重试**，不会触发新的调度
+- 即使任务最终失败（重试耗尽），**下一小时的定时调度仍然会正常执行**，两者互相独立
+- 失败任务不会被保留（`keepFailedJobs: false`），无法手动重试，只能等待下一次调度或用户手动触发
 
 ## 3. 条目标准化流程
 
@@ -389,7 +392,7 @@ if (!contentType || !contentType.includes("xml")) {
 ### 7.2 潜在改进点
 
 1. **非事务性**：书签创建与导入记录写入非原子，极端情况下可能出现 GUID 未标记但书签已创建
-2. **无重试机制**：单次抓取失败后需等待下一小时调度（仅队列内置 1 次重试）
+2. **重试机制有限**：队列内置 1 次重试，但重试失败后仍需等待下一小时调度，无指数退避或渐进式重试策略
 3. **全量查询**：每次抓取都查询所有已导入的 GUID，feed 条目多时可能有性能问题
 4. **guid 冲突**：不同 feed 间相同 GUID 不会去重，可能导致重复书签
 5. **手动触发无频率限制**：`fetchNow` API 无幂等保护和速率限制，可被滥用导致无效任务堆积
