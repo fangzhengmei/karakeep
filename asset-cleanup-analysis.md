@@ -496,7 +496,7 @@ await db.update(assets).set({ ... }).where(eq(assets.id, asset.assetId));
          ├─ workerStatsCounter: failed +1
          └─ 日志: Job failed: ...
              
-延迟 1000ms 后重试
+延迟后重试（延迟时间取决于错误类型：
     │
     ▼
 第2次执行 (runNumber=1, numRetriesLeft=0)
@@ -803,3 +803,5 @@ await client.admin.runAdminMaintenanceTask.mutate({
 | 前端触发按钮 | `apps/web/components/admin/BackgroundJobs.tsx` | 454-466 |
 | Workers 入口 | `apps/workers/index.ts` | 58-61 |
 | 队列接口定义 | `packages/shared/queueing.ts` | 1-102 |
+| 队列重试调度 | `packages/plugins/queue-restate/src/dispatcher.ts` | 92-207 |
+| 队列任务类型 | `packages/plugins/queue-restate/src/types.ts` | 19-35 |
