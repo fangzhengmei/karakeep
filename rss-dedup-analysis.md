@@ -43,6 +43,132 @@ function getFeedMinuteOffset(feedId: string): number {
 - **超时时间**：30秒
 - **抓取超时**：5秒（`AbortSignal.timeout(5000)`，`feedWorker.ts:166`）
 
+## 2.5 调度链路对照
+
+Karakeep 存在两条独立的 RSS 抓取触发链路，它们在频率控制、入队参数和行为语义上有显著差异。
+
+### 2.5.1 链路概述
+
+| 维度 | 定时调度链路 | 手动触发链路 |
+|------|-------------|-------------|
+| 触发入口 | `FeedRefreshingWorker` cron 调度器 | tRPC `feeds.fetchNow` mutation |
+| 代码位置 | `apps/workers/workers/feedWorker.ts:33-84` | `packages/trpc/routers/feeds.ts:81-93` |
+| 触发时机 | 每小时整点自动触发 | 用户主动调用 API |
+| 频率控制 | 强约束（每小时 1 次） | 无内置约束，可被频繁调用 |
+
+### 2.5.2 入队参数差异
+
+两条链路最终都调用 `FeedQueue.enqueue()`，但传递的参数截然不同：
+
+**定时调度链路入队参数**（`feedWorker.ts:67-76`）：
+```typescript
+FeedQueue.enqueue(
+  { feedId: feed.id },
+  {
+    idempotencyKey: `${feed.id}-${hourlyWindow}`,  // 每小时唯一
+    groupId: feed.userId,
+    delayMs: delayMinutes * 60 * 1000,              // 分钟偏移延迟
+  },
+);
+```
+
+**手动触发链路入队参数**（`feeds.ts:85-92`）：
+```typescript
+FeedQueue.enqueue(
+  { feedId: ctx.feed.id },
+  {
+    groupId: ctx.user.id,
+    // 无 idempotencyKey —— 每次调用创建独立任务
+    // 无 delayMs —— 立即执行
+  },
+);
+```
+
+| 参数 | 定时调度 | 手动触发 | 影响 |
+|------|---------|---------|------|
+| `idempotencyKey` | `${feedId}-${YYYY-MM-DDTHH:00:00}` | 未提供 | 定时任务每小时去重；手动调用可重复入队 |
+| `delayMs` | 0-3540000ms（0-59分钟） | 未提供（0ms） | 定时任务分散执行；手动任务立即执行 |
+| `groupId` | `feed.userId` | `ctx.user.id` | 两者一致，按用户分组串行执行 |
+
+### 2.5.3 频率控制机制对比
+
+**定时调度链路**：
+1. cron 每小时触发一次调度器
+2. 调度器遍历所有启用的 feed，每个 feed 生成一个任务
+3. 通过 `idempotencyKey` 确保同一 feed 每小时只入队一次
+4. 即使调度器被重复触发，队列的幂等机制会拒绝重复任务
+
+**手动触发链路**：
+1. 每次 API 调用直接入队一个任务
+2. 无幂等保护，连续调用会产生多个排队任务
+3. 依赖 `groupId` 按用户串行执行，但任务会累积
+4. 无频率限制，理论上可无限触发
+
+### 2.5.4 对去重前置的影响
+
+两条链路共享同一套去重逻辑，但触发时机差异导致不同的去重行为：
+
+**场景 1：正常定时调度**
+- T=00:00 — 调度器运行，为 feed A 生成任务，延迟 15 分钟执行
+- T=00:15 — 任务执行，抓取并去重，写入导入记录
+- T=01:00 — 下一轮调度，生成新的幂等键，重复流程
+- 结果：去重窗口稳定为 1 小时
+
+**场景 2：定时 + 手动混合触发**
+- T=00:00 — 定时任务入队，延迟 15 分钟
+- T=00:05 — 用户点击"立即刷新"，手动任务入队，立即执行
+- T=00:05 — 手动任务执行，发现并导入新条目，写入导入记录
+- T=00:15 — 定时任务执行，查询导入记录时发现所有条目已存在，无新内容
+- 结果：手动任务"抢占"了定时任务的工作，定时任务成为空跑
+
+**场景 3：连续手动触发**
+- T=00:00 — 用户第一次点击，任务 1 入队并执行
+- T=00:01 — 用户第二次点击，任务 2 入队（因 `groupId` 串行，排队等待）
+- T=00:02 — 任务 1 完成，任务 2 开始执行
+- T=00:02 — 任务 2 执行，发现无新条目（RSS 源 1 分钟内无更新）
+- 结果：任务 2 完全无效，浪费资源
+
+### 2.5.5 对入库时序的影响
+
+**延迟执行 vs 立即执行**：
+- 定时任务的 `delayMs` 确保抓取操作在小时内均匀分布，避免 RSS 源服务器和自身数据库的流量突刺
+- 手动任务无延迟，立即执行，可能与定时任务或其他用户的手动任务产生并发
+
+**并发风险**：
+由于 feed worker 并发数配置为 1（`feedWorker.ts:123`），且按 `groupId`（用户 ID）分组，同一用户的任务始终串行执行。但不同用户的任务可能并行执行：
+
+```
+用户 A 的定时任务（延迟 5 分钟）——┐
+用户 B 的手动任务（立即执行） ————┼—— 并行执行，数据库连接池压力
+用户 C 的定时任务（延迟 10 分钟）——┘
+```
+
+**状态字段的时序**：
+- `lastFetchedAt`：每次任务执行完成（无论成败）都会更新
+- `lastSuccessfulFetchAt`：仅在成功解析 feed 后更新（`feedWorker.ts:193-196`）
+- `lastFetchedStatus`：任务完成后更新为 `success` 或 `failure`
+
+当手动任务在定时任务之前执行成功时，定时任务执行时会看到：
+- `lastSuccessfulFetchAt` 已被手动任务更新
+- `lastFetchedStatus` 为 `success`
+- 但定时任务仍会完整执行抓取流程，只是去重阶段发现无新条目
+
+### 2.5.6 队列重试机制
+
+FeedQueue 配置了 1 次重试（`shared-server/src/queues.ts:230`）：
+```typescript
+export const FeedQueue = createDeferredQueue<ZFeedRequestSchema>("feed_queue", {
+  defaultJobArgs: {
+    numRetries: 1,
+  },
+  keepFailedJobs: false,
+});
+```
+
+- 定时任务和手动任务共享此重试配置
+- 失败任务会重试一次，之后标记为永久失败
+- 失败的定时任务不会影响下一小时的调度
+
 ## 3. 条目标准化流程
 
 ### 3.1 解析库与配置
