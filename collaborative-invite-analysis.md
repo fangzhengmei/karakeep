@@ -657,10 +657,63 @@ const invalidateListCaches = () =>
 
 **潜在问题：** 邀请的 `invitedAt` 字段会被更新为最新时间，用户无法看到最初邀请的时间。
 
-#### 6. 协作者被移除后的数据保留
-**现象：** 协作者被移除后，他们添加到列表中的书签会保留在列表中。
+#### 6. 协作者被移除后的数据处理（原说法修正）
 
-**代码事实：** `bookmarksInLists` 表的 `listMembershipId` 字段设置了 `ON DELETE CASCADE`（`schema.ts:517-521`），但删除协作者时只会删除 `listCollaborators` 记录，不会主动级联删除书签关联。实际上书签是独立实体，属于其创建者。
+> **原说法不准确修正：** 原描述"协作者被移除后其添加的书签仍会保留在列表中"不符合实际代码行为。
+
+**真实行为：协作者被移除后，他们添加的书签会被级联删除**
+
+**代码事实链：**
+
+1. **协作者添加书签时**（`lists.ts:1024-1028`）：
+   ```typescript
+   await this.ctx.db.insert(bookmarksInLists).values({
+     listId: this.list.id,
+     bookmarkId,
+     listMembershipId: this.collaboratorEntry?.membershipId,
+   });
+   ```
+   - 协作者添加的书签会记录 `listMembershipId`，指向该协作者的 `listCollaborators` 记录
+   - 列表所有者添加的书签不会设置此字段（`collaboratorEntry` 为 null）
+
+2. **数据库级联约束**（`schema.ts:517-521`）：
+   ```typescript
+   listMembershipId: text("listMembershipId").references(
+     () => listCollaborators.id,
+     {
+       onDelete: "cascade",  // 关键：级联删除
+     },
+   ),
+   ```
+
+3. **移除协作者时**（`lists.ts:715-722`）：
+   ```typescript
+   await this.ctx.db
+     .delete(listCollaborators)
+     .where(
+       and(
+         eq(listCollaborators.listId, this.list.id),
+         eq(listCollaborators.userId, userId),
+       ),
+     );
+   ```
+   - 只删除 `listCollaborators` 记录
+   - 数据库通过 `ON DELETE CASCADE` 自动删除 `bookmarksInLists` 中关联的记录
+
+**页面表现：**
+- 协作者被移除后，列表中该协作者添加的所有书签都会消失
+- 列表所有者添加的书签不受影响，继续保留
+
+**用户感知差异：**
+- **用户可能期望：** "移除协作者只是不让他们继续编辑，之前添加的内容应该保留"
+- **实际行为：** 协作者添加的所有书签都会被移除，列表内容可能大幅减少
+- **潜在困惑：** 所有者可能疑惑"那些书签去哪儿了？"（实际上书签本身仍存在于协作者的个人库中，只是从该列表中移除）
+
+**与 leaveList 行为一致：**
+`leaveList` 方法的注释（`lists.ts:735`）明确说明：
+> "This also removes all bookmarks that the user added to the list."
+
+这与级联删除的实际行为完全一致。
 
 #### 7. 智能列表不支持协作
 **现象：** 只有 `type = "manual"` 的列表可以邀请协作者，智能列表（`type = "smart"`）不支持协作。
