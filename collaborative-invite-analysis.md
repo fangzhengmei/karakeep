@@ -128,9 +128,45 @@ const inviteUrl = `${serverConfig.publicUrl}/dashboard/lists?pendingInvitation=$
 
 邮件包含指向 `/dashboard/lists` 的链接，带有 `pendingInvitation` 查询参数。
 
+> **重要澄清：** `pendingInvitation` 参数在当前前端代码中**未被任何组件消费**。该参数仅作为 URL 的一部分存在，但实际的待处理邀请展示完全不依赖此参数。详情见下文"参数与入口的真实对应关系"。
+
 ---
 
 ### 阶段二：接收确认
+
+#### 0. 邮件链接参数与前端入口的真实对应关系
+
+**实际链路：**
+
+```
+邮件链接: /dashboard/lists?pendingInvitation={listId}
+              │
+              ▼
+       跳转到列表页面 (page.tsx)
+              │
+              ▼  无参数消费逻辑
+       PendingInvitationsCard 组件
+              │
+              ▼  调用
+       lists.getPendingInvitations() 查询
+              │
+              ▼
+       返回当前用户的所有待处理邀请
+```
+
+**关键发现：**
+
+| 项目 | 状态 | 说明 |
+|------|------|------|
+| `pendingInvitation` URL 参数 | ❌ 未消费 | 代码库中无任何地方读取或使用该参数 |
+| 实际展示依赖 | ✅ `lists.getPendingInvitations` 查询 | 基于当前登录用户 ID 返回所有待处理邀请 |
+| 参数设计意图 | 可能为预留功能 | 理论上可用于高亮特定邀请，但当前未实现 |
+
+**前端入口代码溯源：**
+
+1. **列表页面** (`apps/web/app/dashboard/lists/page.tsx:36`)：直接渲染 `<PendingInvitationsCard />`，不读取任何 searchParams
+2. **待处理邀请卡片** (`PendingInvitationsCard.tsx:144-146`)：调用 `api.lists.getPendingInvitations.queryOptions()` 获取所有待处理邀请
+3. **侧边栏徽章** (`InvitationNotificationBadge.tsx:9-13`)：同样调用 `getPendingInvitations` 查询，每 5 分钟刷新
 
 #### 1. 邀请通知展示
 
