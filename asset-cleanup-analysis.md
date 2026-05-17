@@ -103,6 +103,65 @@ export const AdminMaintenanceQueue = createDeferredQueue<ZAdminMaintenanceTask>(
 );
 ```
 
+### 2.3 完整时序图
+
+```
+  用户触发
+     │
+     ▼
+  前端按钮点击 (BackgroundJobs.tsx:454-466)
+     │
+     ▼
+  tRPC mutation: admin.runAdminMaintenanceTask
+     │
+     ▼
+  AdminMaintenanceQueue.enqueue({
+    type: "tidy_assets",
+    args: { cleanDanglingAssets: true, syncAssetMetadata: true }
+  })
+     │
+     ▼
+  任务进入队列，状态: pending
+     │
+     ▼
+  AdminMaintenanceWorker 轮询 (pollIntervalMs: 1000)
+     │
+     ▼
+  取出任务，创建 DequeuedJob
+     │
+     ▼
+  调用 runAdminMaintenance(job)
+     │
+     ├─▶ 参数校验: zAdminMaintenanceTaskSchema.safeParse
+     │
+     ├─▶ task.type === "tidy_assets"
+     │
+     ▼
+  调用 runTidyAssetsTask(job, task)
+     │
+     ├─▶ 参数解析: zTidyAssetsRequestSchema.safeParse(task.args)
+     │
+     ├─▶ 遍历所有资产: for await (const asset of getAllAssets())
+     │    │
+     │    ├─▶ 检查 abortSignal.aborted
+     │    │
+     │    └─▶ 调用 handleAsset(asset, request, jobId)
+     │         │
+     │         ├─▶ 数据库查询: db.query.assets.findFirst()
+     │         │
+     │         ├─▶ 分支1: !dbRow && cleanDanglingAssets → deleteAsset()
+     │         │
+     │         ├─▶ 分支2: dbRow && syncAssetMetadata → db.update()
+     │         │
+     │         └─▶ 异常捕获: try-catch 记录错误日志
+     │
+     ▼
+  任务完成 → onComplete 回调
+     │
+     ▼
+  指标统计 + 日志记录
+```
+
 ---
 
 ## 三、引用判断逻辑
@@ -168,11 +227,23 @@ async function handleAsset(asset: AssetInfo, request: ZTidyAssetsRequest, jobId:
       fileName: asset.fileName,
       size: asset.size,
     }).where(eq(assets.id, asset.assetId));
+    logger.info(`[adminMaintenance:tidy_assets][${jobId}] Updated metadata for asset ${asset.assetId}`);
   }
 }
 ```
 
-### 3.3 资产存储遍历
+### 3.3 四种参数组合行为详解
+
+| 组合 | cleanDanglingAssets | syncAssetMetadata | 悬空资产行为 | 存在资产行为 | 适用场景 |
+|------|---------------------|-------------------|------------|------------|----------|
+| **组合1** | `false` | `false` | 只打 WARN 日志，不删除 | 不做任何修改 | **干跑验证**：只检查不修改，用于首次执行前确认 |
+| **组合2** | `false` | `true` | 只打 WARN 日志，不删除 | 用存储元数据更新数据库 | **元数据修复**：数据库元数据损坏时从存储恢复 |
+| **组合3** | `true` | `false` | 从存储中删除 | 不做任何修改 | **清理悬空**：只清理无效资产，不影响有效资产 |
+| **组合4** | `true` | `true` | 从存储中删除 | 用存储元数据更新数据库 | **完全维护**：清理 + 元数据同步，推荐生产使用 |
+
+> **重要提示**：Web 管理后台默认使用 **组合4** (`cleanDanglingAssets: true, syncAssetMetadata: true`)
+
+### 3.4 资产存储遍历
 
 位置：`packages/shared/assetdb.ts:323-343` (LocalFileSystem) 和 `packages/shared/assetdb.ts:566-612` (S3)
 
@@ -199,7 +270,6 @@ async *getAllAssets() {
     const listResponse = await this.s3Client.send(new ListObjectsV2Command({ ... }));
     if (listResponse.Contents) {
       for (const obj of listResponse.Contents) {
-        // 解析 S3 Key 获取 userId/assetId
         const pathParts = obj.Key.split("/");
         if (pathParts.length === 2) {
           const userId = pathParts[0];
@@ -318,7 +388,55 @@ Karakeep 采用 **四层错误处理** 架构，确保系统稳定性：
 └─────────────────────────────────────────────────┘
 ```
 
-### 5.2 队列层重试
+### 5.2 关键异常场景分析
+
+#### 场景1：数据库查询失败（连接超时、网络中断等）
+
+**代码位置**：`tidyAssets.ts:25-27`
+
+```typescript
+const dbRow = await db.query.assets.findFirst({
+  where: eq(assets.id, asset.assetId),
+});
+```
+
+**行为分析**：
+- 如果 `findFirst()` 抛出异常（如数据库连接失败），异常会从 `handleAsset` 抛出
+- 被外层 `runTidyAssetsTask` 中的 `try-catch` 捕获
+- 记录错误日志：`Failed to tidy asset ${asset.assetId}: ${error}`
+- **不会执行删除操作**，因为代码在 `if (!dbRow)` 判断之前就抛出了异常
+- 继续处理下一个资产
+
+**结论**：✅ **查询失败不会触发误删**，系统设计是安全的。
+
+#### 场景2：存储删除失败（文件被占用、S3 权限问题等）
+
+**代码位置**：`tidyAssets.ts:30`
+
+```typescript
+await deleteAsset({ userId: asset.userId, assetId: asset.assetId });
+```
+
+**行为分析**：
+- `deleteAsset` 本身没有 `try-catch`，会向上抛出异常
+- 被外层 `try-catch` 捕获，记录错误日志
+- 该资产的删除操作失败，但不影响其他资产处理
+- 下次执行清理任务时会再次尝试删除
+
+#### 场景3：数据库更新失败（锁冲突、事务失败等）
+
+**代码位置**：`tidyAssets.ts:43-50`
+
+```typescript
+await db.update(assets).set({ ... }).where(eq(assets.id, asset.assetId));
+```
+
+**行为分析**：
+- 更新操作抛出异常，被外层 `try-catch` 捕获
+- 记录错误日志，继续处理下一个资产
+- 元数据未更新，下次执行时会再次尝试
+
+### 5.3 队列层重试
 
 位置：`packages/shared/queueing.ts:10`
 
@@ -332,7 +450,7 @@ export class QueueRetryAfterError extends Error {
 }
 ```
 
-### 5.3 Worker 层错误处理
+### 5.4 Worker 层错误处理
 
 位置：`apps/workers/workers/adminMaintenanceWorker.ts:37-53`
 
@@ -347,7 +465,7 @@ onError: (job) => {
 },
 ```
 
-### 5.4 静默删除机制
+### 5.5 静默删除机制
 
 位置：`packages/shared/assetdb.ts:794-801`
 
@@ -367,7 +485,7 @@ export async function silentDeleteAsset(userId: string, assetId: string | undefi
 - `packages/trpc/models/assets.ts:161-164` (replaceAsset)
 - `packages/trpc/models/assets.ts:199-201` (detachAsset)
 
-### 5.5 任务中止支持
+### 5.6 任务中止支持
 
 位置：`apps/workers/workers/adminMaintenance/tasks/tidyAssets.ts:70-73`
 
@@ -391,6 +509,7 @@ if (job.abortSignal.aborted) {
 3. **可观测性完善**：每个关键操作都有日志记录和指标统计
 4. **参数化设计**：`cleanDanglingAssets` 和 `syncAssetMetadata` 独立控制，支持"干跑"模式
 5. **级联删除保护**：数据库层面通过 `onDelete: cascade` 确保书签/用户删除时资产记录被清理
+6. **查询安全**：数据库查询失败不会触发误删，异常会被安全捕获
 
 ### 6.2 潜在改进点
 
@@ -399,12 +518,14 @@ if (job.abortSignal.aborted) {
 3. **无进度跟踪**：长时运行的清理任务无法报告进度百分比
 4. **无幂等性保证**：任务中断后重新执行会从头开始遍历，浪费资源
 5. **无清理前统计**：执行前无法预览将删除多少资产、释放多少空间
+6. **无批量查询优化**：当前是每个资产单独查询数据库，可优化为批量查询
 
 ### 6.3 风险提示
 
-1. **误删风险**：`cleanDanglingAssets=true` 时，如果数据库查询失败（如连接超时），可能误判为悬空资产导致误删
+1. **超时风险**：10分钟超时对于百万级资产可能不足，需要根据实际数据量调整
 2. **性能影响**：大量资产时，`getAllAssets()` 会遍历所有对象，可能对存储系统造成压力
-3. **超时风险**：10分钟超时对于百万级资产可能不足，需要根据实际数据量调整
+3. **S3 成本**：S3 模式下 `getAllAssets()` 会产生 LIST 请求费用，大量资产时需注意成本
+4. **幂等性问题**：如果任务执行到一半失败，重新执行会重复处理已处理过的资产
 
 ---
 
@@ -416,12 +537,12 @@ if (job.abortSignal.aborted) {
 1. 登录管理员账号
 2. 进入 Admin → Background Jobs
 3. 找到 "Admin Maintenance" 卡片
-4. 点击 "Clean Assets" 按钮
+4. 点击 "Clean Assets" 按钮（默认使用组合4）
 5. 确认操作
 
 **通过 API 调用：**
 ```typescript
-// 使用 tRPC 客户端
+// 使用 tRPC 客户端 - 完全维护模式（推荐）
 await client.admin.runAdminMaintenanceTask.mutate({
   type: "tidy_assets",
   args: {
@@ -429,14 +550,24 @@ await client.admin.runAdminMaintenanceTask.mutate({
     syncAssetMetadata: true,     // 同步元数据
   },
 });
+
+// 干跑模式（首次执行推荐）
+await client.admin.runAdminMaintenanceTask.mutate({
+  type: "tidy_assets",
+  args: {
+    cleanDanglingAssets: false,  // 不删除，只检查
+    syncAssetMetadata: false,    // 不同步
+  },
+});
 ```
 
 ### 7.2 安全执行建议
 
-1. **先干跑验证**：第一次执行时建议先设置 `cleanDanglingAssets: false`，通过日志观察哪些资产会被判定为悬空
+1. **先干跑验证**：第一次执行时使用 `cleanDanglingAssets: false, syncAssetMetadata: false`，通过日志观察哪些资产会被判定为悬空
 2. **低峰期执行**：大量资产时建议在业务低峰期执行
 3. **监控日志**：执行期间监控 `[adminMaintenance:tidy_assets]` 前缀的日志
 4. **备份数据**：执行前建议备份存储系统数据
+5. **关注错误**：注意观察 `Failed to tidy asset` 错误，排查是否有系统性问题
 
 ---
 
@@ -454,3 +585,4 @@ await client.admin.runAdminMaintenanceTask.mutate({
 | Admin API | `packages/trpc/routers/admin.ts` | 321-325 |
 | 前端触发按钮 | `apps/web/components/admin/BackgroundJobs.tsx` | 454-466 |
 | Workers 入口 | `apps/workers/index.ts` | 58-61 |
+| 队列接口定义 | `packages/shared/queueing.ts` | 1-102 |
