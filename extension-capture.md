@@ -399,6 +399,10 @@ export function createScopedAuthedProcedure(resource: ZApiKeyScopeResource) {
 
 ## 六、完整调用链时序图
 
+> **⚠️ 队列触发边界标记**：`╔══════════════════════════════════╗` 标记了不同阶段的队列触发边界。
+> - **阶段一**（同步路径）：`createBookmark` 阶段
+> - **阶段二**（异步路径）：爬取完成后的后续处理
+
 ```
 User Action (右键菜单 / 快捷键)
     │
@@ -430,6 +434,15 @@ SavePage.tsx 加载
          │
          └─► tRPC mutation: bookmarks.createBookmark
               │
+╔════════════════════════════════════════════════════════════╗
+║  阶段一：createBookmark 同步路径 —— 队列触发边界          ║
+║  ======================================================  ║
+║  BookmarkTypes.LINK  →  LinkCrawlerQueue / LowPriority   ║
+║  BookmarkTypes.TEXT  →  OpenAIQueue (tag)                ║
+║  BookmarkTypes.ASSET →  AssetPreprocessingQueue          ║
+║  注意：LINK 类型的 OpenAIQueue 不在此阶段触发！           ║
+╚════════════════════════════════════════════════════════════╝
+              │
               ▼
 [Backend]
 packages/trpc/routers/bookmarks.ts createBookmark
@@ -439,9 +452,48 @@ packages/trpc/routers/bookmarks.ts createBookmark
     ├─► 配额检查 (QuotaService.canCreateBookmark)
     ├─► 数据库事务插入 (bookmarks + bookmark_links)
     ├─► 更新 precrawled archive 关联
-    ├─► 入队爬取任务 (LinkCrawlerQueue)
-    ├─► 入队 AI 处理任务 (OpenAIQueue)
-    └─► 触发搜索索引重建 + Webhook
+    │
+    ├─► 按类型分流入队 ──┬── LINK  → LinkCrawlerQueue / LowPriorityCrawlerQueue
+    │                   ├── TEXT  → OpenAIQueue (tag)
+    │                   └── ASSET → AssetPreprocessingQueue
+    │
+    ├─► 触发规则引擎 (RuleEngine.bookmarkAdded)
+    ├─► 触发搜索索引重建
+    └─► 触发 Webhook (created)
+    │
+    ▼
+[异步 Worker 阶段]
+    │
+    ├─┬─ LinkCrawlerQueue 或 LowPriorityCrawlerQueue
+    │ │  (crawlerWorker.ts:2190 runCrawler)
+    │ │
+    │ ├─► 检查域名速率限制
+    │ ├─► 检测 Content-Type
+    │ ├─► 如为 PDF/图片 → handleAsAssetBookmark() 转型为 ASSET
+    │ ├─► 否则 crawlPage() / 使用 precrawled archive
+    │ ├─► runParseSubprocess() 解析元数据
+    │ ├─► 存储 screenshot / PDF / HTML content / banner image
+    │ ├─► 更新 bookmark_links 元数据
+    │ │
+    │ ╔═════════════════════════════════════════════════════╗
+    │ ║  阶段二：爬取完成后 —— 后续队列触发边界              ║
+    │ ║  ==============================================   ║
+    │ ║  仅当 crawl 成功且 runInference !== false 时：       ║
+    │ ║  → OpenAIQueue (tag + summarize)                   ║
+    │ ║  → VideoWorkerQueue (如启用视频下载)                ║
+    │ ║  → 搜索索引重建 (crawled)                          ║
+    │ ║  → Webhook (crawled)                               ║
+    │ ╚═════════════════════════════════════════════════════╝
+    │ │
+    │ ├─► OpenAIQueue.enqueue({ bookmarkId, type: "tag" })
+    │ ├─► OpenAIQueue.enqueue({ bookmarkId, type: "summarize" })
+    │ ├─► triggerSearchReindex()
+    │ ├─► VideoWorkerQueue.enqueue() (可选)
+    │ ├─► Webhook (crawled)
+    │ └─► archiveWebpage() 全页归档 (可选)
+    │
+    ├─ OpenAIQueue (TEXT 类型从阶段一直达此处)
+    └─ AssetPreprocessingQueue (ASSET 类型从阶段一直达此处)
 ```
 
 ---
@@ -541,10 +593,87 @@ const highBookmarkCreationRateLimitConfig = {
 };
 ```
 
-**其他类型队列分流**：
-- `BookmarkTypes.LINK` → `LinkCrawlerQueue` / `LowPriorityCrawlerQueue`
+**createBookmark 阶段队列分流（阶段一，同步路径）**：
+- `BookmarkTypes.LINK` → `LinkCrawlerQueue` / `LowPriorityCrawlerQueue` （**仅此二选一，不触发 OpenAIQueue**）
 - `BookmarkTypes.TEXT` → `OpenAIQueue`（打标签）
 - `BookmarkTypes.ASSET` → `AssetPreprocessingQueue`
+
+> **代码证据**：`bookmarks.ts:396` 有明确注释说明：`// The crawling job triggers openai when it's done`
+>
+> 这意味着 LINK 类型的 AI 处理（打标签、摘要）被推迟到爬取完成后，由 crawler worker 触发，而非在创建时同步触发。
+
+---
+
+### 8.3.5 队列触发边界的设计意图与完整分流表
+
+**两阶段设计的核心逻辑**：
+
+| 书签类型 | 阶段一：createBookmark 同步路径 | 阶段二：Worker 异步路径 |
+|---------|------------------------------|-----------------------|
+| **LINK** | `LinkCrawlerQueue` 或 `LowPriorityCrawlerQueue` 二选一 | 爬取成功后 → `OpenAIQueue` (tag + summarize) + `VideoWorkerQueue` (可选) |
+| **TEXT** | `OpenAIQueue` (仅 tag) | 无（已在阶段一入队） |
+| **ASSET** | `AssetPreprocessingQueue` | 资产预处理完成后无进一步 AI 入队 |
+
+**设计意图分析**：
+1.  **解耦关注点**：创建路径只负责持久化和入队第一个必要任务，避免同步路径阻塞
+2.  **失败隔离**：爬取失败不会影响书签创建成功（至少保存了 URL）
+3.  **依赖顺序**：AI 打标签和摘要需要爬取到的内容，因此必须在爬取完成后触发
+4.  **优先级传递**：`enqueueOpts.priority` 从爬取任务继承到子任务（`crawlerWorker.ts:2293-2296`）
+
+**完整代码证据**：
+
+阶段一（`bookmarks.ts:394-429`）：
+```typescript
+switch (bookmark.content.type) {
+  case BookmarkTypes.LINK: {
+    // 注释明确：The crawling job triggers openai when it's done
+    const crawlerQueue = shouldUseLowPriority
+      ? LowPriorityCrawlerQueue
+      : LinkCrawlerQueue;
+    await crawlerQueue.enqueue({ bookmarkId: bookmark.id }, enqueueOpts);
+    break;
+  }
+  case BookmarkTypes.TEXT: {
+    await OpenAIQueue.enqueue({ bookmarkId, type: "tag" }, enqueueOpts);
+    break;
+  }
+  case BookmarkTypes.ASSET: {
+    await AssetPreprocessingQueue.enqueue(
+      { bookmarkId, fixMode: false }, enqueueOpts
+    );
+    break;
+  }
+}
+```
+
+阶段二（`crawlerWorker.ts:2298-2314`）：
+```typescript
+// 仅当 crawl 成功且 runInference !== false 时触发
+if (job.data.runInference !== false) {
+  await OpenAIQueue.enqueue(
+    { bookmarkId, type: "tag" }, enqueueOpts
+  );
+  await OpenAIQueue.enqueue(
+    { bookmarkId, type: "summarize" }, enqueueOpts
+  );
+}
+
+// 其他后续任务
+await triggerSearchReindex(bookmarkId, enqueueOpts);
+if (serverConfig.crawler.downloadVideo) {
+  await VideoWorkerQueue.enqueue({ bookmarkId, url }, enqueueOpts);
+}
+await webhookService.triggerWebhook(bookmarkId, "crawled", ...);
+```
+
+**优先级传递机制**（`crawlerWorker.ts:2293-2296`）：
+```typescript
+const enqueueOpts: EnqueueOptions = {
+  priority: job.priority,      // 继承爬取任务的优先级
+  groupId: userId,             // 继承用户分组
+};
+```
+这意味着低优先级爬取任务产生的 AI 任务也会是低优先级。
 
 ---
 
@@ -727,8 +856,12 @@ if (settings.customHeaders) {
 | Layout 路由守卫 | `apps/browser-extension/src/Layout.tsx` | 未配置检测 → `/notconfigured` |
 | SingleFile 集成 | `apps/browser-extension/src/utils/singlefile.ts` | `capturePageWithSingleFile`, `uploadSingleFileAsset`, `injectSingleFileContentScript`, `sendCaptureMessage` |
 | 内容脚本 | `apps/browser-extension/src/content-scripts/singlefile-content-script.ts` | `captureCurrentPage`, `restoreOriginalImageUrls`, `CAPTURE_PAGE` 监听器 |
-| 队列定义 | `packages/shared-server/src/queues.ts` | `LinkCrawlerQueue`, `LowPriorityCrawlerQueue`, `QueuePriority` |
-| 队列分流 | `packages/trpc/routers/bookmarks.ts` | `shouldUseLowPriorityQueues`, `createBookmark` 中的队列选择 |
+| 队列定义 | `packages/shared-server/src/queues.ts` | `LinkCrawlerQueue`, `LowPriorityCrawlerQueue`, `OpenAIQueue`, `QueuePriority` |
+| 阶段一队列入队 | `packages/trpc/routers/bookmarks.ts` | `createBookmark` 中的 `switch (bookmark.content.type)` 分流 (L394-429) |
+| 爬取 Worker 主逻辑 | `apps/workers/workers/crawlerWorker.ts` | `CrawlerWorker.build`, `runCrawler` (L2190) |
+| 阶段二队列触发 | `apps/workers/workers/crawlerWorker.ts` | `runCrawler` 中爬取后的 `OpenAIQueue.enqueue` (L2298-2314) |
+| 优先级传递 | `apps/workers/workers/crawlerWorker.ts` | `enqueueOpts.priority = job.priority` (L2293-2296) |
+| 内容类型检测转型 | `apps/workers/workers/crawlerWorker.ts` | `getContentType`, `handleAsAssetBookmark` (L1608, L1670) |
 | 设置存储 | `apps/browser-extension/src/utils/settings.ts` | `getPluginSettings`, `usePluginSettings`, `zSettingsSchema` |
 | 登录页面 | `apps/browser-extension/src/SignInPage.tsx` | `api.apiKeys.exchange`, `api.apiKeys.validate` |
 | API Key 生成 | `packages/trpc/auth.ts` | `generateApiKey`, `authenticateApiKey`, `parseApiKey` |
