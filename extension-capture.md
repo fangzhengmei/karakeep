@@ -36,7 +36,7 @@
 |---------|---------|---------|---------|
 | 右键菜单 | 右键点击链接/页面/图片/选区 | `background.ts:262` | `apps/browser-extension/src/background/background.ts:104-138` |
 | 键盘快捷键 | `Ctrl+Shift+E` | `background.ts:285` | `apps/browser-extension/src/background/background.ts:269-283` |
-| 扩展图标点击 | 点击工具栏图标 | `manifest.json:11-13` → `index.html#save` | `apps/browser-extension/src/SavePage.tsx` |
+| 扩展图标点击 | 点击工具栏图标 | `manifest.json:11-13` → `index.html` → 路由 `/` | `apps/browser-extension/src/SavePage.tsx` |
 | 命令调用 | `chrome.commands.onCommand` | `background.ts:285` | `apps/browser-extension/src/background/background.ts:269-283` |
 
 ### 2.2 上下文菜单注册逻辑
@@ -191,10 +191,12 @@ async function captureCurrentPage(opts: { blockImages: boolean }): Promise<strin
 **序列化优化**：当阻塞图片时，将 `data-sf-original-src` 恢复为 `src`，使图片在查看器中从源站加载。
 
 #### 消息传递协议
-Background ↔ Content Script 使用 `chrome.tabs.sendMessage` 通信：
+Popup ↔ Content Script 使用 `chrome.tabs.sendMessage` 通信（**发起方是 Popup，不是 Background**）：
 - 请求：`{ type: "CAPTURE_PAGE", blockImages: boolean }`
 - 响应：`{ success: boolean, html?: string, error?: string }`
 - 超时：60 秒 (`CAPTURE_TIMEOUT_MS`)
+
+**调用链**：`SavePage.tsx:140` → `capturePageWithSingleFile(tabId)` → `sendCaptureMessage(tabId)` → `chrome.tabs.sendMessage(tabId, ...)`
 
 ### 4.4 捕获内容上传序列化
 
@@ -210,10 +212,18 @@ const file = new File([blob], filename, { type: "text/html" });
 const formData = new FormData();
 formData.append("file", file);
 
-// 3. HTTP 上传
-const response = await fetch(`${settings.address}/api/assets`, {
+// 3. HTTP 上传（复用 customHeaders）
+const headers: HeadersInit = {
+  Authorization: `Bearer ${settings.apiKey}`,
+};
+if (settings.customHeaders) {
+  Object.entries(settings.customHeaders).forEach(([key, value]) => {
+    headers[key] = value;
+  });
+}
+const response = await fetch(apiUrl, {
   method: "POST",
-  headers: { Authorization: `Bearer ${settings.apiKey}` },
+  headers,
   body: formData,
 });
 ```
@@ -436,15 +446,289 @@ packages/trpc/routers/bookmarks.ts createBookmark
 
 ---
 
-## 七、关键代码位置索引
+## 八、关键事实澄清与调用路径分野
+
+### 8.1 CAPTURE_PAGE 消息发起方：Popup，而非 Background
+
+**澄清**：`CAPTURE_PAGE` 消息的发起方是 **Popup 页面**，不是 Background Service Worker。
+
+**调用链证据**：
+```
+SavePage.tsx:140  saveBookmark()
+    ↓
+singlefile.ts:12  capturePageWithSingleFile(tabId, opts)
+    ↓
+singlefile.ts:19  sendCaptureMessage(tabId, blockImages)
+    ↓
+singlefile.ts:46  chrome.tabs.sendMessage(tabId, { type: "CAPTURE_PAGE", ... })
+    ↓
+singlefile-content-script.ts:23  onMessage 监听器接收
+```
+
+**设计意图**：页面捕获是用户在 Popup 中点击保存后的同步操作，由 Popup 上下文直接发起可以保持调用栈的完整性，便于错误处理和用户反馈（显示 "Capturing Page" 状态）。
+
+---
+
+### 8.2 默认入口路由为何不是 #save
+
+**路由配置**（`main.tsx:21-39`）：
+```typescript
+<HashRouter>
+  <Routes>
+    <Route element={<Layout />}>
+      <Route path="/" element={<SavePage />} />  {/* 默认路由 */}
+      <Route path="/bookmark/:bookmarkId" element={<BookmarkSavedPage />} />
+      ...
+    </Route>
+    <Route path="/notconfigured" element={<NotConfiguredPage />} />
+    <Route path="/options" element={<OptionsPage />} />
+    <Route path="/signin" element={<SignInPage />} />
+  </Routes>
+</HashRouter>
+```
+
+**事实澄清**：
+- `manifest.json` 配置的 `default_popup: "index.html"` 没有 hash 后缀
+- 使用 `HashRouter` 时，无 hash 的路径对应路由 `/`
+- 路由 `/` 直接渲染 `<SavePage />` 组件，因此等效于 "保存页面"
+- 无需 `#save` 是因为 SavePage 本身就是默认首页
+
+**二次路由逻辑**（`Layout.tsx:14-17`）：
+```typescript
+if (!settings.apiKey || !settings.address) {
+  navigate("/notconfigured");  // 未配置时跳转到配置页面
+  return;
+}
+```
+这意味着实际渲染路径可能是：`index.html` → `/` → 检查配置 → `/notconfigured`（如未登录）。
+
+---
+
+### 8.3 链接书签创建后队列分流机制
+
+**双队列架构**（`packages/shared-server/src/queues.ts:89-109`）：
+
+| 队列 | 队列名 | 优先级 | 用途 |
+|------|--------|--------|------|
+| `LinkCrawlerQueue` | `link_crawler_queue` | `QueuePriority.Default = 0` | 正常优先级爬取（用户交互创建） |
+| `LowPriorityCrawlerQueue` | `low_priority_crawler_queue` | `QueuePriority.Low = 50` | 低优先级爬取（批量导入、高频用户） |
+
+> 优先级数值越低，处理越早。
+
+**分流决策逻辑**（`packages/trpc/routers/bookmarks.ts:382-406`）：
+```typescript
+// 1. 显式优先级：input.crawlPriority === "low"
+// 2. 隐式优先级：速率限制触发（5分钟超过30次创建请求）
+const forceLowPriority = await shouldUseLowPriorityQueues(ctx);
+const shouldUseLowPriority = input.crawlPriority === "low" || forceLowPriority;
+
+const crawlerQueue = shouldUseLowPriority
+  ? LowPriorityCrawlerQueue
+  : LinkCrawlerQueue;
+
+await crawlerQueue.enqueue({ bookmarkId: bookmark.id }, {
+  priority: shouldUseLowPriority ? QueuePriority.Low : QueuePriority.Default,
+  groupId: ctx.user.id,  // 按用户分组，保证公平调度
+});
+```
+
+**速率限制触发降级**（`bookmarks.ts:159-180`）：
+```typescript
+const highBookmarkCreationRateLimitConfig = {
+  name: "bookmarks.createBookmark.highVolume",
+  windowMs: 5 * 60 * 1000,   // 5分钟窗口
+  maxRequests: 30,           // 超过30次触发降级
+};
+```
+
+**其他类型队列分流**：
+- `BookmarkTypes.LINK` → `LinkCrawlerQueue` / `LowPriorityCrawlerQueue`
+- `BookmarkTypes.TEXT` → `OpenAIQueue`（打标签）
+- `BookmarkTypes.ASSET` → `AssetPreprocessingQueue`
+
+---
+
+### 8.4 Popup 与 Background 两套 tRPC 客户端关系
+
+**两套独立的 tRPC 客户端实例**，虽然配置同源，但实现和用途完全分离：
+
+#### 客户端一：Background Service Worker 客户端
+**位置**：`apps/browser-extension/src/utils/trpc.ts`
+
+```typescript
+// 模块级单例
+let apiClient: ReturnType<typeof createTRPCClient<AppRouter>> | null = null;
+let queryClient: QueryClient | null = null;
+
+// 核心特性
+// 1. 设置变更检测（地址/API Key/自定义头变更时重建）
+// 2. 持久化缓存（@tanstack/react-query-persist-client + Chrome storage）
+// 3. 缓存失效策略（地址/Key 变更时清空）
+```
+
+**使用场景**（仅 Background 内部调用）：
+- `background.ts:315` → `getBadgeStatus()` → 查询 URL 是否已存档（badge 显示）
+- `background.ts:315` → `checkAndUpdateIcon()` → 更新扩展图标 badge
+- `badgeCache.ts:12` → `fetchBadgeStatus()` → 调用 `api.bookmarks.checkUrl.query()`
+
+#### 客户端二：Popup React 上下文客户端
+**位置**：`packages/shared-react/providers/trpc-provider.tsx`
+
+```typescript
+// React Context 管理
+function getTRPCClient(settings: Settings) {
+  return createTRPCClient<AppRouter>({
+    links: [
+      httpBatchLink({
+        maxURLLength: TRPC_MAX_URL_LENGTH_EXTERNAL,
+        fetch: (url, options) => {
+          // 自定义 fetch：30秒超时 + AbortController 信号转发
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 30_000);
+          // ... 信号转发逻辑
+          return fetch(url, { ...options, signal: controller.signal });
+        },
+        headers() {
+          return {
+            Authorization: settings.apiKey ? `Bearer ${settings.apiKey}` : undefined,
+            ...settings.customHeaders,
+          };
+        },
+        transformer: superjson,
+      }),
+    ],
+  });
+}
+```
+
+**使用场景**（Popup UI 组件调用）：
+- `SavePage.tsx:46` → `api.bookmarks.createBookmark.mutation()` → 创建书签
+- `SignInPage.tsx:27` → `api.apiKeys.exchange.mutation()` → 登录交换密钥
+- `SignInPage.tsx:40` → `api.apiKeys.validate.mutation()` → 验证 API Key
+
+#### 两套客户端对比
+
+| 维度 | Background 客户端 | Popup 客户端 |
+|------|------------------|-------------|
+| 生命周期 | 模块级单例，随 Service Worker 生命周期 | React 组件上下文，随 Popup 开关重建 |
+| 配置来源 | `getPluginSettings()`（chrome.storage.sync） | `TRPCSettingsProvider` props |
+| 缓存策略 | 持久化缓存（Chrome storage） | 内存缓存（React Query Provider） |
+| 超时处理 | 使用 tRPC 默认 | 自定义 30s 超时 + AbortController |
+| 设置变更检测 | 有（比较新旧设置） | 有（`useMemo` 依赖 `settings`） |
+| 主要用途 | Badge 检查、后台静默查询 | 用户交互操作（保存、登录） |
+
+**共同点**：都从 `settings` 读取 `apiKey` / `address` / `customHeaders`，都使用 `superjson` 序列化。
+
+---
+
+### 8.5 资产上传自定义请求头的复用关系
+
+**三处独立实现，但复用同一配置源 `settings.customHeaders`**：
+
+#### 实现一：Background tRPC 客户端
+**位置**：`apps/browser-extension/src/utils/trpc.ts:102-106`
+```typescript
+headers() {
+  return {
+    Authorization: `Bearer ${apiKey}`,
+    ...customHeaders,  // 直接展开
+  };
+}
+```
+
+#### 实现二：Popup tRPC 客户端
+**位置**：`packages/shared-react/providers/trpc-provider.tsx:82-89`
+```typescript
+headers() {
+  return {
+    Authorization: settings.apiKey ? `Bearer ${settings.apiKey}` : undefined,
+    ...settings.customHeaders,  // 直接展开
+  };
+}
+```
+
+#### 实现三：资产上传 Fetch 调用
+**位置**：`apps/browser-extension/src/utils/singlefile.ts:116-124`
+```typescript
+const headers: HeadersInit = {
+  Authorization: `Bearer ${settings.apiKey}`,
+};
+if (settings.customHeaders) {
+  Object.entries(settings.customHeaders).forEach(([key, value]) => {
+    headers[key] = value;  // 手动 forEach 添加
+  });
+}
+```
+
+**设计问题**：三处独立实现了相同的 headers 构造逻辑，没有共享的工具函数。当 `customHeaders` 为空或 undefined 时行为一致，但代码重复。
+
+**自定义头用途**：支持用户在扩展中配置额外的 HTTP 请求头，用于通过反向代理的认证（如 Cloudflare Access、企业内网代理等）。
+
+---
+
+### 8.6 Popup 与 Background 调用路径分野总结
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        User Action                                   │
+│  右键菜单 / Ctrl+Shift+E / 点击扩展图标                              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              Background Service Worker                              │
+│                                                                     │
+│  监听事件 → 构造 ZNewBookmarkRequest → 存入 session storage         │
+│  chrome.contextMenus.onClicked                                      │
+│  chrome.commands.onCommand                                          │
+│  chrome.tabs.onActivated → checkAndUpdateIcon() → getApiClient()   │
+│  chrome.runtime.onMessage → BOOKMARK_REFRESH_BADGE                  │
+│                                                                     │
+│  【tRPC 客户端一】                                                  │
+│  用途：静默 badge 查询，持久化缓存                                  │
+│  调用：api.bookmarks.checkUrl.query()                               │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼  chrome.action.openPopup()
+┌─────────────────────────────────────────────────────────────────────┐
+│                      Popup UI (React SPA)                           │
+│                                                                     │
+│  SavePage.tsx → 读取 session storage → saveBookmark()               │
+│  → [可选] capturePageWithSingleFile()                               │
+│    → chrome.tabs.sendMessage(tabId, "CAPTURE_PAGE")                │
+│  → [可选] uploadSingleFileAsset()                                   │
+│    → fetch("/api/assets", { headers: { Authorization, ...custom } })│
+│  → createBookmark()                                                 │
+│                                                                     │
+│  【tRPC 客户端二】                                                  │
+│  用途：用户交互操作，30s 超时                                      │
+│  调用：api.bookmarks.createBookmark.mutation()                      │
+│        api.apiKeys.exchange.mutation()                              │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Backend API                                  │
+│  /api/trpc/*    /api/assets                                         │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 九、关键代码位置索引
 
 | 功能模块 | 主文件路径 | 关键函数/类 |
 |---------|-----------|------------|
-| 后台事件监听 | `apps/browser-extension/src/background/background.ts` | `handleContextMenuClick`, `addLinkToKarakeep`, `handleCommand` |
+| 后台事件监听 | `apps/browser-extension/src/background/background.ts` | `handleContextMenuClick`, `addLinkToKarakeep`, `handleCommand`, `checkAndUpdateIcon` |
 | 保存页面逻辑 | `apps/browser-extension/src/SavePage.tsx` | `saveBookmark`, `useEffect` 加载逻辑 |
-| tRPC 客户端 | `apps/browser-extension/src/utils/trpc.ts` | `initializeClients`, `getApiClient`, `createTRPCClient` |
-| SingleFile 集成 | `apps/browser-extension/src/utils/singlefile.ts` | `capturePageWithSingleFile`, `uploadSingleFileAsset`, `injectSingleFileContentScript` |
-| 内容脚本 | `apps/browser-extension/src/content-scripts/singlefile-content-script.ts` | `captureCurrentPage`, `restoreOriginalImageUrls` |
+| Background tRPC 客户端 | `apps/browser-extension/src/utils/trpc.ts` | `initializeClients`, `getApiClient`, `createTRPCClient` |
+| Popup tRPC 客户端 | `packages/shared-react/providers/trpc-provider.tsx` | `TRPCSettingsProvider`, `getTRPCClient` |
+| 路由配置 | `apps/browser-extension/src/main.tsx` | `HashRouter`, `Route path="/"` |
+| Layout 路由守卫 | `apps/browser-extension/src/Layout.tsx` | 未配置检测 → `/notconfigured` |
+| SingleFile 集成 | `apps/browser-extension/src/utils/singlefile.ts` | `capturePageWithSingleFile`, `uploadSingleFileAsset`, `injectSingleFileContentScript`, `sendCaptureMessage` |
+| 内容脚本 | `apps/browser-extension/src/content-scripts/singlefile-content-script.ts` | `captureCurrentPage`, `restoreOriginalImageUrls`, `CAPTURE_PAGE` 监听器 |
+| 队列定义 | `packages/shared-server/src/queues.ts` | `LinkCrawlerQueue`, `LowPriorityCrawlerQueue`, `QueuePriority` |
+| 队列分流 | `packages/trpc/routers/bookmarks.ts` | `shouldUseLowPriorityQueues`, `createBookmark` 中的队列选择 |
 | 设置存储 | `apps/browser-extension/src/utils/settings.ts` | `getPluginSettings`, `usePluginSettings`, `zSettingsSchema` |
 | 登录页面 | `apps/browser-extension/src/SignInPage.tsx` | `api.apiKeys.exchange`, `api.apiKeys.validate` |
 | API Key 生成 | `packages/trpc/auth.ts` | `generateApiKey`, `authenticateApiKey`, `parseApiKey` |
