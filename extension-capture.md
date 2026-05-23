@@ -469,31 +469,66 @@ packages/trpc/routers/bookmarks.ts createBookmark
     │ │
     │ ├─► 检查域名速率限制
     │ ├─► 检测 Content-Type
-    │ ├─► 如为 PDF/图片 → handleAsAssetBookmark() 转型为 ASSET
-    │ ├─► 否则 crawlPage() / 使用 precrawled archive
-    │ ├─► runParseSubprocess() 解析元数据
-    │ ├─► 存储 screenshot / PDF / HTML content / banner image
-    │ ├─► 更新 bookmark_links 元数据
     │ │
-    │ ╔═════════════════════════════════════════════════════╗
-    │ ║  阶段二：爬取完成后 —— 后续队列触发边界              ║
-    │ ║  ==============================================   ║
-    │ ║  仅当 crawl 成功且 runInference !== false 时：       ║
-    │ ║  → OpenAIQueue (tag + summarize)                   ║
-    │ ║  → VideoWorkerQueue (如启用视频下载)                ║
-    │ ║  → 搜索索引重建 (crawled)                          ║
-    │ ║  → Webhook (crawled)                               ║
-    │ ╚═════════════════════════════════════════════════════╝
+    │ ├─┬─ 分支 A：Content-Type 为 PDF/图片
+    │ │ │  ├─► handleAsAssetBookmark() 下载文件
+    │ │ │  ├─► 数据库事务：转型 LINK → ASSET
+    │ │ │  └─► AssetPreprocessingQueue.enqueue()
+    │ │ │
+    │ │ ╔═════════════════════════════════════════════════════╗
+    │ │ ║  注意：handleAsAssetBookmark() 内直接转型，          ║
+    │ │ ║        不会触发后续 LINK 分支的 runInference 检查！  ║
+    │ │ ╚═════════════════════════════════════════════════════╝
     │ │
-    │ ├─► OpenAIQueue.enqueue({ bookmarkId, type: "tag" })
-    │ ├─► OpenAIQueue.enqueue({ bookmarkId, type: "summarize" })
-    │ ├─► triggerSearchReindex()
-    │ ├─► VideoWorkerQueue.enqueue() (可选)
-    │ ├─► Webhook (crawled)
-    │ └─► archiveWebpage() 全页归档 (可选)
+    │ └─┬─ 分支 B：Content-Type 为 HTML
+    │   ├─► crawlPage() / 使用 precrawled archive
+    │   ├─► runParseSubprocess() 解析元数据
+    │   ├─► 存储 screenshot / PDF / HTML content / banner image
+    │   ├─► 更新 bookmark_links 元数据
+    │   │
+    │   ╔═════════════════════════════════════════════════════╗
+    │   ║  阶段二（仅 LINK 分支）：爬取完成后队列边界         ║
+    │   ║  ==============================================   ║
+    │   ║  仅当 crawl 成功且 runInference !== false 时：       ║
+    │   ║  → OpenAIQueue (tag + summarize)                   ║
+    │   ║  → VideoWorkerQueue (如启用视频下载)                ║
+    │   ║  → 搜索索引重建 (crawled)                          ║
+    │   ║  → Webhook (crawled)                               ║
+    │   ║                                                     ║
+    │   ║  ⚠️ runInference 仅限制此 LINK 分支，不限制 ASSET    ║
+    │   ║     预处理分支！                                    ║
+    │   ╚═════════════════════════════════════════════════════╝
+    │   │
+    │   ├─► OpenAIQueue.enqueue({ bookmarkId, type: "tag" })
+    │   ├─► OpenAIQueue.enqueue({ bookmarkId, type: "summarize" })
+    │   ├─► triggerSearchReindex()
+    │   ├─► VideoWorkerQueue.enqueue() (可选)
+    │   ├─► Webhook (crawled)
+    │   └─► archiveWebpage() 全页归档 (可选)
     │
     ├─ OpenAIQueue (TEXT 类型从阶段一直达此处)
-    └─ AssetPreprocessingQueue (ASSET 类型从阶段一直达此处)
+    │
+    └─┬─ AssetPreprocessingQueue (ASSET 类型从阶段一直达此处)
+      │  (assetPreprocessingWorker.ts:372 run)
+      │
+      ├─► 读取资产文件 (PDF 或 image)
+      ├─► PDF：提取文本 + 生成首页截图
+      ├─► Image：OCR 提取文本 (Tesseract 或 LLM)
+      ├─► 更新 bookmarkAssets.content
+      │
+      ╔═════════════════════════════════════════════════════╗
+      ║  阶段三（ASSET 预处理完成后）：AI 触发边界           ║
+      ║  ==============================================   ║
+      ║  触发条件：!isFixMode || anythingChanged            ║
+      ║  → OpenAIQueue (tag + summarize)                   ║
+      ║  → 搜索索引重建                                     ║
+      ║                                                     ║
+      ║  ⚠️ 此处不受 runInference 限制！                     ║
+      ╚═════════════════════════════════════════════════════╝
+      │
+      ├─► OpenAIQueue.enqueue({ bookmarkId, type: "tag" })
+      ├─► OpenAIQueue.enqueue({ bookmarkId, type: "summarize" })
+      └─► triggerSearchReindex()
 ```
 
 ---
@@ -606,23 +641,67 @@ const highBookmarkCreationRateLimitConfig = {
 
 ### 8.3.5 队列触发边界的设计意图与完整分流表
 
-**两阶段设计的核心逻辑**：
+**三阶段设计的核心逻辑**：
 
-| 书签类型 | 阶段一：createBookmark 同步路径 | 阶段二：Worker 异步路径 |
-|---------|------------------------------|-----------------------|
-| **LINK** | `LinkCrawlerQueue` 或 `LowPriorityCrawlerQueue` 二选一 | 爬取成功后 → `OpenAIQueue` (tag + summarize) + `VideoWorkerQueue` (可选) |
-| **TEXT** | `OpenAIQueue` (仅 tag) | 无（已在阶段一入队） |
-| **ASSET** | `AssetPreprocessingQueue` | 资产预处理完成后无进一步 AI 入队 |
+| 书签类型 | 阶段一：createBookmark 同步路径 | 阶段二：Worker 异步路径 | 阶段三：预处理完成后 |
+|---------|------------------------------|-----------------------|-------------------|
+| **LINK** | `LinkCrawlerQueue` 或 `LowPriorityCrawlerQueue` 二选一 | 爬取成功且 `runInference !== false` → `OpenAIQueue` (tag + summarize) + `VideoWorkerQueue` (可选) | 不涉及 |
+| **TEXT** | `OpenAIQueue` (仅 tag) | 无（已在阶段一入队） | 不涉及 |
+| **ASSET** (直接创建) | `AssetPreprocessingQueue` | 不涉及 | 预处理成功 → `OpenAIQueue` (tag + summarize) |
+| **ASSET** (LINK 转型而来) | `LinkCrawlerQueue` 或 `LowPriorityCrawlerQueue` | crawler 检测到 PDF/图片 → `handleAsAssetBookmark()` 转型 → `AssetPreprocessingQueue` | 预处理成功 → `OpenAIQueue` (tag + summarize) |
+
+> **⚠️ 关键修正**：之前"ASSET 预处理后无 AI 入队"的表述错误。**无论 ASSET 是直接创建还是由 LINK 转型而来，都会在 AssetPreprocessingQueue 处理完成后触发 OpenAIQueue 的 tag 和 summarize 任务**。
 
 **设计意图分析**：
 1.  **解耦关注点**：创建路径只负责持久化和入队第一个必要任务，避免同步路径阻塞
 2.  **失败隔离**：爬取失败不会影响书签创建成功（至少保存了 URL）
-3.  **依赖顺序**：AI 打标签和摘要需要爬取到的内容，因此必须在爬取完成后触发
-4.  **优先级传递**：`enqueueOpts.priority` 从爬取任务继承到子任务（`crawlerWorker.ts:2293-2296`）
+3.  **依赖顺序**：AI 打标签和摘要需要提取到的文本内容，因此必须在爬取/预处理完成后触发
+4.  **优先级传递**：`enqueueOpts.priority` 从父任务继承到子任务
+5.  **转型透明性**：LINK 转型为 ASSET 后，后续处理流程与直接创建的 ASSET 完全一致
 
-**完整代码证据**：
+---
 
-阶段一（`bookmarks.ts:394-429`）：
+#### runInference 约束范围澄清
+
+**`runInference` 仅限制 crawler 的 LINK 分支，不限制 ASSET 预处理分支**。
+
+- **`runInference` 字段定义**（`shared-server/src/queues.ts:83`）：
+  ```typescript
+  export const zCrawlLinkRequestSchema = z.object({
+    bookmarkId: z.string(),
+    runInference: z.boolean().optional(),  // 仅 ZCrawlLinkRequest 有此字段
+    archiveFullPage: z.boolean().optional(),
+    storePdf: z.boolean().optional(),
+  });
+  ```
+  `AssetPreprocessingRequest` schema 中**没有** `runInference` 字段。
+
+- **LINK 分支的 runInference 检查**（`crawlerWorker.ts:2298-2299`）：
+  ```typescript
+  if (job.data.runInference !== false) {  // 仅此处检查
+    await OpenAIQueue.enqueue(...);
+  }
+  ```
+
+- **ASSET 预处理分支无 runInference 检查**（`assetPreprocessingWorker.ts:463-477`）：
+  ```typescript
+  if (!isFixMode || anythingChanged) {  // 仅检查 fixMode 和变化状态
+    await OpenAIQueue.enqueue({ bookmarkId, type: "tag" }, enqueueOpts);
+    await OpenAIQueue.enqueue({ bookmarkId, type: "summarize" }, enqueueOpts);
+    await triggerSearchReindex(bookmarkId, enqueueOpts);
+  }
+  ```
+
+**实际影响**：
+- 通过规则引擎创建的书签设置 `runInference: false`，可以跳过 LINK 爬取后的 AI 处理
+- 但如果该 LINK 在 crawler 中被检测为 PDF/图片并转型为 ASSET，后续的 AssetPreprocessingQueue 仍会触发 AI 处理
+- 这是一个**设计边界**：`runInference` 只控制 LINK 路径的 AI，不控制 ASSET 路径的 AI
+
+---
+
+#### 完整代码证据
+
+**阶段一**（`bookmarks.ts:394-429`）：
 ```typescript
 switch (bookmark.content.type) {
   case BookmarkTypes.LINK: {
@@ -646,16 +725,25 @@ switch (bookmark.content.type) {
 }
 ```
 
-阶段二（`crawlerWorker.ts:2298-2314`）：
+**阶段二（LINK 转型 ASSET 分支）**（`crawlerWorker.ts:1690-1739`）：
+```typescript
+// crawler 检测到 Content-Type 为 PDF 或 image
+if (isPdf || (contentType && IMAGE_ASSET_TYPES.has(contentType))) {
+  await handleAsAssetBookmark(url, "pdf" | "image", userId, jobId, bookmarkId, ...);
+  // 内部逻辑：
+  // 1. downloadAndStoreFile() 下载文件
+  // 2. 数据库事务：更新 bookmarks.type = ASSET，删除 bookmark_links
+  // 3. AssetPreprocessingQueue.enqueue({ bookmarkId, fixMode: false })
+  return;  // 直接返回，不会执行后续的 LINK 分支 runInference 检查
+}
+```
+
+**阶段二（LINK 正常分支）**（`crawlerWorker.ts:2298-2314`）：
 ```typescript
 // 仅当 crawl 成功且 runInference !== false 时触发
 if (job.data.runInference !== false) {
-  await OpenAIQueue.enqueue(
-    { bookmarkId, type: "tag" }, enqueueOpts
-  );
-  await OpenAIQueue.enqueue(
-    { bookmarkId, type: "summarize" }, enqueueOpts
-  );
+  await OpenAIQueue.enqueue({ bookmarkId, type: "tag" }, enqueueOpts);
+  await OpenAIQueue.enqueue({ bookmarkId, type: "summarize" }, enqueueOpts);
 }
 
 // 其他后续任务
@@ -666,14 +754,27 @@ if (serverConfig.crawler.downloadVideo) {
 await webhookService.triggerWebhook(bookmarkId, "crawled", ...);
 ```
 
-**优先级传递机制**（`crawlerWorker.ts:2293-2296`）：
+**阶段三（ASSET 预处理完成后）**（`assetPreprocessingWorker.ts:458-481`）：
 ```typescript
+// 优先级传递
 const enqueueOpts: EnqueueOptions = {
-  priority: job.priority,      // 继承爬取任务的优先级
-  groupId: userId,             // 继承用户分组
+  priority: req.priority,      // 继承预处理任务的优先级
+  groupId: bookmark.userId,
 };
+
+// 触发条件：非修复模式 或 有内容变化
+if (!isFixMode || anythingChanged) {
+  await OpenAIQueue.enqueue({ bookmarkId, type: "tag" }, enqueueOpts);
+  await OpenAIQueue.enqueue({ bookmarkId, type: "summarize" }, enqueueOpts);
+  await triggerSearchReindex(bookmarkId, enqueueOpts);
+}
 ```
-这意味着低优先级爬取任务产生的 AI 任务也会是低优先级。
+
+**优先级传递机制**：
+- `crawlerWorker.ts:2293-2296`（LINK 分支）：`priority: job.priority`
+- `assetPreprocessingWorker.ts:459-462`（ASSET 分支）：`priority: req.priority`
+
+低优先级任务产生的 AI 子任务也会是低优先级。
 
 ---
 
@@ -856,12 +957,15 @@ if (settings.customHeaders) {
 | Layout 路由守卫 | `apps/browser-extension/src/Layout.tsx` | 未配置检测 → `/notconfigured` |
 | SingleFile 集成 | `apps/browser-extension/src/utils/singlefile.ts` | `capturePageWithSingleFile`, `uploadSingleFileAsset`, `injectSingleFileContentScript`, `sendCaptureMessage` |
 | 内容脚本 | `apps/browser-extension/src/content-scripts/singlefile-content-script.ts` | `captureCurrentPage`, `restoreOriginalImageUrls`, `CAPTURE_PAGE` 监听器 |
-| 队列定义 | `packages/shared-server/src/queues.ts` | `LinkCrawlerQueue`, `LowPriorityCrawlerQueue`, `OpenAIQueue`, `QueuePriority` |
+| 队列定义 | `packages/shared-server/src/queues.ts` | `LinkCrawlerQueue`, `LowPriorityCrawlerQueue`, `AssetPreprocessingQueue`, `OpenAIQueue`, `QueuePriority`, `zCrawlLinkRequestSchema` (含 `runInference` 字段) |
 | 阶段一队列入队 | `packages/trpc/routers/bookmarks.ts` | `createBookmark` 中的 `switch (bookmark.content.type)` 分流 (L394-429) |
 | 爬取 Worker 主逻辑 | `apps/workers/workers/crawlerWorker.ts` | `CrawlerWorker.build`, `runCrawler` (L2190) |
-| 阶段二队列触发 | `apps/workers/workers/crawlerWorker.ts` | `runCrawler` 中爬取后的 `OpenAIQueue.enqueue` (L2298-2314) |
-| 优先级传递 | `apps/workers/workers/crawlerWorker.ts` | `enqueueOpts.priority = job.priority` (L2293-2296) |
-| 内容类型检测转型 | `apps/workers/workers/crawlerWorker.ts` | `getContentType`, `handleAsAssetBookmark` (L1608, L1670) |
+| LINK 转型 ASSET | `apps/workers/workers/crawlerWorker.ts` | `getContentType` (L1608), `handleAsAssetBookmark` (L1670) |
+| 阶段二 LINK 分支队列触发 | `apps/workers/workers/crawlerWorker.ts` | `runCrawler` 中爬取后的 `OpenAIQueue.enqueue` + `runInference` 检查 (L2298-2314) |
+| 资产预处理 Worker | `apps/workers/workers/assetPreprocessingWorker.ts` | `AssetPreprocessingWorker.build`, `run` (L372) |
+| 资产文本提取 | `apps/workers/workers/assetPreprocessingWorker.ts` | `extractAndSavePDFText`, `extractAndSaveImageText`, `readImageTextWithLLM` |
+| 阶段三 ASSET 分支队列触发 | `apps/workers/workers/assetPreprocessingWorker.ts` | 预处理后的 `OpenAIQueue.enqueue` (L463-481)，**无 `runInference` 检查** |
+| 优先级传递 | `apps/workers/workers/crawlerWorker.ts`, `assetPreprocessingWorker.ts` | `enqueueOpts.priority = job.priority` (L2293-2296, L459-462) |
 | 设置存储 | `apps/browser-extension/src/utils/settings.ts` | `getPluginSettings`, `usePluginSettings`, `zSettingsSchema` |
 | 登录页面 | `apps/browser-extension/src/SignInPage.tsx` | `api.apiKeys.exchange`, `api.apiKeys.validate` |
 | API Key 生成 | `packages/trpc/auth.ts` | `generateApiKey`, `authenticateApiKey`, `parseApiKey` |
