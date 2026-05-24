@@ -29,11 +29,14 @@ Karakeep 的书签导入导出系统位于 `packages/shared/import-export/`，�
     └─ 调用 importBookmarksFromFile
         ↓
 [importer.ts] importBookmarksFromFile
-    ├─ 解析文件（parseImportFile）⚠️ fail-fast，格式错误直接抛出
+    ├─ 解析文件（parseImportFile）⚠️ Schema级fail-fast，字段级宽松
+    │   ├─ 过滤点A：Parser内记录过滤（空URL/feed/非URL行）
+    │   └─ 过滤点B：字段级宽松降级（产生content: undefined）
     ├─ 创建导入根列表
     ├─ 重建目录结构（paths 或 listExternalIds）
     ├─ 转换为 StagedBookmark
-    ├─ 批量暂存（50条/批）⚠️ 暂存前会过滤无效书签
+    ├─ 批量暂存（50条/批）
+    │   └─ 过滤点C：Service层暂存前过滤（link无URL/text无content）
     └─ finalize → 会话状态从 staging → pending
         ↓
 [importWorker.ts] ImportWorker（轮询，空闲时5秒/次，繁忙时无间隔）
@@ -44,7 +47,7 @@ Karakeep 的书签导入导出系统位于 `packages/shared/import-export/`，�
     │   ├─ 公平调度取候选
     │   ├─ 原子声明为 processing
     │   ├─ processOneBookmark（并行处理）
-    │   │   ├─ 二次校验空 URL/空内容
+    │   │   ├─ 过滤点D：Worker二次校验空URL/空内容
     │   │   ├─ createBookmark
     │   │   ├─ updateTags
     │   │   ├─ attachBookmarkToLists
@@ -214,155 +217,141 @@ or(isNull(taggingStatus), eq(taggingStatus, "success"), eq(taggingStatus, "failu
 
 ## 失败容忍与重试机制（修正版）
 
-### 1. 空 URL / 空内容的多入口判定路径
+### 1. 空 URL / 空内容的统一判定矩阵
 
-空 URL 和空内容的处理**取决于数据进入系统的入口**，共有 4 个可能的入口，产生 3 种不同结果：
+#### 概念澄清（口径统一）
 
-```
-                                 数据来源
-                                     │
-            ┌───────────┬────────────┼────────────┬───────────┐
-            │           │            │            │           │
-            ▼           ▼            ▼            ▼           ▼
-      正常导入      直接调用      直接调用    Parser 内部   Parser 内部
-   importBookmarks stageBookmarks insertStaging   过滤       产生
-     FromFile      service          repo          (RW)    content:undefined
-          │            │              │            │           │
-          │            │              │            │           │
-          ├────────────┘              │            ▼           │
-          │                           │         丢弃，        │
-          ▼                           │       不进入流程     │
-  暂存前过滤                          │                        │
-          │                           │                        │
-          ├───────────────────────────┘                        │
-          │                                                    │
-          ▼                                                    │
-    过滤丢弃                                               传递到
-  无失败记录                                             暂存前过滤
-                                                               │
-                                                               ▼
-                                                          过滤丢弃
-                                                        无失败记录
-                                              （除非暂存前过滤被绕过）
-                                                               │
-                                                               └──────┐
-                                                                      │
-                                                                      ▼
-                                                          Worker 二次校验
-                                                                      │
-                                                                      ▼
-                                                          抛出错误 → catch
-                                                                      │
-                                                                      ▼
-                                                          status: "failed"
-                                                          result: "rejected"
-                                                          resultReason: 白名单安全消息
-                                                          completedAt: now
-                                                          （产生可见失败记录）
-```
+**真实入口（3 个，按调用层级）**：数据进入系统的 API 边界
+
+| 入口编号 | 入口名称 | 调用路径 | 过滤点覆盖 |
+|---------|---------|---------|-----------|
+| 入口 1 | 正常导入流程 | `importBookmarksFromFile` → `stageBookmarks`（service） | A → B → C |
+| 入口 2 | 直接调用 service 层 | 直接调用 `stageBookmarks`（service） | C |
+| 入口 3 | 直接调用 repo 层 | 直接调用 `insertStagingBookmarks`（repo） | D |
+
+**过滤点（4 个，按数据流向执行，统一命名 A、B、C、D）**：
+
+| 过滤点 | 名称 | 位置 | 触发条件 | 处理结果 |
+|--------|------|------|---------|---------|
+| **A** | Parser 内记录过滤 | `parsers.ts` 各 parser 内 | 空 URL / feed 项 / 非 URL 行 | 记录被过滤，不进入后续 |
+| **B** | Parser 字段级宽松 | `parsers.ts` 字段转换时 | URL/Selection 都为空 | 产生 `content: undefined`，继续传递 |
+| **C** | Service 层暂存前过滤 | `importSessions.service.ts:95-100` | link 无 URL / text 无 content | 静默丢弃，不入库 |
+| **D** | Worker 二次校验 | `importWorker.ts:392-404` | link 无 URL / text 无 content | 抛出错误 → catch → 标记失败入库 |
+
+> **统一规则**：过滤点 A、B、C 属于"前端/预处理层"，静默处理不产生失败记录；只有过滤点 D（Worker 层）才会产生可见的失败记录。
 
 ---
 
-#### 入口 A：正常导入流程（`importer.ts` → `stageBookmarks`）
+#### 统一判定矩阵（3 × 4 × 结果）
 
-**路径**：
-1. `parseImportFile()` 解析文件
-   - Readwise Reader 内部会过滤空 URL（parsers.ts:542-544）
-   - Instapaper 中 URL 和 Selection 都为空时产生 `content: undefined`
-   - Pocket 无 URL 的行会产生 `content.url: ""`
-2. `importBookmarksFromFile()` 调用 `stageBookmarks`
-3. `stageBookmarks` 暂存前过滤（importSessions.service.ts:95-100）：
-```typescript
-const validBookmarks = bookmarks.filter((bookmark) => {
-  if (bookmark.type === "link" && !bookmark.url) return false;
-  if (bookmark.type === "text" && !bookmark.content) return false;
-  return true;
-});
+| 入口 | 经过过滤点 | 空 URL 触发点 | 处理方式 | 失败记录 | `stats.totalBookmarks` 包含 | `counts.total` 包含 |
+|------|-----------|--------------|---------|---------|----------------------------|--------------------|
+| **入口 1** 正常导入 | A → B → C | 过滤点 A（如 RW parser） | Parser 内过滤 | ❌ 无 | ❌ | ❌ |
+| **入口 1** 正常导入 | A → B → C | 过滤点 B（如 Instapaper） | 过滤点 C 丢弃 | ❌ 无 | ❌ | ✅（解析到但过滤前计数） |
+| **入口 1** 正常导入 | A → B → C | 过滤点 C（如 Pocket 空 URL） | 过滤点 C 丢弃 | ❌ 无 | ❌ | ✅（解析到但过滤前计数） |
+| **入口 2** 直接调 service | 仅 C | 过滤点 C | 过滤点 C 丢弃 | ❌ 无 | ❌ | -（不经过 parser） |
+| **入口 3** 直接调 repo | 仅 D | 过滤点 D | Worker 校验失败入库 | ✅ 有 | ✅ | -（不经过 parser） |
+
+---
+
+#### 各入口详细路径
+
+##### 入口 1：正常导入流程（`importBookmarksFromFile` → `stageBookmarks`）
+
+**完整链路**：
+```
+用户上传文件
+    ↓
+parseImportFile()  [过滤点 A: 部分 parser 内过滤空 URL / feed]
+    ↓                           ↓
+（通过）                 （被过滤点 A 拦截）
+    ↓                           ↓
+字段转换           不进入后续，counts.total 不计数
+    ↓
+[过滤点 B: 字段级宽松，可能产生 content: undefined]
+    ↓
+importBookmarksFromFile() 转换为 StagedBookmark
+    ↓
+调用 stageBookmarks
+    ↓
+[过滤点 C: service 层暂存前过滤]
+    ↓                           ↓
+（通过）                 （被过滤点 C 拦截）
+    ↓                           ↓
+insertStagingBookmarks     静默丢弃，totalBookmarks 不计数
+    ↓
+status: pending
 ```
 
-**结果**：**静默丢弃**，不产生任何数据库记录，`stats.totalBookmarks` 不包含这些项。
+**代码位置**：
+- 过滤点 A：`parsers.ts:539-544`（RW）、`parsers.ts:598-601`（OneTab）
+- 过滤点 B：`parsers.ts:452-460`（Instapaper）、`parsers.ts:393-410`（mymind）
+- 过滤点 C：`importSessions.service.ts:95-100`
 
----
+##### 入口 2：直接调用 `stageBookmarks`（service 层）
 
-#### 入口 B：直接调用 `stageBookmarks` API（绕过 parser）
-
-**路径**：
-1. 调用者直接构造 `StagedBookmark` 数据
-2. 调用 `importSessions.stageBookmarks`
-3. 暂存前过滤仍会执行（同上）
-
-**结果**：**静默丢弃**，与入口 A 相同。
-
----
-
-#### 入口 C：直接调用 `insertStagingBookmarks` repo 层（绕过 service 层过滤）
-
-**路径**：
-1. 调用者直接构造 `importStagingBookmarks` 数据库记录（含空 URL）
-2. 调用 `importSessionsRepo.insertStagingBookmarks`
-3. 不经过 service 层过滤，直接入库
-4. Worker 轮询到该记录，二次校验：
-```typescript
-if (staged.type === "link") {
-  if (!staged.url) {
-    throw new Error("URL is required for link bookmarks");
-  }
-}
+**完整链路**：
 ```
-5. 错误被 `processOneBookmark` 的 try-catch 捕获（importWorker.ts:469-485）
-6. 标记为失败状态
-
-**结果**：**产生可见失败记录**：
-- `status: "failed"`
-- `result: "rejected"`
-- `resultReason: "URL is required for link bookmarks"`（通过 `getSafeErrorMessage` 白名单）
-- `completedAt: now`
-
----
-
-#### 入口 D：Parser 内部产生 `content: undefined`（如 Instapaper）
-
-**路径**：
-1. Instapaper 中某条记录的 `URL` 和 `Selection` 都为空
-2. Parser 逻辑（parsers.ts:452-460）：
-```typescript
-let content: ParsedBookmark["content"];
-if (record.URL && record.URL.trim().length > 0) {
-  content = { type: BookmarkTypes.LINK, url: record.URL.trim() };
-} else if (record.Selection && record.Selection.trim().length > 0) {
-  content = { type: BookmarkTypes.TEXT, text: record.Selection.trim() };
-}
-// 两者都为空 → content = undefined
-```
-3. `type` 默认是 `"link"`（由 importer.ts 推断），但 `url` 是 `undefined`
-4. 进入暂存前过滤 → `bookmark.type === "link" && !bookmark.url` → `return false`
-
-**结果**：**静默丢弃**，与入口 A 相同。
-
----
-
-#### 入口 E：Readwise Reader parser 内部过滤空 URL
-
-**路径**（parsers.ts:542-544）：
-```typescript
-const emptyFilteredArticles = feedFilteredArticles.filter(
-  (record) => record.URL && record.URL.trim().length > 0,
-);
+调用者构造 StagedBookmark（含空 URL）
+    ↓
+调用 importSessions.stageBookmarks
+    ↓
+[过滤点 C: service 层暂存前过滤]
+    ↓                           ↓
+（通过）                 （被过滤点 C 拦截）
+    ↓                           ↓
+insertStagingBookmarks     静默丢弃，totalBookmarks 不计数
+    ↓
+status: pending
 ```
 
-**结果**：**在 parser 层就被过滤**，不会传递到后续流程，`counts.total` 也不包含这些项。
+**代码位置**：
+- 过滤点 C：`importSessions.service.ts:95-100`
+
+##### 入口 3：直接调用 `insertStagingBookmarks`（repo 层，绕过过滤）
+
+**完整链路**：
+```
+调用者直接构造数据库记录（含空 URL）
+    ↓
+调用 importSessionsRepo.insertStagingBookmarks
+    ↓
+直接入库，status: pending
+    ↓
+Worker 轮询声明为 processing
+    ↓
+[过滤点 D: Worker 二次校验]
+    ↓                           ↓
+（通过）                 （被过滤点 D 拦截）
+    ↓                           ↓
+正常处理            throw Error → try-catch 捕获
+                          ↓
+                    status: "failed"
+                    result: "rejected"
+                    resultReason: "URL is required for link bookmarks"
+                    completedAt: now
+                    （产生可见失败记录）
+```
+
+**代码位置**：
+- 过滤点 D：`importWorker.ts:392-404`（校验）、`importWorker.ts:469-485`（catch 后标记失败）
+- 白名单机制：`importWorker.ts:89-93`
 
 ---
 
-### 关键区别总结
+### 关键区别总结（统一口径）
 
-| 入口 | 空 URL 处理方式 | 失败记录 | 用户可见 |
-|------|----------------|---------|---------|
-| 正常导入流程 | 暂存前过滤，静默丢弃 | ❌ 无 | ❌ |
-| 直接调用 `stageBookmarks` | 暂存前过滤，静默丢弃 | ❌ 无 | ❌ |
-| 直接调用 repo 层 | Worker 二次校验，标记失败 | ✅ 有 | ✅ |
-| Instapaper `content: undefined` | 暂存前过滤，静默丢弃 | ❌ 无 | ❌ |
-| Readwise Reader 内部过滤 | Parser 内过滤，不进入后续 | ❌ 无 | ❌ |
+| 维度 | 过滤点 A/B/C | 过滤点 D |
+|------|-------------|---------|
+| 层级 | Parser / Service | Worker |
+| 处理方式 | 静默过滤 / 字段降级 | 标记失败入库 |
+| 失败记录 | ❌ 无 | ✅ 有 |
+| 用户可见 | ❌ | ✅ |
+| `stats.totalBookmarks` | ❌（A/C）/ ✅（B 但被 C 滤掉） | ✅ |
+| `counts.total` | ❌（A）/ ✅（B、C） | -（不经过 parser） |
+| 重试可能 | 否（已被过滤，不在数据库） | 否（已标记为 failed，终态） |
+
+> **统一原则**：数据一旦通过过滤点 C 进入数据库，要么成功处理（`status: "completed"`，`result: "accepted"`/`"skipped_duplicate"`），要么失败入库（`status: "failed"`，`result: "rejected"`），永远不会被静默删除。
 
 ### 2. Worker 阶段二次校验（深层防御）
 
@@ -754,9 +743,10 @@ const stats = {
 
 **特殊处理**:
 - 空文件夹名 → `"Unnamed"` (parsers.ts:72)
-- 无 URL 的书签也会被保留（`content` 为 `undefined`），但会在暂存前被过滤
+- 无 URL 的书签也会被保留（`content` 为 `undefined`）→ **触发过滤点 B**
 - Schema 级 Fail-Fast：文件头不匹配直接 `throw Error`
 - 字段级宽松：逐行解析，单条记录问题不影响整体
+- 过滤点链路：A（无）→ B（content: undefined）→ C（暂存前过滤丢弃）
 
 ### 2. Pocket (`pocket`)
 
@@ -772,8 +762,9 @@ const stats = {
 
 **特殊处理**:
 - 无 Schema 级验证，完全宽松解析
-- 无 URL 的行也会被解析（`content.url: ""`），但会在暂存前被过滤
+- 无 URL 的行也会被解析（`content.url: ""`）→ **触发过滤点 C**
 - 字段级宽松：逐行映射，不做 schema 校验
+- 过滤点链路：A（无）→ B（无）→ C（暂存前过滤丢弃）
 
 ### 3. Readwise Reader (`readwise-reader`)
 
@@ -789,11 +780,12 @@ const stats = {
 | `Location` | 过滤 | `"feed"` → 排除 |
 
 **特殊处理**:
-- 空 URL 项目在 **parser 内就被过滤**（parsers.ts:542-544），不进入后续流程
-- 标签 JSON 解析失败时 `tags = []`（字段级宽松，不抛出错误）
-- feed 项目在 parser 内过滤（parsers.ts:539-541）
+- 空 URL 项目在 **过滤点 A** 被过滤（parsers.ts:542-544），不进入后续流程
+- feed 项目在 **过滤点 A** 被过滤（parsers.ts:539-541）
+- 标签 JSON 解析失败时 `tags = []`（**过滤点 B** 字段级宽松，不抛出错误）
 - Schema 级 Fail-Fast：Zod schema 验证不通过直接 throw
 - 记录级宽松：过滤无效记录不影响整体
+- 过滤点链路：A（空URL/feed）→ B（tags容错）→ C（无）
 
 ### 4. Instapaper (`instapaper`)
 
@@ -809,9 +801,10 @@ const stats = {
 | `Folder` | `archived`/`paths` | `"Archive"` → `archived: true`; `"Unread"` → 无路径; 其他 → `paths: [[Folder]]` |
 
 **特殊处理**:
-- URL 和 Selection 都为空时产生 `content: undefined`（字段级宽松），后续由暂存前过滤处理
-- 标签 JSON 解析失败时 `tags = []`（字段级宽松，不抛出错误）
+- URL 和 Selection 都为空时产生 `content: undefined`（**过滤点 B** 字段级宽松）→ **触发过滤点 C**
+- 标签 JSON 解析失败时 `tags = []`（**过滤点 B** 字段级宽松，不抛出错误）
 - Schema 级 Fail-Fast：Zod schema 验证不通过直接 throw
+- 过滤点链路：A（无）→ B（content: undefined / tags容错）→ C（暂存前过滤丢弃）
 
 ### 5. Karakeep 自有格式 (`karakeep`)
 
@@ -834,7 +827,8 @@ const stats = {
 - 智能列表（`type: "smart"`）不与书签关联，仅作为列表元数据导入
 - `listExternalIds` 过滤掉智能列表 ID
 - Schema 级 Fail-Fast：Zod schema 验证不通过直接 throw
-- 字段级宽松：无效 content 会在后续流程中被过滤
+- 字段级宽松：无效 content 会触发 **过滤点 C**（暂存前过滤）
+- 过滤点链路：A（无）→ B（content 判别）→ C（无效 content 过滤）
 
 ---
 
