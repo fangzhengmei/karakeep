@@ -309,7 +309,7 @@ Mobile 端通过 `ReaderSettingsProvider`（`apps/mobile/lib/readerSettings.tsx`
 
 #### 2.4.1 阅读器设置的两条写回路径
 
-共享 hook `useReaderSettings`（`packages/shared-react/hooks/reader-settings.tsx`）中实现了两条独立的写回路径，Web 端和移动端共享同一套逻辑，但使用方式略有差异。
+共享 hook `useReaderSettings`（`packages/shared-react/hooks/reader-settings.tsx`）中实现了两条独立的写回路径，**Web 端和移动端共享完全一致的写回粒度**——两条路径都总是同时更新全部 3 个字段。
 
 ##### 路径 1：saveAsDefault（保存为默认）
 
@@ -334,16 +334,20 @@ const saveAsDefault = useCallback(
 );
 ```
 
+**关键机制**：`saveAsDefault` 内部会用当前 `settings` 的值补全未传入的字段，因此**无论调用时传入几个字段，最终提交到服务端的总是全部 3 个字段**。
+
 **使用的 mutation**：`saveServerSettings`（第 90-107 行）
 - 成功回调：自动清除本地覆盖（localOverrides）和会话覆盖（sessionOverrides）
 - 乐观更新：设置 `pendingServerSave`，防止同步期间的闪烁
 - 错误回滚：失败时清除 `pendingServerSave` 状态
 
-**字段更新特点**：
-| 端 | 调用方式 | 更新字段 | 触发场景 |
-|----|---------|---------|---------|
-| **Web 端** | `saveAsDefault({ fontSize: 18 })` | 可单个字段或全部 3 个 | 1. 阅读器设置页面修改下拉/滑块时立即同步单个字段<br>2. 预览弹窗点击 "Save to All Devices" 同步全部 3 个 |
-| **Mobile 端** | `saveAsDefault()`（不传参数） | **总是同时更新全部 3 个字段** | 阅读器设置页面点击 "Save as Default (All Devices)" 按钮 |
+**字段更新特点**（Web 和移动端行为一致）：
+| 端 | 调用方式示例 | 实际提交字段 | 触发场景 |
+|----|-------------|-------------|---------|
+| **Web 端** | `updateServerSetting({ fontSize: 18 })` | `{ readerFontSize: 18, readerLineHeight: 1.5, readerFontFamily: "sans" }`（补全另外两个字段的当前值） | 1. 阅读器设置页面修改下拉/滑块时立即调用<br>2. 预览弹窗点击 "Save to All Devices" 调用 |
+| **Mobile 端** | `saveAsDefault()`（不传参数） | `{ readerFontSize: 20, readerLineHeight: 1.6, readerFontFamily: "serif" }`（使用当前 settings 的值） | 阅读器设置页面点击 "Save as Default (All Devices)" 按钮 |
+
+**重要修正**：之前认为 Web 端支持单字段更新是错误的。Web 端的 `updateServerSetting` 本质上就是 `saveAsDefault`，即使只传入 `{ fontSize: 18 }`，也会被内部补全为 3 个字段同时提交。
 
 ##### 路径 2：clearAllDefaults（清除服务器默认）
 
@@ -363,13 +367,13 @@ const clearAllDefaults = useCallback(() => {
 - 乐观更新：无 `pending` 状态
 - 语义：将字段设为 `null`，表示"使用系统默认值"（`READER_DEFAULTS`）
 
-**字段更新特点**：
-| 端 | 更新字段 | 触发场景 |
-|----|---------|---------|
-| **Web 端** | 3 个字段同时设为 `null` | 阅读器设置页面点击 "Clear defaults" 按钮 |
-| **Mobile 端** | 3 个字段同时设为 `null` | 阅读器设置页面点击 "Clear Server Defaults" 按钮 |
+**字段更新特点**（Web 和移动端行为一致）：
+| 端 | 实际提交字段 | 触发场景 |
+|----|-------------|---------|
+| **Web 端** | `{ readerFontSize: null, readerLineHeight: null, readerFontFamily: null }` | 阅读器设置页面点击 "Clear defaults" 按钮 |
+| **Mobile 端** | `{ readerFontSize: null, readerLineHeight: null, readerFontFamily: null }` | 阅读器设置页面点击 "Clear Server Defaults" 按钮 |
 
-**重要特性**：`clearAllDefaults` 不会清除本地覆盖。如果某设备有本地覆盖，清除服务器默认后，该设备仍会显示本地覆盖值，而其他设备会回退到系统默认值。
+**重要特性**：`clearAllDefaults` 不会清除本地覆盖。如果某设备有本地覆盖，清除服务器默认后，该设备仍会显示本地覆盖值，而其他设备会回退到系统默认值，可能导致多端不一致。
 
 ##### 附加路径：clearDefault（清除单个服务器默认）
 
@@ -388,7 +392,7 @@ const clearDefault = useCallback(
 );
 ```
 
-**使用情况**：目前在 Web 端和移动端都没有 UI 调用此函数，仅作为 API 导出。
+**使用情况**：这是**唯一支持单字段更新**的 API，但目前在 Web 端和移动端都没有 UI 调用此函数，仅作为内部 API 导出。
 
 #### 2.4.2 移动端同步代码示例
 
@@ -415,23 +419,23 @@ const handleClearServerDefaults = () => {
 |---------|-----|--------|
 | **页面加载** | ✅ SSR 预取 + React Query 缓存 | ✅ React Query 懒加载（仅阅读器设置和 archiveDisplayBehaviour） |
 | **设置变更后主动刷新** | ✅ 所有 14 项设置变更后均 `invalidateQueries` 触发重新拉取 | ⚠️ 仅阅读器设置同步后 `refetchQueries`，其他设置永不同步 |
-| **设置变更触发同步** | ✅ 所有设置变更立即同步到服务端<br>阅读器设置支持单字段即时同步 | ⚠️ 仅阅读器设置同步，且必须用户显式操作：<br>• 点击 "Save as Default" → saveAsDefault 路径<br>• 点击 "Clear Server Defaults" → clearAllDefaults 路径<br>其他设置仅本地保存 |
+| **设置变更触发同步** | ✅ 所有设置变更立即同步到服务端<br>• 非阅读器设置：通过 `useUpdateUserSettings` 可单字段更新<br>• 阅读器设置：通过 `saveAsDefault` 总是同时更新 3 个字段 | ⚠️ 仅阅读器设置同步，且必须用户显式操作：<br>• 点击 "Save as Default" → saveAsDefault 路径<br>• 点击 "Clear Server Defaults" → clearAllDefaults 路径<br>其他设置仅本地保存 |
 | **定时轮询** | ❌ 无自动轮询 | ❌ 无自动轮询 |
 | **实时推送** | ❌ 无 WebSocket/Server-Sent Events | ❌ 无实时推送 |
 | **应用回到前台** | ❌ 无显式刷新 | ❌ 无显式刷新 |
 
-### 2.6 两条写回路径的行为对比
+### 2.6 两条写回路径的行为对比（Web 与移动端行为完全一致）
 
 | 维度 | 路径 1：saveAsDefault | 路径 2：clearAllDefaults |
 |-----|----------------------|-------------------------|
-| **触发按钮** | "Save as Default (All Devices)" | "Clear Server Defaults" |
+| **触发按钮** | Web：修改下拉/滑块，或点击 "Save to All Devices"<br>Mobile：点击 "Save as Default (All Devices)" | Web：点击 "Clear defaults"<br>Mobile：点击 "Clear Server Defaults" |
 | **写入值** | 具体的非 null 数值 | `null`（表示使用系统默认） |
-| **Web 端字段范围** | 可单字段或全部 3 个 | 总是全部 3 个字段 |
-| **Mobile 端字段范围** | 总是全部 3 个字段 | 总是全部 3 个字段 |
+| **字段范围** | **总是全部 3 个字段**（即使只传入一个参数，内部也会补全另外两个） | **总是全部 3 个字段** |
 | **使用的 mutation** | `saveServerSettings` | `updateServerSettings` |
 | **成功后清除本地覆盖** | ✅ 自动清除 | ❌ 不清除，本地覆盖继续生效 |
 | **乐观更新** | ✅ 设置 pendingServerSave | ❌ 无 pending 状态 |
-| **冲突风险** | 🟡 中：可能覆盖其他端的同字段修改 | 🟠 中高：一次性清空 3 个字段，可能覆盖其他端的所有阅读器设置 |
+| **冲突风险** | 🟡 中高：每次都覆盖全部 3 个字段，可能覆盖其他端的修改 | 🟠 高：一次性清空 3 个字段，可能覆盖其他端的所有阅读器设置 |
+| **实际提交内容示例** | `{ readerFontSize: 18, readerLineHeight: 1.5, readerFontFamily: "sans" }` | `{ readerFontSize: null, readerLineHeight: null, readerFontFamily: null }` |
 
 ---
 
@@ -453,56 +457,61 @@ const handleClearServerDefaults = () => {
 
 ### 3.1.1 两条写回路径对冲突范围的影响
 
-由于两条写回路径更新字段的范围不同，冲突的风险和影响范围也有显著差异：
+由于两条写回路径**总是同时更新全部 3 个字段**，冲突的风险和影响范围是一致的，不存在"单字段更新"的情况（仅内部 API `clearDefault` 支持单字段更新，但没有 UI 使用）：
 
 | 写回路径 | Web 端更新字段 | 移动端更新字段 | 冲突风险 | 影响范围 |
 |---------|---------------|---------------|---------|---------|
-| **saveAsDefault（单字段）** | 1 个字段（fontSize/lineHeight/fontFamily） | ❌ 不支持 | 🟡 中 | 仅单个字段可能被覆盖 |
-| **saveAsDefault（全字段）** | 3 个字段同时 | 3 个字段同时 | 🟡 中高 | 可能覆盖其他端对任意阅读器字段的修改 |
-| **clearAllDefaults** | 3 个字段同时设为 null | 3 个字段同时设为 null | 🟠 高 | 一次性清空所有阅读器默认值，覆盖其他端的所有修改 |
+| **saveAsDefault** | 总是 3 个字段同时（内部补全未传入的字段） | 总是 3 个字段同时 | 🟡 中高 | 每次提交都可能覆盖其他端对任意阅读器字段的修改 |
+| **clearAllDefaults** | 总是 3 个字段同时设为 null | 总是 3 个字段同时设为 null | 🟠 高 | 一次性清空所有阅读器默认值，覆盖其他端的所有修改 |
+
+**关键结论**：Web 端和移动端在阅读器设置的写回粒度上**行为完全一致**，都总是同时更新 3 个字段。之前认为 Web 端支持单字段更新是对代码的误读。
 
 ### 3.1.2 冲突场景示例
 
-所有冲突仅可能发生在阅读器的 3 个字段上。
+所有冲突仅可能发生在阅读器的 3 个字段上，且每次冲突都会影响全部 3 个字段。
 
-#### 场景 1：Web 单字段更新 vs 移动端全字段更新（saveAsDefault）
+#### 场景 1：Web 修改字体大小 vs 移动端保存为默认
 ```
 时序：
   T0: 服务端 fontSize=16, lineHeight=1.5, fontFamily=sans
-  T1: Web 用户修改 fontSize 为 18 → 仅更新 readerFontSize=18（Web 支持单字段更新）
-  T2: Mobile 用户在阅读器设置中调整字体为 20（仅本地覆盖）
-  T3: Mobile 用户点击 "Save as Default" → 同时提交 fontSize=20, lineHeight=1.5, fontFamily=sans
+  T1: Web 用户修改 fontSize 为 18 → 实际提交 { readerFontSize: 18, readerLineHeight: 1.5, readerFontFamily: "sans" }
+      （即使只修改字体大小，也会补全行高和字体一起提交）
+  T2: Mobile 用户在阅读器设置中调整字体为 20（仅本地覆盖，服务端仍为 18）
+  T3: Mobile 用户点击 "Save as Default" → 提交 { fontSize: 20, lineHeight: 1.5, fontFamily: "sans" }
   T4: 服务端所有 3 个字段被移动端覆盖
   
 结果：
   Web 端的 fontSize 修改（18）被静默覆盖为 20
-  Web 端需要刷新页面才能看到移动端同步的值
-  更隐蔽的风险：即使 lineHeight 和 fontFamily 没有变化，移动端也会强制覆盖
+  由于 Web 端也提交了全部 3 个字段，Mobile 端的 lineHeight 和 fontFamily 值（1.5、sans）
+  覆盖了 Web 端的相同值（虽值相同，但行为上仍是完全覆盖）
 ```
 
-#### 场景 2：两端同时 saveAsDefault
+#### 场景 2：两端同时修改不同字段
 ```
 时序：
-  T0: 服务端 fontSize=16
-  T1: Web 用户点击 "Save to All Devices" → 提交 fontSize=18
-  T2: 服务端更新为 18，但移动端缓存仍为 16
-  T3: Mobile 用户点击 "Save as Default" → 提交 fontSize=20
-  T4: 服务端直接覆盖为 20
+  T0: 服务端 fontSize=16, lineHeight=1.5, fontFamily=sans
+  T1: Web 用户修改 fontFamily 为 mono → 提交 { fontSize: 16, lineHeight: 1.5, fontFamily: "mono" }
+  T2: 服务端更新，但移动端缓存仍为旧值
+  T3: Mobile 用户调整 lineHeight 为 1.8（仅本地覆盖）
+  T4: Mobile 用户点击 "Save as Default" → 提交 { fontSize: 16, lineHeight: 1.8, fontFamily: "sans" }
+      （注意：mobile 提交的 fontFamily 仍是缓存的旧值 "sans"）
+  T5: 服务端所有 3 个字段被移动端覆盖
   
 结果：
-  Web 端的变更被静默覆盖，用户无任何感知
+  Web 端的 fontFamily 修改（mono）被静默回滚为 sans
+  两端用户都无感知，Web 端需要刷新页面才会发现自己的修改"丢失"了
 ```
 
 #### 场景 3：clearAllDefaults 冲突（风险最高）
 ```
 时序：
-  T0: 服务端 fontSize=18, lineHeight=1.6, fontFamily=serf
-  T1: Web 用户修改 fontFamily 为 sans → 仅更新 readerFontFamily=sans
-  T2: Mobile 用户点击 "Clear Server Defaults" → 同时设置 3 个字段为 null
+  T0: 服务端 fontSize=18, lineHeight=1.6, fontFamily=mono
+  T1: Web 用户修改 fontSize 为 20 → 提交 { fontSize: 20, lineHeight: 1.6, fontFamily: "mono" }
+  T2: Mobile 用户点击 "Clear Server Defaults" → 提交全部 3 个字段为 null
   T3: 服务端所有 3 个字段变为 null，回退到系统默认值
   
 结果：
-  Web 端的 fontFamily 修改被清空
+  Web 端的 fontSize 修改被清空
   所有设备的阅读器设置都回退到系统默认值（READER_DEFAULTS）
   如果某设备有本地覆盖，该设备仍显示本地值，其他设备显示默认值，出现多端不一致
 ```
@@ -556,21 +565,30 @@ onError: () => {
 
 ### 3.4 字段级部分更新
 
-虽然没有冲突检测，但支持**字段级部分更新**。
+虽然 API 层面支持部分更新，但**阅读器设置的两条写回路径都总是同时更新全部 3 个字段**。
 
 #### Web 端更新能力
 
-Web 端可以更新任意单个或多个字段：
-```typescript
-// 通过 useUpdateUserSettings 更新非阅读器设置
-mutate({ timezone: "Asia/Shanghai" });
-mutate({ autoTaggingEnabled: true });
-mutate({ bookmarkClickAction: "expand_bookmark_preview", tagStyle: "lowercase-hyphens" });
+Web 端有两类更新接口，行为不同：
 
-// 通过阅读器设置 hook 单字段更新
-updateServerSetting({ fontSize: 18 });           // 仅更新 readerFontSize
-updateServerSetting({ lineHeight: 1.6 });        // 仅更新 readerLineHeight
-updateServerSetting({ fontFamily: "mono" });     // 仅更新 readerFontFamily
+**1. 非阅读器设置：通过 `useUpdateUserSettings` 支持单字段更新**
+```typescript
+mutate({ timezone: "Asia/Shanghai" });  // 仅更新 timezone
+mutate({ autoTaggingEnabled: true });   // 仅更新 autoTaggingEnabled
+mutate({ 
+  bookmarkClickAction: "expand_bookmark_preview", 
+  tagStyle: "lowercase-hyphens" 
+});  // 同时更新 2 个字段
+```
+
+**2. 阅读器设置：通过 `saveAsDefault` 总是同时更新 3 个字段**
+```typescript
+// 即使只传入 { fontSize: 18 }，内部也会补全为 3 个字段
+updateServerSetting({ fontSize: 18 });  
+// 实际提交：{ readerFontSize: 18, readerLineHeight: 1.5, readerFontFamily: "sans" }
+
+updateServerSetting({ fontFamily: "mono" });
+// 实际提交：{ readerFontSize: 16, readerLineHeight: 1.5, readerFontFamily: "mono" }
 ```
 
 #### 移动端更新能力
@@ -594,9 +612,10 @@ updateServerSettings({
 
 #### 对冲突的影响
 
-- Web 端的单字段更新能力**降低了冲突概率**（只更新真正变更的字段）
-- 移动端的全字段更新方式**扩大了冲突范围**（即使只修改了字体大小，也会同时覆盖行高和字体）
-- 这是一个**不对称的设计**：Web 端可以精细地单字段更新，而移动端每次同步都会"冲刷"全部 3 个字段，增加了意外覆盖的风险
+- **阅读器设置在 Web 端和移动端的写回粒度完全一致**：都总是同时更新全部 3 个字段
+- 之前认为 Web 端支持阅读器设置单字段更新是对代码的误读——`saveAsDefault` 内部会补全未传入的字段
+- 每次阅读器设置同步都会"冲刷"全部 3 个字段，这增加了意外覆盖的风险
+- **真正的单字段更新 API `clearDefault` 仅支持设为 null，且没有被 UI 使用**
 
 ---
 
@@ -606,9 +625,10 @@ updateServerSettings({
 
 | 问题 | 风险等级 | 说明 |
 |-----|---------|------|
-| **阅读器设置无冲突检测** | 🟡 中 | 仅阅读器的 3 个字段可能发生跨端冲突，后写入者静默覆盖先写入者，用户无感知 |
+| **阅读器设置无冲突检测** | 🟡 中高 | 仅阅读器的 3 个字段可能发生跨端冲突，后写入者静默覆盖先写入者，用户无感知 |
+| **阅读器设置更新粒度过粗** | 🟡 中 | 两条写回路径都总是同时更新全部 3 个字段，即使某些字段没有变化也会被强制覆盖，增加了意外覆盖风险 |
 | **clearAllDefaults 冲突风险高** | 🟠 中高 | 清除服务器默认会同时清空 3 个字段，且不清除本地覆盖，容易导致多端不一致和意外覆盖 |
-| **更新粒度不对称** | 🟡 中 | Web 端支持阅读器设置单字段更新，移动端两条路径都总是同时更新全部 3 个字段，即使某些字段没有变化也会被强制覆盖 |
+| **移动端缓存过期问题** | 🟡 中 | 移动端缓存的阅读器设置过期时，调用 saveAsDefault 会用缓存的旧值覆盖其他端的新值（如场景 2 所示） |
 | **无实时同步** | 🟡 中 | 设置变更后，另一端必须刷新页面才能看到更新。例如 Web 端修改了阅读器字体，移动端必须重新进入阅读器设置页面才能看到 |
 | **设置分散，权限不对称** | 🟡 中 | 三套设置体系（服务端/Web本地/Mobile本地），且 Web 端可修改全部 14 个服务端设置，移动端仅能修改 3 个，概念不统一 |
 | **无修改历史** | 🟠 中高 | 无法追溯设置变更历史，问题排查困难 |
@@ -678,32 +698,70 @@ async updateSettings(input, currentVersion) {
 eventBus.emit(`user:${userId}:settings-updated`, newSettings);
 ```
 
-#### 建议 5：统一更新粒度，减少移动端全字段覆盖
+#### 建议 5：优化更新粒度，只提交真正变更的字段
 
-修改移动端 `saveAsDefault` 的实现，支持只更新真正变更的字段，而不是每次都强制覆盖全部 3 个字段：
+修改 `saveAsDefault` 的实现，支持只更新与服务端值不同的字段，而不是每次都强制覆盖全部 3 个字段：
 
 ```typescript
-// 改进前：总是同时更新 3 个字段
+// 改进前：总是同时更新 3 个字段（即使某些字段没有变化）
 saveAsDefault()  // → readerFontSize, readerLineHeight, readerFontFamily 全部被覆盖
 
-// 改进后：仅更新有本地覆盖的字段，或与服务端不同的字段
-saveAsDefault()  // → 只更新实际变更的字段
+// 改进后：对比服务端值，只提交真正变更的字段
+const saveAsDefault = useCallback(
+  (settingsToSave?: ReaderSettingsPartial) => {
+    const toSave: Partial<ReaderSettings> = {};
+    const effective = {
+      fontSize: settingsToSave?.fontSize ?? settings.fontSize,
+      lineHeight: settingsToSave?.lineHeight ?? settings.lineHeight,
+      fontFamily: settingsToSave?.fontFamily ?? settings.fontFamily,
+    };
+    // 只提交与服务端不同的字段
+    if (serverSettings?.readerFontSize !== effective.fontSize) {
+      toSave.readerFontSize = effective.fontSize;
+    }
+    if (Math.abs((serverSettings?.readerLineHeight ?? 0) - effective.lineHeight) > 1e-6) {
+      toSave.readerLineHeight = effective.lineHeight;
+    }
+    if (serverSettings?.readerFontFamily !== effective.fontFamily) {
+      toSave.readerFontFamily = effective.fontFamily;
+    }
+    if (Object.keys(toSave).length > 0) {
+      saveServerSettings(toSave);
+    }
+  },
+  [settings, serverSettings, saveServerSettings],
+);
 ```
 
 这可以显著降低意外覆盖其他端修改的风险。
 
-#### 建议 6：修复 clearAllDefaults 的行为一致性
+#### 建议 6：提交前刷新服务端数据，避免缓存过期问题
+
+在调用 `saveAsDefault` 和 `clearAllDefaults` 前，先刷新一次服务端数据，确保使用最新值进行比较和补全，避免用缓存的旧值覆盖其他端的新值：
+
+```typescript
+const saveAsDefault = useCallback(
+  async (settingsToSave?: ReaderSettingsPartial) => {
+    // 先刷新服务端数据，避免缓存过期
+    await queryClient.refetchQueries(api.users.settings.pathFilter());
+    // 再进行后续逻辑...
+  },
+  [settings, saveServerSettings, queryClient, api],
+);
+```
+
+#### 建议 7：修复 clearAllDefaults 的行为一致性
 
 `clearAllDefaults` 应该与 `saveAsDefault` 保持一致，成功后也清除本地覆盖，避免出现"服务器已清空但本地仍显示旧值"的多端不一致问题。或者在 UI 上明确提示用户"此操作不会影响本设备的本地设置"。
 
-#### 建议 7：提高移动端同步透明度
+#### 建议 8：提高移动端同步透明度
 
 在移动端设置界面明确标注哪些设置仅本地生效、哪些会跨端同步。例如：
 - 在阅读器设置页面更明确地提示 "Save as Default" 会同步到所有设备
 - 明确提示 "Clear Server Defaults" 会清空所有设备的默认设置，但保留本地设置
 - 在其他仅本地的设置旁边添加 "This device only" 提示
 
-#### 建议 8：统一设置模型
+#### 建议 9：统一设置模型
 
 考虑将更多移动端本地设置（如主题、默认书签视图）纳入同步范围，减少"本地 vs 服务端"的概念割裂。或者在移动端提供与 Web 端一致的完整设置界面，允许用户修改所有 14 个服务端设置。
 
@@ -729,11 +787,12 @@ saveAsDefault()  // → 只更新实际变更的字段
 | 功能 | 文件位置 | 行号 |
 |-----|---------|------|
 | 阅读器设置共享 hook（两条路径实现） | `packages/shared-react/hooks/reader-settings.tsx` | 42-248 |
-| → 路径 1：saveAsDefault 实现 | `packages/shared-react/hooks/reader-settings.tsx` | 175-191 |
-| → 路径 2：clearAllDefaults 实现 | `packages/shared-react/hooks/reader-settings.tsx` | 207-213 |
-| → 附加：clearDefault 实现 | `packages/shared-react/hooks/reader-settings.tsx` | 194-204 |
-| → saveServerSettings mutation（路径 1 使用） | `packages/shared-react/hooks/reader-settings.tsx` | 90-107 |
-| → updateServerSettings mutation（路径 2 使用） | `packages/shared-react/hooks/reader-settings.tsx` | 81-87 |
+| → 路径 1：saveAsDefault 实现**（内部补全字段，总是提交 3 个）** | `packages/shared-react/hooks/reader-settings.tsx` | 175-191 |
+| → 路径 2：clearAllDefaults 实现（总是提交 3 个 null） | `packages/shared-react/hooks/reader-settings.tsx` | 207-213 |
+| → 附加：clearDefault 实现（唯一真正单字段更新，但无 UI 调用） | `packages/shared-react/hooks/reader-settings.tsx` | 194-204 |
+| → saveServerSettings mutation（路径 1 使用，成功后清除本地覆盖） | `packages/shared-react/hooks/reader-settings.tsx` | 90-107 |
+| → updateServerSettings mutation（路径 2 使用，不清除本地覆盖） | `packages/shared-react/hooks/reader-settings.tsx` | 81-87 |
+| → 关键机制：settings 优先级计算（session → local → pending → server → default） | `packages/shared-react/hooks/reader-settings.tsx` | 110-132 |
 
 ### 移动端代码
 
