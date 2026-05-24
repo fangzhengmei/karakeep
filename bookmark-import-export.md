@@ -1,4 +1,4 @@
-# 书签导入导出转换规则分析（修正版）
+# 书签导入导出转换规则分析（二次修正版）
 
 ## 概述
 
@@ -24,25 +24,27 @@ Karakeep 的书签导入导出系统位于 `packages/shared/import-export/`，�
 前端用户上传文件
     ↓
 [useBookmarkImport.ts]
-    ├─ 预解析文件统计数量
+    ├─ 预解析文件统计数量（用于配额检查）
     ├─ 检查配额（quotaUsage）
     └─ 调用 importBookmarksFromFile
         ↓
 [importer.ts] importBookmarksFromFile
-    ├─ 解析文件（parseImportFile）
+    ├─ 解析文件（parseImportFile）⚠️ fail-fast，格式错误直接抛出
     ├─ 创建导入根列表
     ├─ 重建目录结构（paths 或 listExternalIds）
     ├─ 转换为 StagedBookmark
-    ├─ 批量暂存（50条/批）
+    ├─ 批量暂存（50条/批）⚠️ 暂存前会过滤无效书签
     └─ finalize → 会话状态从 staging → pending
         ↓
 [importWorker.ts] ImportWorker（轮询，5秒/次）
     ├─ resetStaleProcessingItems（每60次轮询≈5分钟）
     ├─ checkAndCompleteProcessingItems（每次轮询先执行）
     ├─ processBatch
+    │   ├─ getAvailableCapacity（背压控制，隐性判断 stale）
     │   ├─ 公平调度取候选
     │   ├─ 原子声明为 processing
     │   ├─ processOneBookmark（并行处理）
+    │   │   ├─ 二次校验空 URL/空内容
     │   │   ├─ createBookmark
     │   │   ├─ updateTags
     │   │   ├─ attachBookmarkToLists
@@ -64,6 +66,8 @@ Karakeep 的书签导入导出系统位于 `packages/shared/import-export/`，�
 | `status` | text | `["staging", "pending", "running", "paused", "completed", "failed"]` | `staging` |
 | `lastProcessedAt` | timestamp | - | - |
 | `rootListId` | text | - | - |
+
+> ⚠️ **重要发现**：`"failed"` 是 schema 定义的枚举值，但**当前代码中没有任何路径能让 session 达到此状态**。详见下文"Session 级别 failed 状态分析"。
 
 **`importStagingBookmarks` 表**（schema.ts:903-950）
 
@@ -154,11 +158,11 @@ const batch = await db
 
 #### 2. `processing` → 终态（`processOneBookmark` 内）
 
-**路径 A：创建失败**（importWorker.ts:469-485）
+**路径 A：创建失败 / 空 URL / 空内容**（importWorker.ts:469-485）
 ```typescript
 status: "failed"
 result: "rejected"
-resultReason: getSafeErrorMessage(error)
+resultReason: getSafeErrorMessage(error)  // 如 "URL is required for link bookmarks"
 completedAt: new Date()
 ```
 
@@ -208,7 +212,7 @@ or(isNull(taggingStatus), eq(taggingStatus, "success"), eq(taggingStatus, "failu
 
 ---
 
-## 失败容忍与重试机制
+## 失败容忍与重试机制（修正版）
 
 ### 1. 导入前过滤（第一道防线）
 
@@ -223,13 +227,41 @@ const validBookmarks = bookmarks.filter((bookmark) => {
 });
 ```
 
-### 2. 处理过程中的错误隔离
+### 2. Worker 阶段二次校验（第二道防线）
+
+**位置**: `importWorker.ts:392-404`
+
+即使绕过了暂存前过滤（如直接调用 repo 层），worker 中还会做二次校验：
+```typescript
+if (staged.type === "link") {
+  if (!staged.url) {
+    throw new Error("URL is required for link bookmarks");
+  }
+} else if (staged.type === "text") {
+  if (!staged.content) {
+    throw new Error("Content is required for text bookmarks");
+  }
+}
+```
+
+**失败处理路径**：
+- 抛出的错误被 `processOneBookmark` 的 try-catch 捕获
+- 标记为 `status: "failed"`, `result: "rejected"`
+- `resultReason` 是白名单内的安全信息：`"URL is required for link bookmarks"`
+
+> ⚠️ **关键区别**：
+> - 暂存前过滤：静默丢弃，不产生任何失败记录
+> - Worker 中校验：产生失败记录，用户可见
+
+### 3. 处理过程中的错误隔离
 
 - **`Promise.allSettled`**（importWorker.ts:213）：单条失败不影响批次
 - **列表关联容错**（importWorker.ts:341-347）：单个列表关联失败只打 warn，不影响书签状态
 - **错误信息安全过滤**（importWorker.ts:82-100）：避免泄露堆栈、数据库错误等内部详情给用户
 
-### 3. 挂起项重试机制
+### 4. 挂起项重试机制（双重判断）
+
+#### 4.1 显性重试：`resetStaleProcessingItems()`
 
 **位置**: `importWorker.ts:682-718`
 
@@ -248,14 +280,41 @@ processingStartedAt: null  // 清空
 
 **触发频率**: 每 60 次轮询 = 60 × 5秒 = **5分钟**（importWorker.ts:120）
 
+#### 4.2 隐性重试：`getAvailableCapacity()` 背压控制
+
+**位置**: `importWorker.ts:655-673`
+
+```typescript
+const processingCount = await db
+  .select({ count: count() })
+  .from(importStagingBookmarks)
+  .where(
+    and(
+      eq(importStagingBookmarks.status, "processing"),
+      // ⚠️ 只统计最近1小时内开始处理的
+      gt(importStagingBookmarks.processingStartedAt, new Date(Date.now() - this.staleThresholdMs)),
+    ),
+  );
+
+return this.maxInFlight - inFlight;
+```
+
+**隐性效果**：
+- 超过 1 小时的 `processing` 项**不计入在处理数**
+- 系统认为有可用容量，会继续取新的 pending 项处理
+- 如果某挂起项（有 `processingStartedAt` 但无 `resultBookmarkId`）超过 1 小时：
+  - 先被 `getAvailableCapacity` 忽略，不占容量
+  - 然后在某次 `resetStaleProcessingItems` 中被重置为 `pending`
+  - 之后可能被重新声明处理
+
 > **重要限制**：
 > - 已成功创建书签（有 `resultBookmarkId`）的项目**永远不会被重试**
 > - 哪怕后续 crawl/tagging 失败了，也只会标记为 `failed`，不会重试
 > - 只有"书签创建前"挂起的项目才会被重置重试
 
-### 4. 循环引用与父列表缺失兜底
+### 5. 循环引用与父列表缺失兜底
 
-**位置**: `importer.ts:133-147`
+**位置**: `importer.ts:131-147`
 
 拓扑排序中如果一轮没有创建任何列表（说明有循环引用或父引用不存在），强制全部挂到根目录：
 ```typescript
@@ -270,7 +329,7 @@ if (!createdAny) {
 }
 ```
 
-### 5. 会话暂停后的状态回滚
+### 6. 会话暂停后的状态回滚
 
 **位置**: `importWorker.ts:358-364`
 
@@ -285,11 +344,175 @@ if (!session || session.status === "paused") {
 }
 ```
 
-### 6. 并发控制与原子性
+### 7. 并发控制与原子性
 
 - **原子声明**：UPDATE + WHERE 确保多 Worker 不重复处理同一条
 - **背压控制**：`maxInFlight = 50`，通过 `processingStartedAt` 判断是否为有效在处理项
 - **公平调度**：按 `importSessions.lastProcessedAt` 排序，避免大导入阻塞其他用户
+
+---
+
+## Session 级别 failed 状态分析
+
+### 核心结论
+
+**`importSessions.status = "failed"` 在当前代码中是不可达状态。**
+
+### 可达状态路径完整清单
+
+搜索所有 `update(importSessions).set({ status: ... })` 调用，仅发现以下状态转换：
+
+| 起始状态 | 目标状态 | 触发位置 | 触发条件 |
+|---------|---------|---------|---------|
+| `staging` | `pending` | `importSessions.service.ts:131` | `finalize()` 调用 |
+| `pending` | `running` | `importWorker.ts:203-210` | 批次处理开始 |
+| `pending`/`running` | `paused` | `importSessions.service.ts:142` | 用户调用 `pause()` |
+| `paused` | `pending` | `importSessions.service.ts:153` | 用户调用 `resume()` |
+| `pending`/`running` | `completed` | `importWorker.ts:514-516` | 所有 staging item 处理完成 |
+
+### 缺失的路径
+
+**没有任何代码会将 session 设置为 `"failed"`**。哪怕：
+- 所有书签都处理失败（`result: "rejected"`）
+- 部分或全部书签 crawl/tagging 失败
+- Worker 崩溃重启
+
+### 实际行为
+
+当导入出现大量失败时：
+- 单个书签会被标记为 `status: "failed"`, `result: "rejected"`
+- Session 会继续处理剩余书签
+- 所有书签处理完成后，Session 状态变为 `"completed"`（不是 `"failed"`）
+- 用户通过 stats 可以看到 `failedBookmarks` 计数
+
+### 设计意图推测
+
+`"failed"` 可能是为以下场景预留的，但当前未实现：
+- 整个导入任务的系统性失败（如数据库连接中断）
+- 超过最大重试次数后的标记
+- 批量取消/中止操作
+
+---
+
+## Parser 层 Fail-Fast 机制
+
+### 核心原则
+
+**所有 Parser 都是 100% Fail-Fast 的**：格式验证不通过直接抛出异常，不会有部分解析、不会跳过坏记录、不会容错降级。
+
+### 各 Parser 的 Fail-Fast 点
+
+| Parser | 验证方式 | 失败抛出 | 位置 |
+|--------|---------|---------|------|
+| Netscape HTML | 文件头字符串匹配 | `throw Error("The uploaded html file does not seem to be a bookmark file")` | parsers.ts:54-55 |
+| Matter CSV | Zod `parse()` | `throw new Error("The uploaded CSV file contains an invalid Matter bookmark file: ...")` | parsers.ts:166-167 |
+| Karakeep JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid bookmark file: ...")` | parsers.ts:186-187 |
+| Omnivore JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid omnivore bookmark file: ...")` | parsers.ts:253-254 |
+| Linkwarden JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid Linkwarden bookmark file: ...")` | parsers.ts:291-292 |
+| Tab Session Manager | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid Tab Session Manager bookmark file: ...")` | parsers.ts:344-345 |
+| mymind CSV | Zod `parse()` | `throw new Error("The uploaded CSV file contains an invalid mymind bookmark file: ...")` | parsers.ts:386-387 |
+| Instapaper CSV | Zod `parse()` | `throw new Error("CSV file contains an invalid instapaper bookmark file: ...")` | parsers.ts:446-447 |
+| Readwise Reader CSV | Zod `parse()` | `throw new Error("CSV file contains an invalid Readwise Reader bookmark file: ...")` | parsers.ts:533-534 |
+| OneTab TXT | 无格式验证 | - | （逐行解析，非 URL 行静默跳过） |
+| Pocket CSV | 无格式验证 | - | （逐行映射，不做 schema 验证） |
+
+> **例外**：Pocket CSV 和 OneTab TXT 没有 schema 验证，属于**宽松解析**。Pocket 会解析所有能解析的行，OneTab 会跳过非 URL 行。
+
+### 异常传播路径
+
+```
+parseImportFile() 抛出异常
+    ↓
+importBookmarksFromFile() 未捕获，继续向上
+    ↓
+useBookmarkImport.ts 中 onError 捕获
+    ↓
+toast 显示错误信息给用户
+```
+
+**影响**：
+- 不会创建 Import Session
+- 不会创建任何列表
+- 不会暂存任何书签
+- 整个导入完全失败，用户需要修正文件后重新上传
+
+---
+
+## 导入返回 counts 的语义边界
+
+### ImportCounts 接口定义
+
+**位置**: `importer.ts:4-9`
+
+```typescript
+export interface ImportCounts {
+  successes: number;
+  failures: number;
+  alreadyExisted: number;
+  total: number;
+}
+```
+
+### 实际返回值（修正前的关键误解）
+
+**位置**: `importer.ts:277-283` 和 `importer.ts:81-85`
+
+```typescript
+// 正常返回（有书签）
+return {
+  counts: {
+    successes: 0,        // ⚠️ 永远是 0！
+    failures: 0,         // ⚠️ 永远是 0！
+    alreadyExisted: 0,   // ⚠️ 永远是 0！
+    total: parsedBookmarks.length,  // 唯一有意义的字段
+  },
+  rootListId: rootList.id,
+  importSessionId: session.id,
+};
+
+// 空文件返回
+return {
+  counts: { successes: 0, failures: 0, alreadyExisted: 0, total: 0 },
+  rootListId: null,
+  importSessionId: null,
+};
+```
+
+### 语义边界澄清
+
+| 字段 | 含义 | 阶段 |
+|------|------|------|
+| `total` | **解析到**的书签总数（**过滤前**的数量，包含无 URL 的 link 等会被过滤的项） | 解析阶段 |
+| `successes` | 预留字段，当前异步导入模式下**恒为 0** | 未使用 |
+| `failures` | 预留字段，当前异步导入模式下**恒为 0** | 未使用 |
+| `alreadyExisted` | 预留字段，当前异步导入模式下**恒为 0** | 未使用 |
+
+### 设计意图
+
+`ImportCounts` 接口是为**同步导入模式**设计的，即 `importBookmarksFromFile` 内部完成所有处理并返回最终结果。但当前实现采用的是**异步导入模式**：
+- `importBookmarksFromFile` 只负责**解析和暂存**
+- 实际处理由后台 Worker 异步完成
+- 最终结果需要通过 `importSessions.getWithStats()` 后续查询
+
+### 获取真实统计数据
+
+**位置**: `importSessions.service.ts:170-206`
+
+```typescript
+// 通过 session stats 获取真实处理结果
+const stats = {
+  totalBookmarks: 0,        // 暂存的总数（过滤后）
+  completedBookmarks: 0,    // status = "completed" 的数量
+  failedBookmarks: 0,       // status = "failed" 的数量
+  pendingBookmarks: 0,      // status = "pending" 的数量
+  processingBookmarks: 0,   // status = "processing" 的数量
+};
+```
+
+> **`total` 语义区别**：
+> - `importBookmarksFromFile` 返回的 `counts.total` = **解析到**的数量（过滤前）
+> - `getWithStats` 返回的 `totalBookmarks` = **实际暂存**的数量（过滤后）
+> - 两者可能不相等（存在过滤时）
 
 ---
 
@@ -304,7 +527,7 @@ if (!session || session.status === "paused") {
 | `"accepted"` | `processing` | 书签已创建，等待 crawl/tagging |
 | `"accepted"` | `completed` | 全部成功 |
 | `"skipped_duplicate"` | `completed` | URL 已存在，跳过但仍关联标签/列表 |
-| `"rejected"` | `failed` | 验证失败、创建异常、下游失败、asset 不支持 |
+| `"rejected"` | `failed` | 验证失败、创建异常、下游失败、asset 不支持、空 URL、空内容 |
 
 ### 函数内部返回值（不入库）
 
@@ -335,6 +558,7 @@ if (!session || session.status === "paused") {
 **特殊处理**:
 - 空文件夹名 → `"Unnamed"` (parsers.ts:72)
 - 无 URL 的书签也会被保留（`content` 为 `undefined`），但会在暂存前被过滤
+- Fail-Fast：文件头不匹配直接 `throw Error`
 
 ### 2. Pocket (`pocket`)
 
@@ -347,6 +571,10 @@ if (!session || session.status === "paused") {
 | `time_added` | `addDate` | Unix 时间戳 |
 | `tags` | `tags` | 管道符分隔，`split("|")` |
 | `status` | `archived` | `status === "archive"` → `true` |
+
+**特殊处理**:
+- 无 schema 验证，宽松解析
+- 无 URL 的行也会被解析，但会在暂存前被过滤
 
 ### 3. Readwise Reader (`readwise-reader`)
 
@@ -363,7 +591,8 @@ if (!session || session.status === "paused") {
 
 **特殊处理**:
 - 空 URL 项目会被过滤（importWorker.ts 中还会再检查一次）
-- 标签 JSON 解析失败时 `tags = []`，不抛出错误（parsers.ts:563-564）
+- 标签 JSON 解析失败时 `tags = []`，不抛出错误（parsers.ts:563-564）⚠️ 这是 parser 层唯一的非 fail-fast 点
+- Fail-Fast：Zod schema 验证不通过直接 throw
 
 ### 4. Instapaper (`instapaper`)
 
@@ -377,6 +606,9 @@ if (!session || session.status === "paused") {
 | `Timestamp` | `addDate` | `parseInt()` |
 | `Tags` | `tags` | `JSON.parse()`，失败则 `[]` |
 | `Folder` | `archived`/`paths` | `"Archive"` → `archived: true`; `"Unread"` → 无路径; 其他 → `paths: [[Folder]]` |
+
+**特殊处理**:
+- Fail-Fast：Zod schema 验证不通过直接 throw
 
 ### 5. Karakeep 自有格式 (`karakeep`)
 
@@ -398,6 +630,7 @@ if (!session || session.status === "paused") {
 **特殊处理**:
 - 智能列表（`type: "smart"`）不与书签关联，仅作为列表元数据导入
 - `listExternalIds` 过滤掉智能列表 ID
+- Fail-Fast：Zod schema 验证不通过直接 throw
 
 ---
 
@@ -428,7 +661,7 @@ if (!session || session.status === "paused") {
 ```typescript
 // 1. 预解析文件（用于配额检查）
 const textContent = await file.text();
-const parsedImport = parseImportFile(source, textContent);
+const parsedImport = parseImportFile(source, textContent);  // ⚠️ fail-fast
 const bookmarkCount = parsedImport.bookmarks.length;
 
 // 2. 配额检查
@@ -456,6 +689,8 @@ const result = await importBookmarksFromFile(
     },
   },
 );
+
+// 4. result.counts 只有 total 有意义，successes/failures/alreadyExisted 恒为 0
 ```
 
 ### 阶段二：解析与暂存 (`importer.ts`)
@@ -554,6 +789,7 @@ const listIds =
 - 批次大小：50 条 (importer.ts:261)
 - 暂存状态：`pending`
 - `finalizeImportStaging` 后会话状态从 `staging` → `pending`，Worker 开始处理
+- ⚠️ 暂存前会过滤无效书签（link 无 URL / text 无内容）
 
 ### 阶段三：后台 Worker 处理 (`importWorker.ts`)
 
@@ -592,7 +828,7 @@ if (!session || session.status === "paused") {
   return "reset";
 }
 
-// 2. 验证类型并构建请求
+// 2. 验证类型并构建请求 ⚠️ 二次校验
 if (staged.type === "link") {
   if (!staged.url) throw new Error("URL is required for link bookmarks");
   bookmarkRequest = { type: BookmarkTypes.LINK, url: staged.url, ... };
@@ -721,22 +957,27 @@ toNetscapeFormat(bookmarks): string {
 | Netscape 解析 | `parsers.ts` | `parseNetscapeBookmarkFile` | 53-111 |
 | 去重合并 | `parsers.ts` | `deduplicateBookmarks` | 614-661 |
 | 导入主流程 | `packages/shared/import-export/importer.ts` | `importBookmarksFromFile` | 56-286 |
+| 导入计数接口 | `importer.ts` | `ImportCounts` | 4-9 |
 | 导出功能 | `packages/shared/import-export/exporters.ts` | `toExportFormat`, `toNetscapeFormat` | 42-127 |
 | 前端导入 Hook | `apps/web/lib/hooks/useBookmarkImport.ts` | `useBookmarkImport` | 23-132 |
 | 导入会话服务 | `packages/trpc/models/importSessions.service.ts` | `ImportSessionsService` | 17-206 |
+| 暂存前过滤 | `importSessions.service.ts` | `stageBookmarks` | 95-100 |
 | 导入会话仓储 | `packages/trpc/models/importSessions.repo.ts` | `ImportSessionsRepo` | 14-124 |
 | 后台导入 Worker | `apps/workers/workers/importWorker.ts` | `ImportWorker` | 102-718 |
 | 安全错误信息 | `importWorker.ts` | `getSafeErrorMessage` | 82-100 |
 | 挂起项重置 | `importWorker.ts` | `resetStaleProcessingItems` | 682-718 |
+| 背压控制 | `importWorker.ts` | `getAvailableCapacity` | 655-673 |
 | 下游完成检查 | `importWorker.ts` | `checkAndCompleteProcessingItems` | 546-650 |
 | 单条处理 | `importWorker.ts` | `processOneBookmark` | 351-487 |
+| 二次校验空 URL | `importWorker.ts` | `processOneBookmark` | 392-404 |
 | 批次处理 | `importWorker.ts` | `processBatch` | 149-233 |
 | 数据库 Schema | `packages/db/schema.ts` | `importSessions`, `importStagingBookmarks` | 851-950 |
 | 导入类型定义 | `packages/shared/types/importSessions.ts` | - | 1-78 |
+| Session 状态枚举 | `importSessions.ts` | `zImportSessionStatusSchema` | 3-10 |
 
 ---
 
-## 常见误解澄清
+## 常见误解澄清（二次修正版）
 
 | 误解 | 事实 |
 |------|------|
@@ -747,3 +988,9 @@ toNetscapeFormat(bookmarks): string {
 | 去重只在导入时做一次 | 两次去重：解析阶段同一文件内去重 + `createBookmark` 跨导入去重 |
 | `checkAndCompleteProcessingItems` 在批次后调用 | **每次轮询最先调用**，在 `processBatch` 之前 |
 | 挂起项每小时检查一次 | 每 **5 分钟** 检查一次（60次轮询 × 5秒） |
+| 空 URL 在暂存前过滤了就不会再处理 | Worker 中还有二次校验，若绕过暂存过滤会产生失败记录 |
+| Session 可以达到 `failed` 状态 | **当前代码中不可达**，schema 定义了但没有代码路径设置它，所有 session 最终都是 `completed` |
+| Parser 会跳过坏记录继续解析 | 绝大多数 Parser 是 fail-fast 的，格式错误直接抛出，整个导入失败 |
+| `counts.successes` 是成功导入的数量 | 异步模式下**恒为 0**，是为同步模式预留的字段 |
+| `counts.total` 是实际暂存的数量 | 是**解析到**的数量（过滤前），实际暂存数需通过 `getWithStats` 查询 |
+| 空 URL 会静默丢弃 | 分两种情况：暂存前过滤静默丢弃；Worker 中校验会产生可见的失败记录 |
