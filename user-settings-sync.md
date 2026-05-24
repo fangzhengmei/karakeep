@@ -77,11 +77,11 @@ export const zUpdateUserSettingsSchema = zUserSettingsSchema.partial().pick({...
 
 ### 1.3 本地设置 vs 服务端设置
 
-系统中存在**两套独立的设置体系**：
+系统中存在**三套独立的设置体系**，但**服务端存储的14个设置项并非全部在移动端同步或修改：
 
 | 设置类型 | 存储位置 | 同步范围 | 包含内容 |
 |---------|---------|---------|---------|
-| **服务端同步设置** | 数据库 `user` 表 | 跨端同步（Web ↔ Mobile） | 上述 14 个设置项 |
+| **服务端存储设置** | 数据库 `user` 表 | Web 可读写全部 14 项，移动端仅读写 3 项 | bookmarkClickAction、archiveDisplayBehaviour、timezone、backupsEnabled、backupsFrequency、backupsRetentionDays、readerFontSize、readerLineHeight、readerFontFamily、autoTaggingEnabled、autoSummarizationEnabled、tagStyle、curatedTagIds、inferredTagLang |
 | **Web 本地设置** | Cookie（`hoarder-user-local-settings`） | 不同步 | 布局模式、语言、网格列数、显示选项等 |
 | **Mobile 本地设置** | Expo SecureStore | 不同步 | API Key、服务器地址、主题、工具栏配置、图片质量等 |
 
@@ -116,6 +116,53 @@ const zSettingsSchema = z.object({
   overflowActions: z.array(zToolbarActionId).optional().default(...),
 });
 ```
+
+### 1.4 移动端设置分类与同步边界
+
+移动端的设置体系与 Web 端有显著差异。**移动端没有直接调用 `useUpdateUserSettings`**，所有服务端设置更新仅通过阅读器设置的共享 hook 间接完成。
+
+#### 移动端对服务端设置的操作权限
+
+| 服务端设置字段 | 移动端读取 | 移动端写入 | 备注 |
+|---------------|-----------|-----------|------|
+| `readerFontSize` | ✅ 读取 | ✅ 主动写入 | 仅在点击 "Save as Default (All Devices)" 时同步 |
+| `readerLineHeight` | ✅ 读取 | ✅ 主动写入 | 同上 |
+| `readerFontFamily` | ✅ 读取 | ✅ 主动写入 | 同上 |
+| `archiveDisplayBehaviour` | ✅ 读取 | ❌ 不写入 | 仅用于 `useArchiveFilter` hook 判断是否显示已归档 |
+| `bookmarkClickAction` | ❌ 不读取 | ❌ 不写入 | 移动端无此概念 |
+| `timezone` | ❌ 不读取 | ❌ 不写入 | 移动端无设置界面 |
+| `backupsEnabled` | ❌ 不读取 | ❌ 不写入 | 移动端无备份功能 |
+| `backupsFrequency` | ❌ 不读取 | ❌ 不写入 | 同上 |
+| `backupsRetentionDays` | ❌ 不读取 | ❌ 不写入 | 同上 |
+| `autoTaggingEnabled` | ❌ 不读取 | ❌ 不写入 | 移动端无 AI 设置界面 |
+| `autoSummarizationEnabled` | ❌ 不读取 | ❌ 不写入 | 同上 |
+| `tagStyle` | ❌ 不读取 | ❌ 不写入 | 同上 |
+| `curatedTagIds` | ❌ 不读取 | ❌ 不写入 | 同上 |
+| `inferredTagLang` | ❌ 不读取 | ❌ 不写入 | 同上 |
+
+#### 移动端设置分类详情
+
+**✅ 会同步到服务端的设置（仅 3 项）**：
+- `readerFontSize` - 阅读字体大小
+- `readerLineHeight` - 阅读行高
+- `readerFontFamily` - 阅读字体
+
+同步触发条件：用户在阅读器设置页面点击 **"Save as Default (All Devices)"** 按钮。
+
+**⚠️ 仅从服务端读取但不修改的设置（仅 1 项）**：
+- `archiveDisplayBehaviour` - 用于判断列表中是否显示已归档书签
+
+**❌ 仅本地生效、永不同步的设置（10 项）**：
+- `apiKey` / `apiKeyId` - API 凭证
+- `address` - 服务器地址
+- `imageQuality` - 上传图片质量
+- `theme` - 主题（light/dark/system）
+- `defaultBookmarkView` - 默认书签打开方式（reader/browser/externalBrowser）
+- `showNotes` - 是否在书签卡片中显示笔记
+- `keepScreenOnWhileReading` - 阅读时保持屏幕常亮
+- `customHeaders` - 自定义请求头
+- `toolbarActions` / `overflowActions` - 工具栏按钮配置
+- 阅读器设置的**本地覆盖**（未点击 "Save as Default" 前）
 
 ---
 
@@ -237,9 +284,9 @@ onValueChange={(value) => {
 
 ### 2.4 Mobile 端同步流程
 
-Mobile 端使用相同的 React Query 模式：
+Mobile 端**不使用** `useUpdateUserSettings` hook，所有服务端设置更新均通过 `useReaderSettings` 共享 hook 间接完成。
 
-**读取设置**（`apps/mobile/lib/hooks.ts:47-59`）：
+**仅读取服务端设置**（`apps/mobile/lib/hooks.ts:47-59`）：
 ```typescript
 export function useArchiveFilter(): { archived: false | undefined; isLoading: boolean } {
   const api = useTRPC();
@@ -253,15 +300,30 @@ export function useArchiveFilter(): { archived: false | undefined; isLoading: bo
 }
 ```
 
-**阅读器设置的特殊处理**：
-Mobile 端通过 `ReaderSettingsProvider` 包装共享逻辑，实现本地覆盖 + 服务端同步的双层机制（`apps/mobile/lib/readerSettings.tsx`）。
+**阅读器设置的同步流程**：
+Mobile 端通过 `ReaderSettingsProvider`（`apps/mobile/lib/readerSettings.tsx`）包装共享的 `useReaderSettings` hook，实现本地覆盖 + 服务端同步的双层机制。
+
+移动端调用 `updateLocal()` 仅修改本地覆盖，不会同步到服务端。只有当用户显式点击 **"Save as Default (All Devices)"** 按钮时，才会调用 `saveAsDefault()`，通过共享 hook 中的 `saveServerSettings` 调用 `api.users.updateSettings` 同步到服务端（`packages/shared-react/hooks/reader-settings.tsx:175-191`）：
+
+```typescript
+// 仅修改本地，不同步
+const handleFontSizeChange = (value: number) => {
+  updateLocal({ fontSize: Math.round(value) });
+};
+
+// 显式点击才同步到服务端
+const handleSaveAsDefault = () => {
+  saveAsDefault();  // 内部调用 saveServerSettings({ readerFontSize, readerLineHeight, readerFontFamily })
+};
+```
 
 ### 2.5 同步触发时机
 
 | 触发方式 | Web | Mobile |
 |---------|-----|--------|
-| **页面加载** | ✅ SSR 预取 + React Query 缓存 | ✅ React Query 懒加载 |
-| **设置变更后** | ✅ `invalidateQueries` 触发重新拉取 | ✅ 相同机制 |
+| **页面加载** | ✅ SSR 预取 + React Query 缓存 | ✅ React Query 懒加载（仅阅读器设置和 archiveDisplayBehaviour） |
+| **设置变更后主动刷新** | ✅ 所有 14 项设置变更后均 `invalidateQueries` 触发重新拉取 | ⚠️ 仅阅读器设置同步后 `refetchQueries`，其他设置永不同步 |
+| **设置变更触发同步** | ✅ 所有设置变更立即同步到服务端 | ⚠️ 仅阅读器设置在显式点击 "Save as Default" 时同步，其他设置仅本地保存 |
 | **定时轮询** | ❌ 无自动轮询 | ❌ 无自动轮询 |
 | **实时推送** | ❌ 无 WebSocket/Server-Sent Events | ❌ 无实时推送 |
 | **应用回到前台** | ❌ 无显式刷新 | ❌ 无显式刷新 |
@@ -272,7 +334,7 @@ Mobile 端通过 `ReaderSettingsProvider` 包装共享逻辑，实现本地覆�
 
 ### 3.1 当前策略：Last Write Wins (LWW)
 
-**核心问题**：系统**没有任何显式的冲突检测和解决机制**。
+**核心问题**：系统**没有任何显式的冲突检测和解决机制**。但需要注意的是，**冲突仅可能发生在阅读器的 3 个设置字段上**，因为这是移动端唯一会写入的服务端设置。
 
 **证据**：
 1. **无版本字段**：`user` 表没有 `version` 或 `settingsVersion` 列
@@ -284,19 +346,26 @@ Mobile 端通过 `ReaderSettingsProvider` 包装共享逻辑，实现本地覆�
 3. **无时间戳比较**：没有 `lastModifiedAt` 字段用于比较新旧
 4. **无合并逻辑**：服务端直接覆盖所有传入字段
 
-**冲突场景示例**：
+**冲突场景示例（仅可能发生在阅读器设置上）**：
 ```
 时序：
-  T0: 服务端状态：bookmarkClickAction = "open_original_link"
-  T1: Web 加载设置，缓存为 "open_original_link"
-  T2: Mobile 加载设置，缓存为 "open_original_link"
-  T3: Web 用户修改为 "expand_bookmark_preview" → 服务端更新成功
-  T4: Mobile 用户修改为 "open_original_link"（未感知 Web 的变更）
-  T5: Mobile 提交更新 → 服务端直接覆盖为 "open_original_link"
+  T0: 服务端状态：readerFontSize = 16
+  T1: Web 加载设置，缓存为 16
+  T2: Mobile 加载设置，缓存为 16
+  T3: Web 用户修改为 18 → 服务端更新成功，readerFontSize = 18
+  T4: Mobile 用户在阅读器设置中调整字体为 20（此时仅本地覆盖，未同步）
+  T5: Mobile 用户点击 "Save as Default (All Devices)" → 提交 readerFontSize = 20
+  T6: 服务端直接覆盖为 20，Web 端的变更被静默丢失
   
 结果：
-  Web 的变更被静默覆盖，用户无任何感知
+  Web 的变更被静默覆盖，用户无任何感知。
+  Web 端需要刷新页面才能看到移动端同步的 20。
 ```
+
+**不可能发生冲突的字段**：
+- `bookmarkClickAction`、`timezone`、`backups*`、`autoTaggingEnabled` 等 10 个字段：移动端完全不写入，只能在 Web 端修改，不存在跨端冲突
+- `archiveDisplayBehaviour`：移动端只读不写，也不会发生冲突
+- 移动端本地设置（主题、工具栏、图片质量等）：仅本地存储，不存在跨端冲突
 
 ### 3.2 阅读器设置的层级优先级
 
@@ -342,16 +411,26 @@ onError: () => {
 
 ### 3.4 字段级部分更新
 
-虽然没有冲突检测，但支持**字段级部分更新**：
+虽然没有冲突检测，但支持**字段级部分更新**。
 
+**Web 端**可以更新任意单个或多个字段：
 ```typescript
-// 可以只更新单个字段
 mutate({ timezone: "Asia/Shanghai" });
 mutate({ autoTaggingEnabled: true });
 mutate({ bookmarkClickAction: "expand_bookmark_preview", tagStyle: "lowercase-hyphens" });
 ```
 
-这减少了冲突概率（只更新变更的字段），但如果两端同时修改**不同字段**，后提交的仍会覆盖先提交的**相同字段**。
+**移动端**只能更新阅读器的 3 个字段，且总是同时更新这 3 个字段：
+```typescript
+// 移动端 saveAsDefault 总是同时提交 3 个阅读器字段
+saveServerSettings({
+  readerFontSize: toSave.fontSize,
+  readerLineHeight: toSave.lineHeight,
+  readerFontFamily: toSave.fontFamily,
+});
+```
+
+这减少了冲突概率（只更新变更的字段），但如果两端同时修改**相同字段**，后提交的仍会覆盖先提交的。
 
 ---
 
@@ -361,10 +440,11 @@ mutate({ bookmarkClickAction: "expand_bookmark_preview", tagStyle: "lowercase-hy
 
 | 问题 | 风险等级 | 说明 |
 |-----|---------|------|
-| **无冲突检测** | 🔴 高 | 并发修改时后写入者静默覆盖先写入者，用户无感知 |
-| **无实时同步** | 🟡 中 | 设置变更后，另一端必须刷新页面才能看到更新 |
-| **设置分散** | 🟡 中 | 三套设置体系（服务端/Web本地/Mobile本地）增加认知负担 |
+| **阅读器设置无冲突检测** | 🟡 中 | 仅阅读器的 3 个字段可能发生跨端冲突，后写入者静默覆盖先写入者，用户无感知 |
+| **无实时同步** | 🟡 中 | 设置变更后，另一端必须刷新页面才能看到更新。例如 Web 端修改了阅读器字体，移动端必须重新进入阅读器设置页面才能看到 |
+| **设置分散，权限不对称** | 🟡 中 | 三套设置体系（服务端/Web本地/Mobile本地），且 Web 端可修改全部 14 个服务端设置，移动端仅能修改 3 个，概念不统一 |
 | **无修改历史** | 🟠 中高 | 无法追溯设置变更历史，问题排查困难 |
+| **移动端同步触发不透明** | 🟡 中 | 阅读器设置的 "Save as Default (All Devices)" 是移动端唯一的同步入口，但用户可能不清楚哪些设置会同步、哪些仅本地 |
 
 ### 4.2 改进建议
 
@@ -430,9 +510,15 @@ async updateSettings(input, currentVersion) {
 eventBus.emit(`user:${userId}:settings-updated`, newSettings);
 ```
 
-#### 建议 5：统一设置模型
+#### 建议 5：提高移动端同步透明度
 
-考虑将更多本地设置纳入同步范围，减少"本地 vs 服务端"的概念割裂。
+在移动端设置界面明确标注哪些设置仅本地生效、哪些会跨端同步。例如：
+- 在阅读器设置页面更明确地提示 "Save as Default" 会同步到所有设备
+- 在其他仅本地的设置旁边添加 "This device only" 提示
+
+#### 建议 6：统一设置模型
+
+考虑将更多移动端本地设置（如主题、默认书签视图）纳入同步范围，减少"本地 vs 服务端"的概念割裂。或者在移动端提供与 Web 端一致的完整设置界面，允许用户修改所有 14 个服务端设置。
 
 ---
 
@@ -447,8 +533,12 @@ eventBus.emit(`user:${userId}:settings-updated`, newSettings);
 | 服务端写入 | `packages/trpc/models/users.ts` | 513-542 |
 | Web React Query hook | `packages/shared-react/hooks/users.ts` | 7-21 |
 | Web Context Provider | `apps/web/lib/userSettings.tsx` | 26-45 |
-| 阅读器设置 hook | `packages/shared-react/hooks/reader-settings.tsx` | 42-248 |
+| Web 设置界面 | `apps/web/components/settings/UserOptions.tsx` | 60-72 |
+| 阅读器设置共享 hook | `packages/shared-react/hooks/reader-settings.tsx` | 42-248 |
 | Mobile 本地设置 | `apps/mobile/lib/settings.ts` | 37-141 |
 | Mobile 阅读器设置 Provider | `apps/mobile/lib/readerSettings.tsx` | 44-90 |
+| Mobile 阅读器设置页面（唯一同步入口） | `apps/mobile/app/dashboard/settings/reader-settings.tsx` | 1-271 |
+| Mobile 设置主页面 | `apps/mobile/app/dashboard/settings/index.tsx` | 1-404 |
+| Mobile 读取 archiveDisplayBehaviour | `apps/mobile/lib/hooks.ts` | 47-59 |
 | Web 本地设置 | `apps/web/lib/userLocalSettings/types.ts` | 8-16 |
 | 单元测试 | `packages/trpc/routers/users.test.ts` | 167-248 |
