@@ -1,126 +1,326 @@
-# 书签导入导出转换规则分析
+# 书签导入导出转换规则分析（修正版）
 
 ## 概述
 
-Karakeep 的书签导入导出系统位于 `packages/shared/import-export/`，采用 **"解析器 + 处理器"** 架构设计，支持 11 种外部格式的导入和 2 种格式的导出。核心组件包括：
-
-- **`parsers.ts`**: 格式解析器，负责将各种外部格式转换为内部统一表示
-- **`importer.ts`**: 导入处理器，负责目录结构重建、去重、批量暂存
-- **`exporters.ts`**: 导出处理器，将内部格式转换为外部格式
-- **`importWorker.ts`**: 后台 Worker，负责异步处理实际导入
+Karakeep 的书签导入导出系统位于 `packages/shared/import-export/`，采用 **"解析器 + 处理器 + 后台Worker"** 三层架构，支持 **11 种外部格式的导入** 和 **2 种格式的导出**。
 
 ---
 
-## 支持的格式列表
+## 核心组件边界与数据流
 
-### 导入格式 (`ImportSource`)
+### 架构分层
 
-| 格式类型 | 文件类型 | 源格式 | 代码位置 |
-|---------|---------|--------|---------|
-| `html` | HTML | Netscape Bookmark File | `parseNetscapeBookmarkFile` |
-| `pocket` | CSV | Pocket Export | `parsePocketBookmarkFile` |
-| `matter` | CSV | Matter Export | `parseMatterBookmarkFile` |
-| `omnivore` | JSON | Omnivore Export | `parseOmnivoreBookmarkFile` |
-| `karakeep` | JSON | Karakeep 自有格式 | `parseKarakeepBookmarkFile` |
-| `linkwarden` | JSON | Linkwarden Export | `parseLinkwardenBookmarkFile` |
-| `tab-session-manager` | JSON | Tab Session Manager | `parseTabSessionManagerStateFile` |
-| `mymind` | CSV | mymind Export | `parseMymindBookmarkFile` |
-| `readwise-reader` | CSV | Readwise Reader | `parseReadwiseReaderBookmarkFile` |
-| `instapaper` | CSV | Instapaper Export | `parseInstapaperBookmarkFile` |
-| `onetab` | TXT | OneTab Export | `parseOneTabFile` |
+| 层级 | 模块 | 职责 | 有无副作用 |
+|------|------|------|-----------|
+| 1. 格式解析层 | `parsers.ts` | 纯函数式格式转换，外部格式 → 内部统一结构 | ❌ 纯函数，无副作用 |
+| 2. 导入编排层 | `importer.ts` | 目录结构重建、批量暂存编排，通过 `deps` 接口注入外部依赖 | ⚠️ 通过依赖间接产生副作用 |
+| 3. 会话管理层 | `importSessions.service.ts` | 导入会话状态机管理、暂存数据封装 | ✅ 数据库操作 |
+| 4. 后台处理层 | `importWorker.ts` | 实际书签创建、并发控制、下游处理等待 | ✅ 完整业务逻辑 |
+| 5. 前端接入层 | `useBookmarkImport.ts` | 配额检查、进度展示、用户交互 | ✅ UI 层 |
 
-### 导出格式
+### 完整数据流
 
-| 格式类型 | 说明 | 代码位置 |
-|---------|------|---------|
-| Karakeep JSON | 自有完整格式（含列表结构） | `toExportFormat`, `toExportListFormat` |
-| Netscape HTML | 浏览器通用书签格式 | `toNetscapeFormat` |
-
----
-
-## 格式探测与解析流程
-
-### 1. 格式探测机制
-
-**注意：Karakeep 的格式探测是**用户驱动**而非自动探测。**
-
-用户在导入界面选择来源格式后，系统通过 `parseImportFile(source, textContent)` 函数调度到对应解析器：
-
-```typescript
-// parsers.ts:663-709
-export function parseImportFile(
-  source: ImportSource,
-  textContent: string,
-): ParsedImportFile {
-  if (source === "karakeep") {
-    const parsed = parseKarakeepBookmarkFile(textContent);
-    return {
-      bookmarks: deduplicateBookmarks(parsed.bookmarks),
-      lists: parsed.lists,
-    };
-  }
-
-  let result: ParsedBookmark[];
-  switch (source) {
-    case "html":
-      result = parseNetscapeBookmarkFile(textContent);
-      break;
-    // ... 其他格式
-  }
-  return { bookmarks: deduplicateBookmarks(result), lists: [] };
-}
 ```
-
-**各格式的格式验证：**
-
-- **Netscape HTML**: 检查文件头 `<!DOCTYPE NETSCAPE-Bookmark-file-1>` (parsers.ts:54)
-- **JSON 格式**: 使用 Zod schema 做严格验证（如 `zOmnivoreExportSchema`, `zLinkwardenExportSchema`）
-- **CSV 格式**: 使用 `csv-parse/sync` 解析 + Zod schema 验证
-- **OneTab TXT**: 按行解析，跳过非 URL 行
-
-### 2. 解析后统一数据结构
-
-所有外部格式解析后统一为 `ParsedImportFile` 结构：
-
-```typescript
-interface ParsedImportFile {
-  bookmarks: ParsedBookmark[];   // 书签列表
-  lists: ParsedImportList[];     // 列表/文件夹结构（仅 Karakeep 格式）
-}
-
-interface ParsedBookmark {
-  title: string;
-  content?: { type: "link"; url: string } | { type: "text"; text: string };
-  tags: string[];
-  addDate?: number;              // Unix 时间戳（秒）
-  notes?: string;
-  archived?: boolean;
-  paths: string[][];             // 文件夹路径，支持多路径（如重复URL在多个文件夹）
-  listExternalIds?: string[];    // 外部列表ID（仅 Karakeep 格式）
-}
+前端用户上传文件
+    ↓
+[useBookmarkImport.ts]
+    ├─ 预解析文件统计数量
+    ├─ 检查配额（quotaUsage）
+    └─ 调用 importBookmarksFromFile
+        ↓
+[importer.ts] importBookmarksFromFile
+    ├─ 解析文件（parseImportFile）
+    ├─ 创建导入根列表
+    ├─ 重建目录结构（paths 或 listExternalIds）
+    ├─ 转换为 StagedBookmark
+    ├─ 批量暂存（50条/批）
+    └─ finalize → 会话状态从 staging → pending
+        ↓
+[importWorker.ts] ImportWorker（轮询，5秒/次）
+    ├─ resetStaleProcessingItems（每60次轮询≈5分钟）
+    ├─ checkAndCompleteProcessingItems（每次轮询先执行）
+    ├─ processBatch
+    │   ├─ 公平调度取候选
+    │   ├─ 原子声明为 processing
+    │   ├─ processOneBookmark（并行处理）
+    │   │   ├─ createBookmark
+    │   │   ├─ updateTags
+    │   │   ├─ attachBookmarkToLists
+    │   │   └─ 状态更新
+    │   └─ checkAndCompleteEmptySessions
+    └─ checkAndCompleteIdleSessions
 ```
 
 ---
 
-## 字段映射规则详解
+## 数据库字段与状态机
 
-### 通用字段映射表
+### 数据库 Schema 核心字段
 
-| 内部字段 | 来源字段说明 |
-|---------|-------------|
-| `title` | 标题/名称 |
-| `content` | 链接或文本内容 |
-| `tags` | 标签数组 |
-| `addDate` | 添加时间（Unix 秒级时间戳） |
-| `notes` | 备注/笔记 |
-| `archived` | 是否已归档 |
-| `paths` | 文件夹路径数组（支持多层嵌套） |
+**`importSessions` 表**（schema.ts:851-879）
+
+| 字段 | 类型 | 枚举值 | 默认值 |
+|------|------|--------|--------|
+| `status` | text | `["staging", "pending", "running", "paused", "completed", "failed"]` | `staging` |
+| `lastProcessedAt` | timestamp | - | - |
+| `rootListId` | text | - | - |
+
+**`importStagingBookmarks` 表**（schema.ts:903-950）
+
+| 字段 | 类型 | 枚举值 | 默认值 |
+|------|------|--------|--------|
+| `status` | text | `["pending", "processing", "completed", "failed"]` | `pending` |
+| `result` | text | `["accepted", "rejected", "skipped_duplicate"]` | `NULL` |
+| `resultReason` | text | - | `NULL` |
+| `resultBookmarkId` | text | - | `NULL` |
+| `processingStartedAt` | timestamp | - | `NULL` |
+| `completedAt` | timestamp | - | `NULL` |
+
+> **重要区分**：
+> - `status`: 处理进度状态（pending/processing/completed/failed）
+> - `result`: 最终结果类型（仅 completed/failed 时有意义）
+> - 函数内部返回值（如 `"unsupported"`, `"reset"`）是代码级标记，**不存入数据库**
 
 ---
 
-### 各格式详细字段映射
+### 暂存书签完整状态机
 
-#### 1. Netscape HTML (`html`)
+```
+                          +-----------------+
+                          |     pending     |
+                          +-----------------+
+                                   |
+              [processBatch 原子声明，importWorker.ts:181-190]
+                                   ↓
+                          +-----------------+
+                          |   processing    |
+                          +-----------------+
+                                   |
+         +-------------------------+-------------------------+
+         |                         |                         |
+[createBookmark 抛出异常]   [已存在重复]          [成功创建新书签]
+         |                         |                         |
+         ↓                         ↓                         ↓
++-----------------+      +-----------------+      +-----------------+
+|     failed      |      |   completed     |      |   processing    |←──┐
+| result: rejected|      |result: skipped_ |      | result: accepted|   |
+| completedAt 设置|      |   duplicate     |      | resultBookmarkId|   |
++-----------------+      | completedAt 设置|      |  设置           |   |
+         ^               +-----------------+      +-----------------+   |
+         |                         |                         |         |
+         |                         |                         ↓         |
+[asset 类型不支持]           [终态，不可逆]    [checkAndCompleteProcessingItems]
+         |                                                 |         |
+         ↓                                                 ↓         |
++-----------------+                              +-----------------+  |
+|     failed      |                              |crawl/tag 都完成?|  |
+| result: rejected|                              +-----------------+  |
+| reason: "Asset   |                                         |         |
+|  not supported" |                          +--------------+--------------+
++-----------------+                          |              |              |
+                                              ↓              ↓              ↓
+                                     +-----------------+ +-----------+ +-----------+
+                                     |   completed     | |  failed   | |  继续等   |
+                                     | result: accepted| |result: rej| | processing|
+                                     | completedAt 设置| |reason: Crawl| +-----------+
+                                     +-----------------+ | /Tag failed|       ↑
+                                                         +-----------+        |
+                                                              |               |
+                                                              └───────────────┘
+                                                           [下次轮询继续检查]
+```
+
+---
+
+### 状态转换的代码路径
+
+#### 1. `pending` → `processing`（原子声明）
+
+**位置**: `importWorker.ts:181-190`
+
+```typescript
+// 原子 UPDATE，只有仍为 pending 的行才会被声明
+const batch = await db
+  .update(importStagingBookmarks)
+  .set({ status: "processing", processingStartedAt: new Date() })
+  .where(
+    and(
+      eq(importStagingBookmarks.status, "pending"),
+      inArray(importStagingBookmarks.id, candidateIds),
+    ),
+  )
+  .returning();
+```
+
+#### 2. `processing` → 终态（`processOneBookmark` 内）
+
+**路径 A：创建失败**（importWorker.ts:469-485）
+```typescript
+status: "failed"
+result: "rejected"
+resultReason: getSafeErrorMessage(error)
+completedAt: new Date()
+```
+
+**路径 B：asset 类型不支持**（importWorker.ts:412-422）
+```typescript
+status: "failed"
+result: "rejected"  // ⚠️ 不是 "unsupported"，数据库没有这个枚举
+resultReason: "Asset bookmarks not yet supported"
+completedAt: new Date()
+// 函数返回 "unsupported" 只是代码内部标记，不入库
+```
+
+**路径 C：重复 URL**（importWorker.ts:437-452）
+```typescript
+status: "completed"
+result: "skipped_duplicate"
+resultReason: "URL already exists"
+resultBookmarkId: result.id  // 关联到已存在的书签
+completedAt: new Date()
+```
+
+**路径 D：成功创建，等待下游**（importWorker.ts:457-463）
+```typescript
+// ⚠️ 注意：status 仍为 "processing"，不设置 completedAt
+status: "processing"  // 保持不变！
+result: "accepted"
+resultBookmarkId: result.id
+// completedAt 不设置
+```
+
+#### 3. `processing` → 终态（`checkAndCompleteProcessingItems` 内）
+
+**位置**: `importWorker.ts:546-650`
+
+**调用时机**: **每次轮询最先执行**（importWorker.ts:126），在 `processBatch` 之前。
+
+```typescript
+// 查找条件：
+eq(importStagingBookmarks.status, "processing"),
+isNotNull(importStagingBookmarks.resultBookmarkId),  // 已创建书签
+or(isNull(crawlStatus), eq(crawlStatus, "success"), eq(crawlStatus, "failure")),
+or(isNull(taggingStatus), eq(taggingStatus, "success"), eq(taggingStatus, "failure")),
+
+// 都成功 → status: "completed", completedAt: now
+// 任一失败 → status: "failed", result: "rejected", reason: "Crawl failed" / "Tagging failed"
+```
+
+---
+
+## 失败容忍与重试机制
+
+### 1. 导入前过滤（第一道防线）
+
+**位置**: `importSessions.service.ts:95-100`
+
+暂存前就过滤无效书签，根本不进入处理队列：
+```typescript
+const validBookmarks = bookmarks.filter((bookmark) => {
+  if (bookmark.type === "link" && !bookmark.url) return false;
+  if (bookmark.type === "text" && !bookmark.content) return false;
+  return true;
+});
+```
+
+### 2. 处理过程中的错误隔离
+
+- **`Promise.allSettled`**（importWorker.ts:213）：单条失败不影响批次
+- **列表关联容错**（importWorker.ts:341-347）：单个列表关联失败只打 warn，不影响书签状态
+- **错误信息安全过滤**（importWorker.ts:82-100）：避免泄露堆栈、数据库错误等内部详情给用户
+
+### 3. 挂起项重试机制
+
+**位置**: `importWorker.ts:682-718`
+
+**触发条件**（必须同时满足）：
+```
+status === "processing"
+AND processingStartedAt < NOW - 1小时
+AND resultBookmarkId IS NULL  // ⚠️ 关键：已创建书签的不重试！
+```
+
+**重置动作**:
+```typescript
+status: "pending"
+processingStartedAt: null  // 清空
+```
+
+**触发频率**: 每 60 次轮询 = 60 × 5秒 = **5分钟**（importWorker.ts:120）
+
+> **重要限制**：
+> - 已成功创建书签（有 `resultBookmarkId`）的项目**永远不会被重试**
+> - 哪怕后续 crawl/tagging 失败了，也只会标记为 `failed`，不会重试
+> - 只有"书签创建前"挂起的项目才会被重置重试
+
+### 4. 循环引用与父列表缺失兜底
+
+**位置**: `importer.ts:133-147`
+
+拓扑排序中如果一轮没有创建任何列表（说明有循环引用或父引用不存在），强制全部挂到根目录：
+```typescript
+if (!createdAny) {
+  for (const [externalId, list] of unresolvedLists) {
+    const createdList = await deps.createList({
+      // ...
+      parentId: rootList.id,  // 强制根目录
+    });
+  }
+  unresolvedLists.clear();
+}
+```
+
+### 5. 会话暂停后的状态回滚
+
+**位置**: `importWorker.ts:358-364`
+
+处理中发现会话已暂停，把当前条目重置回 `pending`：
+```typescript
+if (!session || session.status === "paused") {
+  await db
+    .update(importStagingBookmarks)
+    .set({ status: "pending" })  // 重置，不保留 processingStartedAt
+    .where(eq(importStagingBookmarks.id, staged.id));
+  return "reset";  // 代码内部标记，不入库
+}
+```
+
+### 6. 并发控制与原子性
+
+- **原子声明**：UPDATE + WHERE 确保多 Worker 不重复处理同一条
+- **背压控制**：`maxInFlight = 50`，通过 `processingStartedAt` 判断是否为有效在处理项
+- **公平调度**：按 `importSessions.lastProcessedAt` 排序，避免大导入阻塞其他用户
+
+---
+
+## 结果类型汇总
+
+### 数据库存储的结果类型
+
+| `result` | `status` | 场景 |
+|----------|----------|------|
+| `NULL` | `pending` | 等待处理 |
+| `NULL` | `processing` | 处理中（书签创建前） |
+| `"accepted"` | `processing` | 书签已创建，等待 crawl/tagging |
+| `"accepted"` | `completed` | 全部成功 |
+| `"skipped_duplicate"` | `completed` | URL 已存在，跳过但仍关联标签/列表 |
+| `"rejected"` | `failed` | 验证失败、创建异常、下游失败、asset 不支持 |
+
+### 函数内部返回值（不入库）
+
+| 返回值 | 场景 |
+|--------|------|
+| `"reset"` | 会话暂停，状态已回滚 |
+| `"unsupported"` | asset 类型，数据库已存 `result: "rejected"` |
+| `"duplicate"` | 重复 URL，数据库已存 `result: "skipped_duplicate"` |
+| `"accepted"` | 成功创建，数据库已存 `result: "accepted"`（status 仍为 processing） |
+| `"failed"` | 处理失败，数据库已存 `result: "rejected"` |
+
+---
+
+## 各格式字段映射（修正版）
+
+### 1. Netscape HTML (`html`)
 
 **代码位置**: `parsers.ts:53-111`
 
@@ -134,12 +334,9 @@ interface ParsedBookmark {
 
 **特殊处理**:
 - 空文件夹名 → `"Unnamed"` (parsers.ts:72)
-- 支持任意深度嵌套文件夹
-- 无 URL 的书签也会被保留（`content` 为 `undefined`）
+- 无 URL 的书签也会被保留（`content` 为 `undefined`），但会在暂存前被过滤
 
----
-
-#### 2. Pocket (`pocket`)
+### 2. Pocket (`pocket`)
 
 **代码位置**: `parsers.ts:113-135`
 
@@ -151,70 +348,7 @@ interface ParsedBookmark {
 | `tags` | `tags` | 管道符分隔，`split("|")` |
 | `status` | `archived` | `status === "archive"` → `true` |
 
----
-
-#### 3. Matter (`matter`)
-
-**代码位置**: `parsers.ts:137-181`
-
-| CSV 列 | 内部字段 | 转换规则 |
-|-------|---------|---------|
-| `Title` | `title` | 直接映射 |
-| `URL` | `content.url` | 直接映射 |
-| `Tags` | `tags` | 分号分隔，`split(";")` |
-| `Last Interaction Date` | `addDate` | `Date.parse(date) / 1000` |
-| `In Queue` | `archived` | `"False"` → `true` |
-
----
-
-#### 4. Omnivore (`omnivore`)
-
-**代码位置**: `parsers.ts:240-268`
-
-| JSON 字段 | 内部字段 | 转换规则 |
-|----------|---------|---------|
-| `title` | `title` | 直接映射 |
-| `url` | `content.url` | 直接映射 |
-| `labels` | `tags` | 直接映射（数组） |
-| `savedAt` | `addDate` | `z.coerce.date()` → `.getTime() / 1000` |
-| `state` | `archived` | `state === "Archived"` → `true` |
-
----
-
-#### 5. Linkwarden (`linkwarden`)
-
-**代码位置**: `parsers.ts:270-324`
-
-| JSON 路径 | 内部字段 | 转换规则 |
-|----------|---------|---------|
-| `links[].name` | `title` | 直接映射 |
-| `links[].url` | `content.url` | 直接映射 |
-| `links[].tags[].name` | `tags` | 提取 `name` 字段 |
-| `links[].createdAt` | `addDate` | `.getTime() / 1000` |
-| `collections` 层级 | `paths` | 递归 `parentId` 构建完整路径 |
-
-**特殊处理**:
-- 按 `collections[].id` → `parentId` 递归构建路径 (`getCollectionPath`)
-- 同一 URL 在多个集合中会被去重，路径合并
-
----
-
-#### 6. Instapaper (`instapaper`)
-
-**代码位置**: `parsers.ts:426-496`
-
-| CSV 列 | 内部字段 | 转换规则 |
-|-------|---------|---------|
-| `Title` | `title` | 直接映射 |
-| `URL` | `content.url` | 优先使用 URL |
-| `Selection` | `content.text` | 无 URL 时使用文本内容 |
-| `Timestamp` | `addDate` | `parseInt()` |
-| `Tags` | `tags` | `JSON.parse()`，失败则空数组 |
-| `Folder` | `archived`/`paths` | `"Archive"` → `archived: true`; `"Unread"` → 无路径; 其他 → `paths: [[Folder]]` |
-
----
-
-#### 7. Readwise Reader (`readwise-reader`)
+### 3. Readwise Reader (`readwise-reader`)
 
 **代码位置**: `parsers.ts:498-576`
 
@@ -222,52 +356,29 @@ interface ParsedBookmark {
 |-------|---------|---------|
 | `Title` | `title` | 直接映射 |
 | `URL` | `content.url` | 直接映射 |
-| `Document tags` | `tags` | 特殊引号转义后 `JSON.parse()` |
+| `Document tags` | `tags` | 特殊引号转义（`\'` → `'`，`'` → `"`）后 `JSON.parse()` |
 | `Saved date` | `addDate` | `new Date().getTime() / 1000` |
 | `Location` | `archived` | `"archive"` → `true` |
-| `Location` | 过滤 | `"feed"` → 过滤排除 |
+| `Location` | 过滤 | `"feed"` → 排除 |
 
 **特殊处理**:
-- 标签字段需要转义：`\'` → `'`，`'` → `"` 等 (parsers.ts:519-524)
-- 自动过滤 RSS feed 项目 (`Location !== "feed"`)
-- 过滤空 URL 项目
+- 空 URL 项目会被过滤（importWorker.ts 中还会再检查一次）
+- 标签 JSON 解析失败时 `tags = []`，不抛出错误（parsers.ts:563-564）
 
----
+### 4. Instapaper (`instapaper`)
 
-#### 8. mymind (`mymind`)
-
-**代码位置**: `parsers.ts:365-424`
+**代码位置**: `parsers.ts:426-496`
 
 | CSV 列 | 内部字段 | 转换规则 |
 |-------|---------|---------|
-| `title` | `title` | 直接映射 |
-| `url` | `content.url` | 优先使用 URL |
-| `content` | `content.text` | 无 URL 时使用文本 |
-| `tags` | `tags` | 逗号分隔，`split(",")` |
-| `note` | `notes` | 直接映射 |
-| `created` | `addDate` | `new Date().getTime() / 1000` |
+| `Title` | `title` | 直接映射 |
+| `URL` | `content.url` | 优先使用 URL |
+| `Selection` | `content.text` | 无 URL 时使用 |
+| `Timestamp` | `addDate` | `parseInt()` |
+| `Tags` | `tags` | `JSON.parse()`，失败则 `[]` |
+| `Folder` | `archived`/`paths` | `"Archive"` → `archived: true`; `"Unread"` → 无路径; 其他 → `paths: [[Folder]]` |
 
-**类型判定**:
-```
-有 URL → type: "link"
-无 URL 但有 content → type: "text"
-```
-
----
-
-#### 9. OneTab (`onetab`)
-
-**代码位置**: `parsers.ts:578-612`
-
-| 格式 | 内部字段 | 说明 |
-|------|---------|------|
-| `URL \| Title` 行 | `content.url`, `title` | 按 ` \| ` 分割 |
-| 单独 `URL` 行 | `content.url` | `title` 为空 |
-| 非 `http://` 或 `https://` | - | 跳过该行 |
-
----
-
-#### 10. Karakeep 自有格式 (`karakeep`)
+### 5. Karakeep 自有格式 (`karakeep`)
 
 **代码位置**: `parsers.ts:183-238`
 
@@ -281,8 +392,8 @@ interface ParsedBookmark {
 | `bookmarks[].createdAt` | `addDate` | 直接映射 |
 | `bookmarks[].note` | `notes` | 直接映射 |
 | `bookmarks[].archived` | `archived` | 直接映射 |
-| `bookmarks[].lists` | `listExternalIds` | 仅保留 `manual` 类型列表 |
-| `lists[]` | `lists` | 完整保留列表结构（含 `parentId`, `type`, `query`） |
+| `bookmarks[].lists` | `listExternalIds` | 仅保留 `manual` 类型列表，过滤智能列表 |
+| `lists[]` | `lists` | 完整保留（含 `parentId`, `type`, `query`） |
 
 **特殊处理**:
 - 智能列表（`type: "smart"`）不与书签关联，仅作为列表元数据导入
@@ -290,16 +401,18 @@ interface ParsedBookmark {
 
 ---
 
-### 重复数据合并规则
+## 去重合并规则
 
-**代码位置**: `parsers.ts:614-661` (`deduplicateBookmarks`)
+**位置**: `parsers.ts:614-661` (`deduplicateBookmarks`)
 
-按 URL 去重（文本书签不做去重），合并策略：
+**作用范围**: 仅**同一导入文件内**的去重（解析阶段），跨导入去重由 `createBookmark` 内部处理。
+
+**去重键**: 仅对 `link` 类型按 URL 去重，`text` 类型不去重。
 
 | 字段 | 合并策略 |
 |-----|---------|
 | `tags` | 合并去重：`[...new Set([...existing, ...new])]` |
-| `paths` | 合并所有路径 |
+| `paths` | 合并所有路径（数组元素合并） |
 | `listExternalIds` | 合并去重 |
 | `addDate` | 保留较早的日期 |
 | `notes` | 两者都有时用 `\n---\n` 分隔追加 |
@@ -308,37 +421,58 @@ interface ParsedBookmark {
 
 ---
 
-## 导入工作流
+## 导入工作流详细步骤
 
-### 整体流程
+### 阶段一：前端触发 (`useBookmarkImport.ts`)
 
-```
-用户上传文件 → 选择格式 → 解析文件 → 重建目录结构 → 批量暂存 → 
-后台Worker处理 → 实际创建书签 → 关联列表/标签 → 完成
-```
-
-### 阶段一：解析与暂存 (`importer.ts`)
-
-**代码位置**: `importBookmarksFromFile` (importer.ts:56-286)
-
-#### 1. 创建导入根列表
 ```typescript
-const rootList = await deps.createList({ name: rootListName, icon: "⬆️" });
+// 1. 预解析文件（用于配额检查）
+const textContent = await file.text();
+const parsedImport = parseImportFile(source, textContent);
+const bookmarkCount = parsedImport.bookmarks.length;
+
+// 2. 配额检查
+const quotaUsage = await queryClient.fetchQuery(api.subscriptions.getQuotaUsage.queryOptions());
+// 剩余配额不足则抛出错误
+
+// 3. 调用导入主流程，传入自定义 parser 避免重复解析
+const result = await importBookmarksFromFile(
+  {
+    file,
+    source,
+    rootListName: t("settings.import.imported_bookmarks"),
+    deps: {
+      createImportSession,      // tRPC mutation
+      createList,               // tRPC mutation
+      stageImportedBookmarks,   // tRPC mutation
+      finalizeImportStaging,    // tRPC mutation
+    },
+    onProgress: (done, total) => setImportProgress({ done, total }),
+  },
+  {
+    // ⚠️ 关键优化：自定义 parser 复用预解析结果，避免二次解析
+    parsers: {
+      [source]: () => parsedImport,
+    },
+  },
+);
 ```
 
-#### 2. 重建目录结构
+### 阶段二：解析与暂存 (`importer.ts`)
+
+#### 目录结构重建
 
 **方式 A：通过 `paths` 构建（大多数格式）**
 
 ```typescript
-// 路径分隔符："$$__$$"
+// 路径分隔符："$$__$$"（importer.ts:151）
 const PATH_DELIMITER = "$$__$$";
 
-// 1. 收集所有需要的路径（含所有父路径）
+// 1. 收集所有需要的路径（含所有父路径，确保中间目录也被创建）
 for (const bookmark of bookmarksWithPathMembership) {
   for (const path of bookmark.paths) {
     for (let i = 1; i <= path.length; i++) {
-      const subPath = path.slice(0, i); // 确保父目录也被创建
+      const subPath = path.slice(0, i); // 例：["a","b","c"] → ["a"], ["a","b"], ["a","b","c"]
       allRequiredPaths.set(getPathKey(subPath), folderName);
     }
   }
@@ -369,15 +503,18 @@ for (const { pathKey, folderName } of allRequiredPathsArray) {
 // 拓扑排序处理有依赖的列表创建
 while (unresolvedLists.size > 0) {
   for (const [externalId, list] of unresolvedLists) {
-    // 父列表未创建则跳过
+    // 父列表未创建则跳过，等下一轮
     if (list.parentExternalId && !externalListIdToCreatedListId[list.parentExternalId]) {
       continue;
     }
     
-    // 创建列表
+    const parentId = list.parentExternalId 
+      ? externalListIdToCreatedListId[list.parentExternalId] 
+      : rootList.id;
+    
     const createdList = await deps.createList({
       name: list.name.substring(0, MAX_LIST_NAME_LENGTH),
-      parentId: list.parentExternalId ? externalListIdToCreatedListId[list.parentExternalId] : rootList.id,
+      parentId,
       icon: list.icon ?? "📁",
       description: list.description,
       ...(list.type === "smart" && list.query ? { type: "smart", query: list.query } : {}),
@@ -393,7 +530,7 @@ while (unresolvedLists.size > 0) {
     for (const [externalId, list] of unresolvedLists) {
       const createdList = await deps.createList({
         name: list.name.substring(0, MAX_LIST_NAME_LENGTH),
-        parentId: rootList.id,  // 强制挂到根
+        parentId: rootList.id,  // 强制根目录
         // ...
       });
     }
@@ -402,77 +539,82 @@ while (unresolvedLists.size > 0) {
 }
 ```
 
-#### 3. 书签关联列表优先级
+#### 书签关联列表优先级
 
 ```typescript
-// listExternalIds 优先于 paths
+// listExternalIds 优先于 paths（importer.ts:225-228）
 const listIds =
   listIdsFromExternalListIds.length > 0
     ? listIdsFromExternalListIds
     : listIdsFromPaths;
 ```
 
-#### 4. 批量暂存
+#### 批量暂存
 
 - 批次大小：50 条 (importer.ts:261)
-- 暂存表：`import_staging_bookmarks`
-- 状态：`pending`
+- 暂存状态：`pending`
+- `finalizeImportStaging` 后会话状态从 `staging` → `pending`，Worker 开始处理
 
----
+### 阶段三：后台 Worker 处理 (`importWorker.ts`)
 
-### 阶段二：后台 Worker 处理 (`importWorker.ts`)
-
-**代码位置**: `apps/workers/workers/importWorker.ts`
-
-#### 状态机
-
-```
-staging → pending → running → completed
-                    ↓         ↓
-                  paused    failed
-```
-
-#### 并发控制与公平调度
+#### 轮询循环
 
 ```typescript
-// 最大同时处理数：50
-private maxInFlight = 50;
-// 批次大小：10
-private batchSize = 10;
-
-// 公平调度：按用户 lastProcessedAt 排序，再按创建时间
-.orderBy(importSessions.lastProcessedAt, importStagingBookmarks.createdAt)
-
-// 原子声明：防止多 Worker 竞争
-const batch = await db
-  .update(importStagingBookmarks)
-  .set({ status: "processing", processingStartedAt: new Date() })
-  .where(
-    and(
-      eq(importStagingBookmarks.status, "pending"),
-      inArray(importStagingBookmarks.id, candidateIds),
-    ),
-  )
-  .returning();
+while (this.running) {
+  // 1. 每 60 次轮询（≈5分钟）重置挂起项
+  if (iterationCount % 60 === 0) {
+    await this.resetStaleProcessingItems();
+  }
+  
+  // 2. 每次轮询先检查已完成下游处理的项目
+  await this.checkAndCompleteProcessingItems();
+  
+  // 3. 处理一个批次
+  const processed = await this.processBatch();
+  
+  if (processed === 0) {
+    // 4. 无任务时检查空闲会话并完成
+    await this.checkAndCompleteIdleSessions();
+    await this.updateGauges();
+    await sleep(this.pollIntervalMs); // 5秒
+  }
+}
 ```
 
-#### 单条书签处理流程
+#### 单条书签处理 (`processOneBookmark`)
 
 ```typescript
-// 1. 构建创建请求
-const baseRequest = {
-  title: normalizedTitle?.trim().substring(0, MAX_BOOKMARK_TITLE_LENGTH),
-  note: staged.note ?? undefined,
-  createdAt: staged.sourceAddedAt ?? undefined,
-  crawlPriority: "low",
-  archived: staged.archived ?? false,
-  source: "import",
-};
+// 1. 会话检查：已暂停则重置回 pending
+if (!session || session.status === "paused") {
+  await db.update(importStagingBookmarks)
+    .set({ status: "pending" })
+    .where(eq(importStagingBookmarks.id, staged.id));
+  return "reset";
+}
 
-// 2. 调用 createBookmark（内部已含重复检测）
+// 2. 验证类型并构建请求
+if (staged.type === "link") {
+  if (!staged.url) throw new Error("URL is required for link bookmarks");
+  bookmarkRequest = { type: BookmarkTypes.LINK, url: staged.url, ... };
+} else if (staged.type === "text") {
+  if (!staged.content) throw new Error("Content is required for text bookmarks");
+  bookmarkRequest = { type: BookmarkTypes.TEXT, text: staged.content, ... };
+} else {
+  // asset 类型 → 标记为 failed
+  await db.update(importStagingBookmarks)
+    .set({
+      status: "failed",
+      result: "rejected",  // ⚠️ 不是 "unsupported"
+      resultReason: "Asset bookmarks not yet supported",
+      completedAt: new Date(),
+    });
+  return "unsupported"; // 代码内部标记
+}
+
+// 3. 创建书签（内部已含跨导入去重）
 const result = await caller.bookmarks.createBookmark(bookmarkRequest);
 
-// 3. 应用标签
+// 4. 应用标签（重复书签也应用标签）
 if (staged.tags && staged.tags.length > 0) {
   await caller.bookmarks.updateTags({
     bookmarkId: result.id,
@@ -481,121 +623,52 @@ if (staged.tags && staged.tags.length > 0) {
   });
 }
 
-// 4. 关联列表
+// 5. 处理重复
+if (result.alreadyExists) {
+  await db.update(importStagingBookmarks)
+    .set({
+      status: "completed",
+      result: "skipped_duplicate",
+      resultReason: "URL already exists",
+      resultBookmarkId: result.id,
+      completedAt: new Date(),
+    });
+  await this.attachBookmarkToLists(caller, session, staged, result.id);
+  return "duplicate";
+}
+
+// 6. 成功创建，标记为 accepted 但保持 processing 状态
+await db.update(importStagingBookmarks)
+  .set({
+    result: "accepted",
+    resultBookmarkId: result.id,
+    // ⚠️ status 仍为 "processing"，不设置 completedAt
+  });
+await this.attachBookmarkToLists(caller, session, staged, result.id);
+return "accepted";
+```
+
+#### 列表关联逻辑 (`attachBookmarkToLists`)
+
+```typescript
+const listIds = new Set<string>();
+
+// ⚠️ 同时关联 rootListId + staged.listIds
+if (session.rootListId) {
+  listIds.add(session.rootListId);
+}
+if (staged.listIds && staged.listIds.length > 0) {
+  for (const listId of staged.listIds) {
+    listIds.add(listId);
+  }
+}
+
+// 单条失败不影响整体
 for (const listId of listIds) {
   try {
     await caller.lists.addToList({ listId, bookmarkId });
   } catch (error) {
-    // 单个列表关联失败不影响整体
-    logger.warn(`Failed to add bookmark to list: ${error}`);
-  }
-}
-```
-
----
-
-## 失败容忍与容错处理
-
-### 1. 导入前过滤 (`importSessions.service.ts:95-100`)
-
-暂存前过滤无效书签：
-```typescript
-const validBookmarks = bookmarks.filter((bookmark) => {
-  if (bookmark.type === "link" && !bookmark.url) return false;
-  if (bookmark.type === "text" && !bookmark.content) return false;
-  return true;
-});
-```
-
-### 2. 结果类型
-
-| `result` | `status` | 说明 |
-|----------|----------|------|
-| `accepted` | `completed` | 成功导入 |
-| `skipped_duplicate` | `completed` | URL 已存在，跳过但仍关联列表和标签 |
-| `rejected` | `failed` | 处理失败 |
-| `unsupported` | `failed` | asset 类型暂不支持 |
-
-### 3. 错误信息安全过滤 (`importWorker.ts:82-100`)
-
-```typescript
-function getSafeErrorMessage(error: unknown): string {
-  // TRPCError 非 INTERNAL_SERVER_ERROR 可直接展示
-  if (error instanceof TRPCError && error.code !== "INTERNAL_SERVER_ERROR") {
-    return error.message;
-  }
-  
-  // 已知安全的验证错误
-  if (error instanceof Error) {
-    const safeMessages = [
-      "URL is required for link bookmarks",
-      "Content is required for text bookmarks",
-    ];
-    if (safeMessages.includes(error.message)) {
-      return error.message;
-    }
-  }
-  
-  return "An unexpected error occurred while processing the bookmark";
-}
-```
-
-### 4. 挂起项重试机制 (`importWorker.ts:682-718`)
-
-```typescript
-// 超时阈值：1小时
-private staleThresholdMs = 60 * 60 * 1000;
-
-// 每 60 次轮询（约 5 分钟）检查一次
-if (iterationCount % 60 === 0) {
-  await this.resetStaleProcessingItems();
-}
-
-// 重置条件：
-// 1. status === "processing"
-// 2. processingStartedAt < 1小时前
-// 3. resultBookmarkId IS NULL（已创建书签的不算挂起）
-```
-
-### 5. 下游处理等待 (`importWorker.ts:546-650`)
-
-书签创建后，需等待爬虫和自动标签完成才算真正完成：
-
-```typescript
-// crawlStatus 和 taggingStatus 都不为 pending 才标记完成
-or(
-  isNull(bookmarkLinks.crawlStatus),
-  eq(bookmarkLinks.crawlStatus, "success"),
-  eq(bookmarkLinks.crawlStatus, "failure"),
-),
-or(
-  isNull(bookmarks.taggingStatus),
-  eq(bookmarks.taggingStatus, "success"),
-  eq(bookmarks.taggingStatus, "failure"),
-)
-```
-
-### 6. 列表关联容错
-
-单条列表关联失败只打 warn 日志，不影响书签整体状态：
-```typescript
-try {
-  await caller.lists.addToList({ listId, bookmarkId });
-} catch (error) {
-  logger.warn(`[import] Failed to add bookmark ${bookmarkId} to list ${listId}: ${error}`);
-}
-```
-
-### 7. 循环引用或父列表缺失
-
-拓扑排序中遇到无法解析的父引用时，强制挂到导入根列表：
-```typescript
-if (!createdAny) {
-  for (const [externalId, list] of unresolvedLists) {
-    const createdList = await deps.createList({
-      // ...
-      parentId: rootList.id,  // 强制根目录
-    });
+    logger.warn(`[import] Failed to add bookmark to list: ${error}`);
   }
 }
 ```
@@ -628,12 +701,12 @@ toExportListFormat(list): {
 
 ```typescript
 toNetscapeFormat(bookmarks): string {
-  // 仅导出 link 类型书签
+  // 仅导出 link 类型书签，text 类型被忽略
   if (bookmark.content?.type !== BookmarkTypes.LINK) {
     return "";
   }
   
-  // 格式：
+  // 输出格式：
   <DT><A HREF="{url}" ADD_DATE="{timestamp}" TAGS="{tags}">{title}</A>
 }
 ```
@@ -642,18 +715,35 @@ toNetscapeFormat(bookmarks): string {
 
 ## 代码位置索引
 
-| 功能 | 文件 | 关键函数/类 |
-|------|------|------------|
-| 格式解析入口 | `packages/shared/import-export/parsers.ts` | `parseImportFile` |
-| Netscape 解析 | `parsers.ts` | `parseNetscapeBookmarkFile` |
-| Pocket 解析 | `parsers.ts` | `parsePocketBookmarkFile` |
-| Linkwarden 解析 | `parsers.ts` | `parseLinkwardenBookmarkFile` |
-| Readwise Reader 解析 | `parsers.ts` | `parseReadwiseReaderBookmarkFile` |
-| Instapaper 解析 | `parsers.ts` | `parseInstapaperBookmarkFile` |
-| Karakeep 解析 | `parsers.ts` | `parseKarakeepBookmarkFile` |
-| 去重合并 | `parsers.ts` | `deduplicateBookmarks` |
-| 导入主流程 | `packages/shared/import-export/importer.ts` | `importBookmarksFromFile` |
-| 导出功能 | `packages/shared/import-export/exporters.ts` | `toExportFormat`, `toNetscapeFormat` |
-| 导入会话服务 | `packages/trpc/models/importSessions.service.ts` | `ImportSessionsService` |
-| 后台导入 Worker | `apps/workers/workers/importWorker.ts` | `ImportWorker` |
-| 导入类型定义 | `packages/shared/types/importSessions.ts` | - |
+| 功能 | 文件 | 关键函数/类 | 行号 |
+|------|------|------------|------|
+| 格式解析入口 | `packages/shared/import-export/parsers.ts` | `parseImportFile` | 663-709 |
+| Netscape 解析 | `parsers.ts` | `parseNetscapeBookmarkFile` | 53-111 |
+| 去重合并 | `parsers.ts` | `deduplicateBookmarks` | 614-661 |
+| 导入主流程 | `packages/shared/import-export/importer.ts` | `importBookmarksFromFile` | 56-286 |
+| 导出功能 | `packages/shared/import-export/exporters.ts` | `toExportFormat`, `toNetscapeFormat` | 42-127 |
+| 前端导入 Hook | `apps/web/lib/hooks/useBookmarkImport.ts` | `useBookmarkImport` | 23-132 |
+| 导入会话服务 | `packages/trpc/models/importSessions.service.ts` | `ImportSessionsService` | 17-206 |
+| 导入会话仓储 | `packages/trpc/models/importSessions.repo.ts` | `ImportSessionsRepo` | 14-124 |
+| 后台导入 Worker | `apps/workers/workers/importWorker.ts` | `ImportWorker` | 102-718 |
+| 安全错误信息 | `importWorker.ts` | `getSafeErrorMessage` | 82-100 |
+| 挂起项重置 | `importWorker.ts` | `resetStaleProcessingItems` | 682-718 |
+| 下游完成检查 | `importWorker.ts` | `checkAndCompleteProcessingItems` | 546-650 |
+| 单条处理 | `importWorker.ts` | `processOneBookmark` | 351-487 |
+| 批次处理 | `importWorker.ts` | `processBatch` | 149-233 |
+| 数据库 Schema | `packages/db/schema.ts` | `importSessions`, `importStagingBookmarks` | 851-950 |
+| 导入类型定义 | `packages/shared/types/importSessions.ts` | - | 1-78 |
+
+---
+
+## 常见误解澄清
+
+| 误解 | 事实 |
+|------|------|
+| 结果类型有 `"unsupported"` | 数据库 `result` 枚举只有 `accepted`/`rejected`/`skipped_duplicate`，`"unsupported"` 只是函数返回值，实际存的是 `rejected` |
+| 成功创建书签后状态变为 `completed` | 书签创建成功后状态仍为 `processing`，需等 crawl/tagging 完成后才由 `checkAndCompleteProcessingItems` 标记为 `completed` |
+| 处理失败后会自动重试 | 只有 `resultBookmarkId IS NULL` 的挂起项会被重置，已创建书签的项目（哪怕下游失败）不会重试 |
+| `listExternalIds` 和 `paths` 是二选一 | `listExternalIds` 优先级高于 `paths`，但 `attachBookmarkToLists` 还会额外加上 `session.rootListId` |
+| 去重只在导入时做一次 | 两次去重：解析阶段同一文件内去重 + `createBookmark` 跨导入去重 |
+| `checkAndCompleteProcessingItems` 在批次后调用 | **每次轮询最先调用**，在 `processBatch` 之前 |
+| 挂起项每小时检查一次 | 每 **5 分钟** 检查一次（60次轮询 × 5秒） |
