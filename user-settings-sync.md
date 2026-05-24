@@ -1,5 +1,20 @@
 # Karakeep 用户设置跨端同步与冲突处理分析
 
+## 摘要
+
+本文档深入分析 Karakeep 项目中用户设置的存储模型、跨端同步触发机制与冲突解决策略。基于代码分析，我们发现：
+
+1. **存储模型**：用户设置直接存储在 `user` 表的列中，共 14 个设置字段，没有独立的 `settingsVersion` 或 `modifiedAt` 字段用于并发控制。
+2. **同步机制**：通过 tRPC 接口 `users.settings`（查询）和 `users.updateSettings`（变更）实现，Web 端和 Mobile 端都使用 React Query 进行缓存管理。同步时机仅限于页面加载和设置变更后主动刷新，无轮询或实时推送。
+3. **冲突策略**：当前采用 **Last Write Wins（最后写入获胜）** 策略，无任何显式冲突检测。`updateSettings` 直接执行无条件 UPDATE，后写入者静默覆盖先写入者。
+4. **移动端限制**：移动端仅能修改 3 个阅读器设置字段，且需要用户显式点击同步按钮；其他 10 个服务端设置字段移动端完全不写入。
+5. **阅读器设置两条写回路径**：`saveAsDefault`（写入具体值）和 `clearAllDefaults`（设为 null），两条路径都**总是同时更新全部 3 个字段**，Web 端与移动端行为完全一致。
+6. **最高风险：本地覆盖值意外泄漏**：`saveAsDefault` 使用 `settings`（包含本地覆盖）补全未传入的字段，而 `settings` 的优先级是 `sessionOverrides` → `localOverrides` → `serverSettings` → `default`。这意味着**仅本设备的本地覆盖值可能被意外写回服务端**，静默覆盖其他设备的设置，形成隐蔽的风险闭环。
+7. **Web 端风险更高**：Web 端修改阅读器设置下拉/滑块时立即同步，且无需有本地覆盖，任意修改都可能"顺便"把本地覆盖值同步到服务端。移动端通过 `disabled={!hasLocalOverrides}` 提供了一定防护。
+8. **其他风险**：阅读器设置更新粒度过粗、`clearAllDefaults` 行为不一致（不清除本地覆盖）、缓存过期问题，都增加了冲突和数据不一致的风险。
+
+---
+
 ## 一、存储模型分析
 
 ### 1.1 数据库表结构
@@ -150,6 +165,8 @@ const zSettingsSchema = z.object({
 同步触发条件（两条独立写回路径）：
 1. **路径 1：保存为默认（saveAsDefault）** - 用户点击 **"Save as Default (All Devices)"** 按钮，写入具体值
 2. **路径 2：清除服务器默认（clearAllDefaults）** - 用户点击 **"Clear Server Defaults"** 按钮，将字段设为 `null`
+
+> ⚠️ **重要风险提示**：两条路径都使用当前 `settings`（包含本地覆盖）补全字段。如果设备有本地覆盖，本地覆盖值可能被**意外写回服务端**，覆盖其他设备的设置。详见 3.2 节的风险闭环分析。
 
 **⚠️ 仅从服务端读取但不修改的设置（仅 1 项）**：
 - `archiveDisplayBehaviour` - 用于判断列表中是否显示已归档书签
@@ -431,11 +448,16 @@ const handleClearServerDefaults = () => {
 | **触发按钮** | Web：修改下拉/滑块，或点击 "Save to All Devices"<br>Mobile：点击 "Save as Default (All Devices)" | Web：点击 "Clear defaults"<br>Mobile：点击 "Clear Server Defaults" |
 | **写入值** | 具体的非 null 数值 | `null`（表示使用系统默认） |
 | **字段范围** | **总是全部 3 个字段**（即使只传入一个参数，内部也会补全另外两个） | **总是全部 3 个字段** |
+| **补全字段的数据源** | `settings`（包含本地覆盖！）→ **风险根源** | 固定 `null` |
 | **使用的 mutation** | `saveServerSettings` | `updateServerSettings` |
 | **成功后清除本地覆盖** | ✅ 自动清除 | ❌ 不清除，本地覆盖继续生效 |
 | **乐观更新** | ✅ 设置 pendingServerSave | ❌ 无 pending 状态 |
-| **冲突风险** | 🟡 中高：每次都覆盖全部 3 个字段，可能覆盖其他端的修改 | 🟠 高：一次性清空 3 个字段，可能覆盖其他端的所有阅读器设置 |
+| **Web 端触发条件** | 无需有本地覆盖，修改即同步 | 无需有本地覆盖，随时可点击 |
+| **移动端触发条件** | `disabled={!hasLocalOverrides}` 只有有本地覆盖时才能点击 | 无条件，随时可点击 |
+| **冲突风险** | 🔴 高：补全字段使用 `settings`（含本地覆盖），每次都覆盖全部 3 个字段，可能将本地覆盖值意外同步到服务端 | 🟠 高：一次性清空 3 个字段，可能覆盖其他端的所有阅读器设置 |
 | **实际提交内容示例** | `{ readerFontSize: 18, readerLineHeight: 1.5, readerFontFamily: "sans" }` | `{ readerFontSize: null, readerLineHeight: null, readerFontFamily: null }` |
+
+**关键风险提示**：`saveAsDefault` 内部使用 `settings` 补全未传入的字段，而 `settings` 的优先级是 `sessionOverrides` → `localOverrides` → `serverSettings` → `default`。这意味着如果设备有本地覆盖，本地覆盖值会被静默写回服务端，覆盖其他设备的设置。详见 3.2 节的风险闭环分析。
 
 ---
 
@@ -461,10 +483,12 @@ const handleClearServerDefaults = () => {
 
 | 写回路径 | Web 端更新字段 | 移动端更新字段 | 冲突风险 | 影响范围 |
 |---------|---------------|---------------|---------|---------|
-| **saveAsDefault** | 总是 3 个字段同时（内部补全未传入的字段） | 总是 3 个字段同时 | 🟡 中高 | 每次提交都可能覆盖其他端对任意阅读器字段的修改 |
+| **saveAsDefault** | 总是 3 个字段同时（内部补全未传入的字段） | 总是 3 个字段同时 | 🔴 高 | 每次提交都可能覆盖其他端对任意阅读器字段的修改，且可能将**本地覆盖值意外泄漏到服务端** |
 | **clearAllDefaults** | 总是 3 个字段同时设为 null | 总是 3 个字段同时设为 null | 🟠 高 | 一次性清空所有阅读器默认值，覆盖其他端的所有修改 |
 
-**关键结论**：Web 端和移动端在阅读器设置的写回粒度上**行为完全一致**，都总是同时更新 3 个字段。之前认为 Web 端支持单字段更新是对代码的误读。
+**关键结论**：
+1. Web 端和移动端在阅读器设置的写回粒度上**行为完全一致**，都总是同时更新 3 个字段。之前认为 Web 端支持单字段更新是对代码的误读。
+2. **最高风险来源**：`saveAsDefault` 使用 `settings`（包含本地覆盖）补全字段，导致仅本设备的本地覆盖值可能被写回服务端，静默覆盖其他设备的设置。这是一个设计层面的风险闭环，详见 3.2 节。
 
 ### 3.1.2 冲突场景示例
 
@@ -521,24 +545,119 @@ const handleClearServerDefaults = () => {
 - `archiveDisplayBehaviour`：移动端只读不写，也不会发生冲突
 - 移动端本地设置（主题、工具栏、图片质量等）：仅本地存储，不存在跨端冲突
 
-### 3.2 阅读器设置的层级优先级
+### 3.2 阅读器设置的层级优先级与风险闭环
 
-虽然没有冲突解决，但阅读器设置实现了**多层级优先级**用于本地显示（`packages/shared-react/hooks/reader-settings.tsx:110-132`）：
+阅读器设置实现了**多层级优先级**用于本地显示，但这个优先级设计与 `saveAsDefault` 的补全机制结合后，形成了一个**隐蔽的风险闭环**——本地覆盖值可能被意外写回服务端，覆盖其他设备的设置。
 
+#### 3.2.1 settings 与 localOverrides 的优先级关系
+
+**代码实现**（`packages/shared-react/hooks/reader-settings.tsx:110-132`）：
 ```typescript
 // 优先级从高到低：
 const settings: ReaderSettings = useMemo(() => ({
   fontSize:
-    sessionOverrides.fontSize ??      // 1. 会话临时覆盖（仅 Web 预览用）
-    localOverrides.fontSize ??        // 2. 设备本地覆盖（不同步）
+    sessionOverrides.fontSize ??      // 1. 会话临时覆盖（仅 Web 预览用，最高优先级）
+    localOverrides.fontSize ??        // 2. 设备本地覆盖（不同步，次高优先级）
     pendingServerSave?.fontSize ??    // 3. 待提交的服务器保存（乐观更新）
     serverSettings?.readerFontSize ?? // 4. 服务端同步值
-    READER_DEFAULTS.fontSize,         // 5. 系统默认值
+    READER_DEFAULTS.fontSize,         // 5. 系统默认值（最低优先级）
   // ... lineHeight, fontFamily 同理
 }), [sessionOverrides, localOverrides, pendingServerSave, serverSettings]);
 ```
 
-这是**显示优先级**，不是冲突解决策略。当用户选择"保存为默认值"时，会清除本地覆盖并同步到服务端。
+**关键特性**：
+- `settings` 是**最终显示值**，融合了所有层级的覆盖
+- `localOverrides` 是**原始本地覆盖值**，仅存储用户明确设置为"仅本设备"的项
+- 当 `localOverrides.fontSize = 20` 时，`settings.fontSize` 也会是 20，无论 `serverSettings.readerFontSize` 是什么值
+
+#### 3.2.2 saveAsDefault 如何使用 settings 补充字段
+
+**完整链路**（`packages/shared-react/hooks/reader-settings.tsx:175-191`）：
+```typescript
+const saveAsDefault = useCallback(
+  (settingsToSave?: ReaderSettingsPartial) => {
+    const toSave: ReaderSettings = {
+      fontSize: settingsToSave?.fontSize ?? settings.fontSize,    // ← 用 settings 补全！
+      lineHeight: settingsToSave?.lineHeight ?? settings.lineHeight, // ← 用 settings 补全！
+      fontFamily: settingsToSave?.fontFamily ?? settings.fontFamily, // ← 用 settings 补全！
+    };
+    setPendingServerSave(toSave);
+    saveServerSettings({
+      readerFontSize: toSave.fontSize,
+      readerLineHeight: toSave.lineHeight,
+      readerFontFamily: toSave.fontFamily,
+    });
+  },
+  [settings, saveServerSettings],  // ← settings 是依赖项
+);
+```
+
+**风险核心**：`saveAsDefault` 使用 `settings`（包含本地覆盖）来补充未传入的字段，而不是使用 `serverSettings`（服务端原值）。这意味着：
+
+1. 如果设备有 `localOverrides`，`settings` 会包含本地覆盖值
+2. 即使调用时只传入 `{ fontFamily: "mono" }`，`fontSize` 和 `lineHeight` 也会被补全为 `settings.fontSize` 和 `settings.lineHeight`
+3. 如果 `settings.fontSize` 正好是本地覆盖值，那么这个**仅本设备的本地值**会被写回服务端，覆盖其他设备的设置
+
+#### 3.2.3 saveServerSettings 的副作用：自动清除本地覆盖
+
+`saveServerSettings` mutation 的成功回调会自动清除本地覆盖（`packages/shared-react/hooks/reader-settings.tsx:93-97`）：
+```typescript
+onSuccess: () => {
+  setLocalOverrides({});       // 清除内存中的本地覆盖
+  saveLocalOverrides({});      // 清除持久化的本地覆盖
+  onClearSessionOverrides?.(); // 清除会话覆盖
+},
+```
+
+这意味着：
+- 本地覆盖值被写回服务端后，本地覆盖会被清除
+- 后续 `settings.fontSize` 会使用刚写回的服务端值
+- 从用户视角看："我保存了默认值，现在所有设备都用这个字体大小了"，但实际上可能覆盖了其他设备的设置
+
+#### 3.2.4 Web 本地覆盖值写回服务端的跨设备影响
+
+这个风险在 Web 端尤为突出，因为 Web 端有两种调用 `saveAsDefault` 的方式：
+
+| 调用方式 | 触发场景 | 是否需要有本地覆盖 | 风险等级 |
+|---------|---------|-----------------|---------|
+| `updateServerSetting({ fontSize: 18 })` | 设置页面修改下拉/滑块时**立即调用** | ❌ 不需要，随时可调用 | 🔴 高 |
+| `saveToServer()` | 预览弹窗点击 "Save to All Devices" | ❌ 不需要，随时可调用 | 🟠 中高 |
+
+**移动端的防护机制**（`apps/mobile/app/dashboard/settings/reader-settings.tsx:238`）：
+```typescript
+<Pressable
+  onPress={handleSaveAsDefault}
+  disabled={!hasLocalOverrides}  // ← 只有有本地覆盖时才能点击
+  ...
+>
+```
+移动端通过 `disabled={!hasLocalOverrides}` 限制了只有在有本地覆盖时才能同步，这在一定程度上降低了风险，但本地覆盖值仍会被写回服务端。
+
+**隐蔽的跨设备冲突场景**：
+```
+时序：
+  T0: 服务端 fontSize=16, lineHeight=1.5, fontFamily=sans
+  T1: 设备 A（Web）设置了本地覆盖 fontSize=20（仅本设备）
+      → 设备 A 的 settings.fontSize = 20（来自 localOverrides）
+  T2: 设备 B（Mobile）修改 fontFamily 为 mono 并同步
+      → 服务端 fontFamily=mono，设备 A 的 serverSettings.fontFamily 更新为 mono
+      → 但设备 A 的 settings.fontSize 仍是 20（本地覆盖优先级更高）
+  T3: 设备 A 的用户在设置页面修改 fontFamily 为 serif
+      → 调用 updateServerSetting({ fontFamily: "serif" })
+      → 内部补全：fontSize = settings.fontSize = 20（本地覆盖值！）
+      → 提交 { readerFontSize: 20, readerLineHeight: 1.5, readerFontFamily: "serif" }
+  T4: 服务端 fontSize 被覆盖为 20，fontFamily 被覆盖为 serif
+  T5: saveServerSettings 成功回调清除设备 A 的本地覆盖
+      → 设备 A 的 settings.fontSize = 20（现在来自服务端）
+  
+结果：
+  设备 B 的 fontFamily 修改（mono）被静默覆盖为 serif
+  设备 B 的 fontSize（16）被静默覆盖为 20
+  设备 A 的用户完全不知道自己"顺便"修改了另外两个字段
+  两端用户都无感知，直到刷新页面才发现设置"不对了"
+```
+
+这是**显示优先级**与**写回补全机制**的设计冲突——优先级用于显示是合理的，但用于写回补全时会导致意外覆盖。
 
 ### 3.3 乐观更新与回滚
 
@@ -625,10 +744,12 @@ updateServerSettings({
 
 | 问题 | 风险等级 | 说明 |
 |-----|---------|------|
+| **本地覆盖值意外泄漏到服务端** | 🔴 高 | `saveAsDefault` 使用 `settings`（包含本地覆盖）补全字段，导致仅本设备的本地覆盖值可能被写回服务端，静默覆盖其他设备的设置（3.2.4 节详细场景） |
+| **Web 端无防护触发同步** | 🔴 高 | Web 端修改阅读器设置下拉/滑块时立即同步，且无需有本地覆盖，任意修改都可能"顺便"把本地覆盖值同步到服务端 |
 | **阅读器设置无冲突检测** | 🟡 中高 | 仅阅读器的 3 个字段可能发生跨端冲突，后写入者静默覆盖先写入者，用户无感知 |
 | **阅读器设置更新粒度过粗** | 🟡 中 | 两条写回路径都总是同时更新全部 3 个字段，即使某些字段没有变化也会被强制覆盖，增加了意外覆盖风险 |
 | **clearAllDefaults 冲突风险高** | 🟠 中高 | 清除服务器默认会同时清空 3 个字段，且不清除本地覆盖，容易导致多端不一致和意外覆盖 |
-| **移动端缓存过期问题** | 🟡 中 | 移动端缓存的阅读器设置过期时，调用 saveAsDefault 会用缓存的旧值覆盖其他端的新值（如场景 2 所示） |
+| **移动端缓存过期问题** | 🟡 中 | 移动端缓存的阅读器设置过期时，调用 saveAsDefault 会用缓存的旧值覆盖其他端的新值（如 3.1.2 节场景 2 所示） |
 | **无实时同步** | 🟡 中 | 设置变更后，另一端必须刷新页面才能看到更新。例如 Web 端修改了阅读器字体，移动端必须重新进入阅读器设置页面才能看到 |
 | **设置分散，权限不对称** | 🟡 中 | 三套设置体系（服务端/Web本地/Mobile本地），且 Web 端可修改全部 14 个服务端设置，移动端仅能修改 3 个，概念不统一 |
 | **无修改历史** | 🟠 中高 | 无法追溯设置变更历史，问题排查困难 |
@@ -698,9 +819,44 @@ async updateSettings(input, currentVersion) {
 eventBus.emit(`user:${userId}:settings-updated`, newSettings);
 ```
 
-#### 建议 5：优化更新粒度，只提交真正变更的字段
+#### 建议 5：核心修复——使用 serverSettings 而非 settings 补全字段（最高优先级）
 
-修改 `saveAsDefault` 的实现，支持只更新与服务端值不同的字段，而不是每次都强制覆盖全部 3 个字段：
+**修复风险根源**：`saveAsDefault` 应该使用 `serverSettings`（服务端原值）来补全未传入的字段，而不是使用 `settings`（包含本地覆盖）。这是最核心的修复，可以彻底解决本地覆盖值意外泄漏到服务端的问题。
+
+```typescript
+// 修复前：使用 settings（包含本地覆盖）补全字段 → 风险根源
+const toSave: ReaderSettings = {
+  fontSize: settingsToSave?.fontSize ?? settings.fontSize,      // ← 可能是本地覆盖值！
+  lineHeight: settingsToSave?.lineHeight ?? settings.lineHeight, // ← 可能是本地覆盖值！
+  fontFamily: settingsToSave?.fontFamily ?? settings.fontFamily, // ← 可能是本地覆盖值！
+};
+
+// 修复后：使用 serverSettings（服务端原值）补全字段
+const saveAsDefault = useCallback(
+  (settingsToSave?: ReaderSettingsPartial) => {
+    // 对于未传入的字段，使用 serverSettings 的值，而不是 settings 的值
+    // 这样即使有本地覆盖，也不会被意外写回服务端
+    const toSave: ReaderSettings = {
+      fontSize: settingsToSave?.fontSize ?? serverSettings?.readerFontSize ?? READER_DEFAULTS.fontSize,
+      lineHeight: settingsToSave?.lineHeight ?? serverSettings?.readerLineHeight ?? READER_DEFAULTS.lineHeight,
+      fontFamily: settingsToSave?.fontFamily ?? serverSettings?.readerFontFamily ?? READER_DEFAULTS.fontFamily,
+    };
+    setPendingServerSave(toSave);
+    saveServerSettings({
+      readerFontSize: toSave.fontSize,
+      readerLineHeight: toSave.lineHeight,
+      readerFontFamily: toSave.fontFamily,
+    });
+  },
+  [serverSettings, saveServerSettings],  // ← 依赖 serverSettings，而非 settings
+);
+```
+
+**特殊场景处理**：如果用户明确点击了 "Save as Default (All Devices)"，说明用户意图是将当前显示的设置（包含本地覆盖）同步到所有设备。这种情况下应该使用 `settings`，但需要在 UI 上明确提示用户"此操作会将当前显示的设置（包括您的本地偏好）同步到所有设备"。
+
+#### 建议 6：优化更新粒度，只提交真正变更的字段
+
+在建议 5 的基础上，进一步优化为只提交与服务端值不同的字段，而不是每次都强制覆盖全部 3 个字段：
 
 ```typescript
 // 改进前：总是同时更新 3 个字段（即使某些字段没有变化）
@@ -711,9 +867,9 @@ const saveAsDefault = useCallback(
   (settingsToSave?: ReaderSettingsPartial) => {
     const toSave: Partial<ReaderSettings> = {};
     const effective = {
-      fontSize: settingsToSave?.fontSize ?? settings.fontSize,
-      lineHeight: settingsToSave?.lineHeight ?? settings.lineHeight,
-      fontFamily: settingsToSave?.fontFamily ?? settings.fontFamily,
+      fontSize: settingsToSave?.fontSize ?? serverSettings?.readerFontSize ?? READER_DEFAULTS.fontSize,
+      lineHeight: settingsToSave?.lineHeight ?? serverSettings?.readerLineHeight ?? READER_DEFAULTS.lineHeight,
+      fontFamily: settingsToSave?.fontFamily ?? serverSettings?.readerFontFamily ?? READER_DEFAULTS.fontFamily,
     };
     // 只提交与服务端不同的字段
     if (serverSettings?.readerFontSize !== effective.fontSize) {
@@ -726,16 +882,17 @@ const saveAsDefault = useCallback(
       toSave.readerFontFamily = effective.fontFamily;
     }
     if (Object.keys(toSave).length > 0) {
+      setPendingServerSave(effective);
       saveServerSettings(toSave);
     }
   },
-  [settings, serverSettings, saveServerSettings],
+  [serverSettings, saveServerSettings],
 );
 ```
 
 这可以显著降低意外覆盖其他端修改的风险。
 
-#### 建议 6：提交前刷新服务端数据，避免缓存过期问题
+#### 建议 7：提交前刷新服务端数据，避免缓存过期问题
 
 在调用 `saveAsDefault` 和 `clearAllDefaults` 前，先刷新一次服务端数据，确保使用最新值进行比较和补全，避免用缓存的旧值覆盖其他端的新值：
 
@@ -746,22 +903,22 @@ const saveAsDefault = useCallback(
     await queryClient.refetchQueries(api.users.settings.pathFilter());
     // 再进行后续逻辑...
   },
-  [settings, saveServerSettings, queryClient, api],
+  [serverSettings, saveServerSettings, queryClient, api],
 );
 ```
 
-#### 建议 7：修复 clearAllDefaults 的行为一致性
+#### 建议 8：修复 clearAllDefaults 的行为一致性
 
 `clearAllDefaults` 应该与 `saveAsDefault` 保持一致，成功后也清除本地覆盖，避免出现"服务器已清空但本地仍显示旧值"的多端不一致问题。或者在 UI 上明确提示用户"此操作不会影响本设备的本地设置"。
 
-#### 建议 8：提高移动端同步透明度
+#### 建议 9：提高移动端同步透明度
 
 在移动端设置界面明确标注哪些设置仅本地生效、哪些会跨端同步。例如：
 - 在阅读器设置页面更明确地提示 "Save as Default" 会同步到所有设备
 - 明确提示 "Clear Server Defaults" 会清空所有设备的默认设置，但保留本地设置
 - 在其他仅本地的设置旁边添加 "This device only" 提示
 
-#### 建议 9：统一设置模型
+#### 建议 10：统一设置模型
 
 考虑将更多移动端本地设置（如主题、默认书签视图）纳入同步范围，减少"本地 vs 服务端"的概念割裂。或者在移动端提供与 Web 端一致的完整设置界面，允许用户修改所有 14 个服务端设置。
 
@@ -787,12 +944,14 @@ const saveAsDefault = useCallback(
 | 功能 | 文件位置 | 行号 |
 |-----|---------|------|
 | 阅读器设置共享 hook（两条路径实现） | `packages/shared-react/hooks/reader-settings.tsx` | 42-248 |
-| → 路径 1：saveAsDefault 实现**（内部补全字段，总是提交 3 个）** | `packages/shared-react/hooks/reader-settings.tsx` | 175-191 |
+| → **关键机制：settings 优先级计算（session → local → pending → server → default）** | `packages/shared-react/hooks/reader-settings.tsx` | 110-132 |
+| → 路径 1：saveAsDefault 实现**（使用 settings 补全字段，风险根源）** | `packages/shared-react/hooks/reader-settings.tsx` | 175-191 |
 | → 路径 2：clearAllDefaults 实现（总是提交 3 个 null） | `packages/shared-react/hooks/reader-settings.tsx` | 207-213 |
 | → 附加：clearDefault 实现（唯一真正单字段更新，但无 UI 调用） | `packages/shared-react/hooks/reader-settings.tsx` | 194-204 |
 | → saveServerSettings mutation（路径 1 使用，成功后清除本地覆盖） | `packages/shared-react/hooks/reader-settings.tsx` | 90-107 |
 | → updateServerSettings mutation（路径 2 使用，不清除本地覆盖） | `packages/shared-react/hooks/reader-settings.tsx` | 81-87 |
-| → 关键机制：settings 优先级计算（session → local → pending → server → default） | `packages/shared-react/hooks/reader-settings.tsx` | 110-132 |
+| → localOverrides 状态管理 | `packages/shared-react/hooks/reader-settings.tsx` | 71-77 |
+| → hasLocalOverrides 计算 | `packages/shared-react/hooks/reader-settings.tsx` | 78-79 |
 
 ### 移动端代码
 
@@ -803,6 +962,8 @@ const saveAsDefault = useCallback(
 | Mobile 阅读器设置页面（两条同步入口） | `apps/mobile/app/dashboard/settings/reader-settings.tsx` | 1-271 |
 | → 路径 1 调用：handleSaveAsDefault | `apps/mobile/app/dashboard/settings/reader-settings.tsx` | 108-111 |
 | → 路径 2 调用：handleClearServerDefaults | `apps/mobile/app/dashboard/settings/reader-settings.tsx` | 117-119 |
+| → **防护机制**：saveAsDefault 按钮禁用条件 `disabled={!hasLocalOverrides}` | `apps/mobile/app/dashboard/settings/reader-settings.tsx` | 238 |
+| → 本地覆盖指示器（显示 "(local)" 标签） | `apps/mobile/app/dashboard/settings/reader-settings.tsx` | 133-135, 168-170, 196-198 |
 | Mobile 设置主页面 | `apps/mobile/app/dashboard/settings/index.tsx` | 1-404 |
 | Mobile 读取 archiveDisplayBehaviour | `apps/mobile/lib/hooks.ts` | 47-59 |
 
