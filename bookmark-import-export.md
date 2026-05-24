@@ -1,4 +1,4 @@
-# 书签导入导出转换规则分析（二次修正版）
+# 书签导入导出转换规则分析（三次修正版）
 
 ## 概述
 
@@ -36,8 +36,8 @@ Karakeep 的书签导入导出系统位于 `packages/shared/import-export/`，�
     ├─ 批量暂存（50条/批）⚠️ 暂存前会过滤无效书签
     └─ finalize → 会话状态从 staging → pending
         ↓
-[importWorker.ts] ImportWorker（轮询，5秒/次）
-    ├─ resetStaleProcessingItems（每60次轮询≈5分钟）
+[importWorker.ts] ImportWorker（轮询，空闲时5秒/次，繁忙时无间隔）
+    ├─ resetStaleProcessingItems（每60次轮询，频率取决于系统负载）
     ├─ checkAndCompleteProcessingItems（每次轮询先执行）
     ├─ processBatch
     │   ├─ getAvailableCapacity（背压控制，隐性判断 stale）
@@ -214,11 +214,64 @@ or(isNull(taggingStatus), eq(taggingStatus, "success"), eq(taggingStatus, "failu
 
 ## 失败容忍与重试机制（修正版）
 
-### 1. 导入前过滤（第一道防线）
+### 1. 空 URL / 空内容的多入口判定路径
 
-**位置**: `importSessions.service.ts:95-100`
+空 URL 和空内容的处理**取决于数据进入系统的入口**，共有 4 个可能的入口，产生 3 种不同结果：
 
-暂存前就过滤无效书签，根本不进入处理队列：
+```
+                                 数据来源
+                                     │
+            ┌───────────┬────────────┼────────────┬───────────┐
+            │           │            │            │           │
+            ▼           ▼            ▼            ▼           ▼
+      正常导入      直接调用      直接调用    Parser 内部   Parser 内部
+   importBookmarks stageBookmarks insertStaging   过滤       产生
+     FromFile      service          repo          (RW)    content:undefined
+          │            │              │            │           │
+          │            │              │            │           │
+          ├────────────┘              │            ▼           │
+          │                           │         丢弃，        │
+          ▼                           │       不进入流程     │
+  暂存前过滤                          │                        │
+          │                           │                        │
+          ├───────────────────────────┘                        │
+          │                                                    │
+          ▼                                                    │
+    过滤丢弃                                               传递到
+  无失败记录                                             暂存前过滤
+                                                               │
+                                                               ▼
+                                                          过滤丢弃
+                                                        无失败记录
+                                              （除非暂存前过滤被绕过）
+                                                               │
+                                                               └──────┐
+                                                                      │
+                                                                      ▼
+                                                          Worker 二次校验
+                                                                      │
+                                                                      ▼
+                                                          抛出错误 → catch
+                                                                      │
+                                                                      ▼
+                                                          status: "failed"
+                                                          result: "rejected"
+                                                          resultReason: 白名单安全消息
+                                                          completedAt: now
+                                                          （产生可见失败记录）
+```
+
+---
+
+#### 入口 A：正常导入流程（`importer.ts` → `stageBookmarks`）
+
+**路径**：
+1. `parseImportFile()` 解析文件
+   - Readwise Reader 内部会过滤空 URL（parsers.ts:542-544）
+   - Instapaper 中 URL 和 Selection 都为空时产生 `content: undefined`
+   - Pocket 无 URL 的行会产生 `content.url: ""`
+2. `importBookmarksFromFile()` 调用 `stageBookmarks`
+3. `stageBookmarks` 暂存前过滤（importSessions.service.ts:95-100）：
 ```typescript
 const validBookmarks = bookmarks.filter((bookmark) => {
   if (bookmark.type === "link" && !bookmark.url) return false;
@@ -227,11 +280,95 @@ const validBookmarks = bookmarks.filter((bookmark) => {
 });
 ```
 
-### 2. Worker 阶段二次校验（第二道防线）
+**结果**：**静默丢弃**，不产生任何数据库记录，`stats.totalBookmarks` 不包含这些项。
+
+---
+
+#### 入口 B：直接调用 `stageBookmarks` API（绕过 parser）
+
+**路径**：
+1. 调用者直接构造 `StagedBookmark` 数据
+2. 调用 `importSessions.stageBookmarks`
+3. 暂存前过滤仍会执行（同上）
+
+**结果**：**静默丢弃**，与入口 A 相同。
+
+---
+
+#### 入口 C：直接调用 `insertStagingBookmarks` repo 层（绕过 service 层过滤）
+
+**路径**：
+1. 调用者直接构造 `importStagingBookmarks` 数据库记录（含空 URL）
+2. 调用 `importSessionsRepo.insertStagingBookmarks`
+3. 不经过 service 层过滤，直接入库
+4. Worker 轮询到该记录，二次校验：
+```typescript
+if (staged.type === "link") {
+  if (!staged.url) {
+    throw new Error("URL is required for link bookmarks");
+  }
+}
+```
+5. 错误被 `processOneBookmark` 的 try-catch 捕获（importWorker.ts:469-485）
+6. 标记为失败状态
+
+**结果**：**产生可见失败记录**：
+- `status: "failed"`
+- `result: "rejected"`
+- `resultReason: "URL is required for link bookmarks"`（通过 `getSafeErrorMessage` 白名单）
+- `completedAt: now`
+
+---
+
+#### 入口 D：Parser 内部产生 `content: undefined`（如 Instapaper）
+
+**路径**：
+1. Instapaper 中某条记录的 `URL` 和 `Selection` 都为空
+2. Parser 逻辑（parsers.ts:452-460）：
+```typescript
+let content: ParsedBookmark["content"];
+if (record.URL && record.URL.trim().length > 0) {
+  content = { type: BookmarkTypes.LINK, url: record.URL.trim() };
+} else if (record.Selection && record.Selection.trim().length > 0) {
+  content = { type: BookmarkTypes.TEXT, text: record.Selection.trim() };
+}
+// 两者都为空 → content = undefined
+```
+3. `type` 默认是 `"link"`（由 importer.ts 推断），但 `url` 是 `undefined`
+4. 进入暂存前过滤 → `bookmark.type === "link" && !bookmark.url` → `return false`
+
+**结果**：**静默丢弃**，与入口 A 相同。
+
+---
+
+#### 入口 E：Readwise Reader parser 内部过滤空 URL
+
+**路径**（parsers.ts:542-544）：
+```typescript
+const emptyFilteredArticles = feedFilteredArticles.filter(
+  (record) => record.URL && record.URL.trim().length > 0,
+);
+```
+
+**结果**：**在 parser 层就被过滤**，不会传递到后续流程，`counts.total` 也不包含这些项。
+
+---
+
+### 关键区别总结
+
+| 入口 | 空 URL 处理方式 | 失败记录 | 用户可见 |
+|------|----------------|---------|---------|
+| 正常导入流程 | 暂存前过滤，静默丢弃 | ❌ 无 | ❌ |
+| 直接调用 `stageBookmarks` | 暂存前过滤，静默丢弃 | ❌ 无 | ❌ |
+| 直接调用 repo 层 | Worker 二次校验，标记失败 | ✅ 有 | ✅ |
+| Instapaper `content: undefined` | 暂存前过滤，静默丢弃 | ❌ 无 | ❌ |
+| Readwise Reader 内部过滤 | Parser 内过滤，不进入后续 | ❌ 无 | ❌ |
+
+### 2. Worker 阶段二次校验（深层防御）
 
 **位置**: `importWorker.ts:392-404`
 
-即使绕过了暂存前过滤（如直接调用 repo 层），worker 中还会做二次校验：
+这是**深层防御**机制，即使上游所有过滤都被绕过，Worker 中仍会校验：
 ```typescript
 if (staged.type === "link") {
   if (!staged.url) {
@@ -247,11 +384,10 @@ if (staged.type === "link") {
 **失败处理路径**：
 - 抛出的错误被 `processOneBookmark` 的 try-catch 捕获
 - 标记为 `status: "failed"`, `result: "rejected"`
-- `resultReason` 是白名单内的安全信息：`"URL is required for link bookmarks"`
+- `resultReason` 是白名单内的安全信息
 
-> ⚠️ **关键区别**：
-> - 暂存前过滤：静默丢弃，不产生任何失败记录
-> - Worker 中校验：产生失败记录，用户可见
+> **白名单机制**（importWorker.ts:89-93）：
+> 只有 `"URL is required for link bookmarks"` 和 `"Content is required for text bookmarks"` 会原样返回给用户，其他错误会被替换为通用错误消息，避免泄露内部实现细节。
 
 ### 3. 处理过程中的错误隔离
 
@@ -278,7 +414,9 @@ status: "pending"
 processingStartedAt: null  // 清空
 ```
 
-**触发频率**: 每 60 次轮询 = 60 × 5秒 = **5分钟**（importWorker.ts:120）
+**触发频率**: 每 60 次轮询，但间隔不固定（importWorker.ts:120）：
+- 空闲时（`processed === 0`）：每次轮询间隔 5 秒 → 60 次 = **5分钟**
+- 繁忙时（`processed > 0`）：不 sleep，轮询连续执行 → 60 次可能只需 **几秒到几十秒**
 
 #### 4.2 隐性重试：`getAvailableCapacity()` 背压控制
 
@@ -304,8 +442,10 @@ return this.maxInFlight - inFlight;
 - 系统认为有可用容量，会继续取新的 pending 项处理
 - 如果某挂起项（有 `processingStartedAt` 但无 `resultBookmarkId`）超过 1 小时：
   - 先被 `getAvailableCapacity` 忽略，不占容量
-  - 然后在某次 `resetStaleProcessingItems` 中被重置为 `pending`
+  - 然后在某次 `resetStaleProcessingItems` 中被重置为 `pending`（取决于系统负载，繁忙时更快触发）
   - 之后可能被重新声明处理
+
+> ⚠️ **代码注释误导**：代码注释写的是 "every 60 iterations ~= 1 min"，但 `pollIntervalMs = 5000`（5秒），实际空闲时是 5 分钟。注释本身与实际参数不符。
 
 > **重要限制**：
 > - 已成功创建书签（有 `resultBookmarkId`）的项目**永远不会被重试**
@@ -394,34 +534,85 @@ if (!session || session.status === "paused") {
 
 ---
 
-## Parser 层 Fail-Fast 机制
+## Parser 层 Fail-Fast 与宽松解析的边界
 
-### 核心原则
+### 三层容错模型
 
-**所有 Parser 都是 100% Fail-Fast 的**：格式验证不通过直接抛出异常，不会有部分解析、不会跳过坏记录、不会容错降级。
+Parser 层的容错策略分为**三个层级**，边界清晰：
 
-### 各 Parser 的 Fail-Fast 点
+| 层级 | 验证对象 | 失败策略 | 影响范围 |
+|------|---------|---------|---------|
+| 1. Schema 级 | 文件整体结构 | **Fail-Fast** | 整个导入失败 |
+| 2. 记录级 | 单条记录格式 | **宽松解析** | 跳过坏行/静默容错 |
+| 3. 字段级 | 单个字段转换 | **宽松容错** | 字段降级（如 `tags = []`） |
+
+---
+
+### 各 Parser 的策略矩阵
+
+| Parser | Schema 级 | 记录级 | 字段级 |
+|--------|----------|--------|--------|
+| Netscape HTML | ✅ Fail-Fast（文件头检查） | ✅ 宽松（逐行解析） | ✅ 宽松（空文件夹名→"Unnamed"） |
+| Matter CSV | ✅ Fail-Fast（Zod schema） | ❌ 无（schema 级已保证） | ❌ 无 |
+| Karakeep JSON | ✅ Fail-Fast（Zod schema） | ❌ 无（schema 级已保证） | ❌ 无 |
+| Omnivore JSON | ✅ Fail-Fast（Zod schema） | ❌ 无（schema 级已保证） | ❌ 无 |
+| Linkwarden JSON | ✅ Fail-Fast（Zod schema） | ❌ 无（schema 级已保证） | ❌ 无 |
+| Tab Session Manager | ✅ Fail-Fast（Zod schema） | ❌ 无（schema 级已保证） | ❌ 无 |
+| mymind CSV | ✅ Fail-Fast（Zod schema） | ❌ 无（schema 级已保证） | ✅ 宽松（URL/Content 二选一） |
+| Instapaper CSV | ✅ Fail-Fast（Zod schema） | ❌ 无（schema 级已保证） | ✅ 宽松（URL/Selection 二选一，tags 容错） |
+| Readwise Reader CSV | ✅ Fail-Fast（Zod schema） | ✅ 宽松（过滤 feed 和空 URL） | ✅ 宽松（tags 容错） |
+| Pocket CSV | ❌ 无 schema | ✅ 宽松（逐行映射，无 URL 也保留） | ✅ 宽松 |
+| OneTab TXT | ❌ 无 schema | ✅ 宽松（逐行跳过非 URL） | ✅ 宽松 |
+
+---
+
+### Fail-Fast 边界（Schema 级）
+
+**触发条件**：文件整体结构不符合预期，无法可靠解析。
+
+**9 种格式的 Fail-Fast 点**：
 
 | Parser | 验证方式 | 失败抛出 | 位置 |
 |--------|---------|---------|------|
 | Netscape HTML | 文件头字符串匹配 | `throw Error("The uploaded html file does not seem to be a bookmark file")` | parsers.ts:54-55 |
-| Matter CSV | Zod `parse()` | `throw new Error("The uploaded CSV file contains an invalid Matter bookmark file: ...")` | parsers.ts:166-167 |
-| Karakeep JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid bookmark file: ...")` | parsers.ts:186-187 |
-| Omnivore JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid omnivore bookmark file: ...")` | parsers.ts:253-254 |
-| Linkwarden JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid Linkwarden bookmark file: ...")` | parsers.ts:291-292 |
-| Tab Session Manager | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid Tab Session Manager bookmark file: ...")` | parsers.ts:344-345 |
-| mymind CSV | Zod `parse()` | `throw new Error("The uploaded CSV file contains an invalid mymind bookmark file: ...")` | parsers.ts:386-387 |
-| Instapaper CSV | Zod `parse()` | `throw new Error("CSV file contains an invalid instapaper bookmark file: ...")` | parsers.ts:446-447 |
-| Readwise Reader CSV | Zod `parse()` | `throw new Error("CSV file contains an invalid Readwise Reader bookmark file: ...")` | parsers.ts:533-534 |
-| OneTab TXT | 无格式验证 | - | （逐行解析，非 URL 行静默跳过） |
-| Pocket CSV | 无格式验证 | - | （逐行映射，不做 schema 验证） |
+| Matter CSV | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded CSV file contains an invalid Matter bookmark file: ...")` | parsers.ts:164-167 |
+| Karakeep JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid bookmark file: ...")` | parsers.ts:184-187 |
+| Omnivore JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid omnivore bookmark file: ...")` | parsers.ts:251-254 |
+| Linkwarden JSON | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid Linkwarden bookmark file: ...")` | parsers.ts:289-292 |
+| Tab Session Manager | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded JSON file contains an invalid Tab Session Manager bookmark file: ...")` | parsers.ts:342-345 |
+| mymind CSV | Zod `safeParse()` + 手动 throw | `throw new Error("The uploaded CSV file contains an invalid mymind bookmark file: ...")` | parsers.ts:384-387 |
+| Instapaper CSV | Zod `safeParse()` + 手动 throw | `throw new Error("CSV file contains an invalid instapaper bookmark file: ...")` | parsers.ts:443-446 |
+| Readwise Reader CSV | Zod `safeParse()` + 手动 throw | `throw new Error("CSV file contains an invalid Readwise Reader bookmark file: ...")` | parsers.ts:530-534 |
 
-> **例外**：Pocket CSV 和 OneTab TXT 没有 schema 验证，属于**宽松解析**。Pocket 会解析所有能解析的行，OneTab 会跳过非 URL 行。
+> **注意**：Zod `parse()` 本身就会 throw，使用 `safeParse()` + 手动 throw 是为了提供更友好的错误信息。
+
+**宽松解析边界（2 种格式）**：
+- **Pocket CSV**：无 schema 验证，逐行 `map`，行结构不匹配时由 `csv-parse` 处理或产生无效记录
+- **OneTab TXT**：无 schema，逐行解析，非 `http://` 或 `https://` 开头的行静默 `continue`
+
+---
+
+### 宽松容错边界（字段级）
+
+即使 schema 验证通过，部分字段转换失败时也会**静默降级**，不影响整条记录：
+
+| Parser | 字段 | 容错策略 | 位置 |
+|--------|------|---------|------|
+| Readwise Reader | `tags` | `JSON.parse()` 失败 → `tags = []` | parsers.ts:554-564 |
+| Instapaper | `tags` | `JSON.parse()` 失败 → `tags = []` | parsers.ts:464-471 |
+| Instapaper | `content` | URL 和 Selection 都为空 → `content = undefined` | parsers.ts:452-460 |
+| mymind | `content` | URL 和 content 二选一，URL 优先 | parsers.ts:393-410 |
+| Readwise Reader | `content` | 空 URL 记录在 parser 内直接过滤排除 | parsers.ts:542-544 |
+| Readwise Reader | `Location` | 值为 `"feed"` 时过滤排除 | parsers.ts:539-541 |
+
+> **关键点**：字段级容错**只降级，不抛出**。`content: undefined` 的记录会继续传递到后续流程，由暂存前过滤处理。
+
+---
 
 ### 异常传播路径
 
 ```
-parseImportFile() 抛出异常
+parseImportFile() 抛出异常（仅 Schema 级失败）
     ↓
 importBookmarksFromFile() 未捕获，继续向上
     ↓
@@ -430,11 +621,17 @@ useBookmarkImport.ts 中 onError 捕获
 toast 显示错误信息给用户
 ```
 
-**影响**：
+**Schema 级失败的影响**：
 - 不会创建 Import Session
 - 不会创建任何列表
 - 不会暂存任何书签
 - 整个导入完全失败，用户需要修正文件后重新上传
+
+**字段级/记录级宽松处理的影响**：
+- 无效字段降级（如 `tags = []`）
+- 部分记录被过滤（如 Readwise Reader 空 URL）
+- 部分记录产生 `content: undefined`（后续由暂存前过滤处理）
+- 导入继续进行，不会整体失败
 
 ---
 
@@ -558,7 +755,8 @@ const stats = {
 **特殊处理**:
 - 空文件夹名 → `"Unnamed"` (parsers.ts:72)
 - 无 URL 的书签也会被保留（`content` 为 `undefined`），但会在暂存前被过滤
-- Fail-Fast：文件头不匹配直接 `throw Error`
+- Schema 级 Fail-Fast：文件头不匹配直接 `throw Error`
+- 字段级宽松：逐行解析，单条记录问题不影响整体
 
 ### 2. Pocket (`pocket`)
 
@@ -573,8 +771,9 @@ const stats = {
 | `status` | `archived` | `status === "archive"` → `true` |
 
 **特殊处理**:
-- 无 schema 验证，宽松解析
-- 无 URL 的行也会被解析，但会在暂存前被过滤
+- 无 Schema 级验证，完全宽松解析
+- 无 URL 的行也会被解析（`content.url: ""`），但会在暂存前被过滤
+- 字段级宽松：逐行映射，不做 schema 校验
 
 ### 3. Readwise Reader (`readwise-reader`)
 
@@ -590,9 +789,11 @@ const stats = {
 | `Location` | 过滤 | `"feed"` → 排除 |
 
 **特殊处理**:
-- 空 URL 项目会被过滤（importWorker.ts 中还会再检查一次）
-- 标签 JSON 解析失败时 `tags = []`，不抛出错误（parsers.ts:563-564）⚠️ 这是 parser 层唯一的非 fail-fast 点
-- Fail-Fast：Zod schema 验证不通过直接 throw
+- 空 URL 项目在 **parser 内就被过滤**（parsers.ts:542-544），不进入后续流程
+- 标签 JSON 解析失败时 `tags = []`（字段级宽松，不抛出错误）
+- feed 项目在 parser 内过滤（parsers.ts:539-541）
+- Schema 级 Fail-Fast：Zod schema 验证不通过直接 throw
+- 记录级宽松：过滤无效记录不影响整体
 
 ### 4. Instapaper (`instapaper`)
 
@@ -608,7 +809,9 @@ const stats = {
 | `Folder` | `archived`/`paths` | `"Archive"` → `archived: true`; `"Unread"` → 无路径; 其他 → `paths: [[Folder]]` |
 
 **特殊处理**:
-- Fail-Fast：Zod schema 验证不通过直接 throw
+- URL 和 Selection 都为空时产生 `content: undefined`（字段级宽松），后续由暂存前过滤处理
+- 标签 JSON 解析失败时 `tags = []`（字段级宽松，不抛出错误）
+- Schema 级 Fail-Fast：Zod schema 验证不通过直接 throw
 
 ### 5. Karakeep 自有格式 (`karakeep`)
 
@@ -630,7 +833,8 @@ const stats = {
 **特殊处理**:
 - 智能列表（`type: "smart"`）不与书签关联，仅作为列表元数据导入
 - `listExternalIds` 过滤掉智能列表 ID
-- Fail-Fast：Zod schema 验证不通过直接 throw
+- Schema 级 Fail-Fast：Zod schema 验证不通过直接 throw
+- 字段级宽松：无效 content 会在后续流程中被过滤
 
 ---
 
@@ -797,10 +1001,12 @@ const listIds =
 
 ```typescript
 while (this.running) {
-  // 1. 每 60 次轮询（≈5分钟）重置挂起项
+  // 1. 每 60 次轮询重置挂起项（间隔不固定，取决于系统负载）
+  // ⚠️ 代码注释写的是 "~= 1 min"，但 pollIntervalMs = 5000，实际空闲时是 5 分钟
   if (iterationCount % 60 === 0) {
     await this.resetStaleProcessingItems();
   }
+  iterationCount++;
   
   // 2. 每次轮询先检查已完成下游处理的项目
   await this.checkAndCompleteProcessingItems();
@@ -809,10 +1015,14 @@ while (this.running) {
   const processed = await this.processBatch();
   
   if (processed === 0) {
-    // 4. 无任务时检查空闲会话并完成
+    // 4. 无任务时检查空闲会话并完成，然后 sleep 5 秒
     await this.checkAndCompleteIdleSessions();
     await this.updateGauges();
     await sleep(this.pollIntervalMs); // 5秒
+  } else {
+    // 5. 有任务处理完不 sleep，立即开始下一轮
+    // 繁忙时 iterationCount 快速递增，60次循环可能只需几秒
+    await this.updateGauges();
   }
 }
 ```
@@ -971,13 +1181,18 @@ toNetscapeFormat(bookmarks): string {
 | 单条处理 | `importWorker.ts` | `processOneBookmark` | 351-487 |
 | 二次校验空 URL | `importWorker.ts` | `processOneBookmark` | 392-404 |
 | 批次处理 | `importWorker.ts` | `processBatch` | 149-233 |
+| 轮询循环 | `importWorker.ts` | `start()` | 111-142 |
+| 错误信息白名单 | `importWorker.ts` | `getSafeErrorMessage` | 89-93 |
+| RW parser 过滤空 URL | `parsers.ts` | `parseReadwiseReaderBookmarkFile` | 542-544 |
+| Instapaper 标签容错 | `parsers.ts` | `parseInstapaperBookmarkFile` | 464-471 |
+| RW 标签容错 | `parsers.ts` | `parseReadwiseReaderBookmarkFile` | 554-564 |
 | 数据库 Schema | `packages/db/schema.ts` | `importSessions`, `importStagingBookmarks` | 851-950 |
 | 导入类型定义 | `packages/shared/types/importSessions.ts` | - | 1-78 |
 | Session 状态枚举 | `importSessions.ts` | `zImportSessionStatusSchema` | 3-10 |
 
 ---
 
-## 常见误解澄清（二次修正版）
+## 常见误解澄清（三次修正版）
 
 | 误解 | 事实 |
 |------|------|
@@ -987,10 +1202,15 @@ toNetscapeFormat(bookmarks): string {
 | `listExternalIds` 和 `paths` 是二选一 | `listExternalIds` 优先级高于 `paths`，但 `attachBookmarkToLists` 还会额外加上 `session.rootListId` |
 | 去重只在导入时做一次 | 两次去重：解析阶段同一文件内去重 + `createBookmark` 跨导入去重 |
 | `checkAndCompleteProcessingItems` 在批次后调用 | **每次轮询最先调用**，在 `processBatch` 之前 |
-| 挂起项每小时检查一次 | 每 **5 分钟** 检查一次（60次轮询 × 5秒） |
-| 空 URL 在暂存前过滤了就不会再处理 | Worker 中还有二次校验，若绕过暂存过滤会产生失败记录 |
+| 挂起项每 5 分钟检查一次 | **不固定**，取决于系统负载：空闲时 60 次 × 5秒 = 5分钟；繁忙时不 sleep，60 次循环可能只需几秒 |
+| 代码注释 "every 60 iterations ~= 1 min" 是正确的 | 注释错误，`pollIntervalMs = 5000`（5秒），实际空闲时是 5 分钟，不是 1 分钟 |
+| 空 URL 在暂存前过滤了就不会再处理 | Worker 中还有二次校验，若绕过暂存过滤（直接调用 repo 层）会产生可见失败记录 |
 | Session 可以达到 `failed` 状态 | **当前代码中不可达**，schema 定义了但没有代码路径设置它，所有 session 最终都是 `completed` |
-| Parser 会跳过坏记录继续解析 | 绝大多数 Parser 是 fail-fast 的，格式错误直接抛出，整个导入失败 |
+| Parser 会跳过坏记录继续解析 | Schema 级是 fail-fast 的，格式错误直接抛出；但字段级是宽松的，单字段转换失败只降级不抛出 |
 | `counts.successes` 是成功导入的数量 | 异步模式下**恒为 0**，是为同步模式预留的字段 |
 | `counts.total` 是实际暂存的数量 | 是**解析到**的数量（过滤前），实际暂存数需通过 `getWithStats` 查询 |
-| 空 URL 会静默丢弃 | 分两种情况：暂存前过滤静默丢弃；Worker 中校验会产生可见的失败记录 |
+| 空 URL 会静默丢弃 | 取决于入口：暂存前过滤静默丢弃；直接 repo 层绕过则产生可见失败记录 |
+| 所有 Parser 都是 100% fail-fast | 三层模型：Schema 级 fail-fast，记录级宽松（过滤/跳过），字段级宽松（降级） |
+| Readwise Reader 空 URL 会进入暂存 | 在 **parser 内就被过滤**（parsers.ts:542-544），不会传递到后续流程 |
+| Instapaper URL 和 Selection 都为空会导入失败 | 会产生 `content: undefined`，但会被暂存前过滤静默丢弃，不会整体失败 |
+| 标签解析失败会导致整条记录失败 | Instapaper 和 Readwise Reader 的标签 JSON 解析失败只会导致 `tags = []`，不影响整条记录 |
