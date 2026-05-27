@@ -14,12 +14,33 @@ Karakeep 使用 API Key（非 JWT/OAuth）作为外部脚本和客户端的身�
 
 | 通道 | 方法 | 认证方式 | 使用场景 |
 |------|------|---------|---------|
-| `create` | `sessionProcedure` + `mutation` | Web Session | Web 界面创建 |
-| `exchange` | `publicProcedure` + `mutation` | email + password | 浏览器扩展"自制 OAuth" |
+| `create` | `sessionProcedure` + `mutation` | Web Session | Web 界面创建（需登录） |
+| `exchange` | `publicProcedure` + `mutation` | email + password | 浏览器扩展/移动端"自制 OAuth" |
 
 **exchange 通道的限速保护：** 15 分钟内最多 10 次请求（`createRateLimitMiddleware`）。
 
-### 1.2 Key 生成算法
+### 1.2 exchange 的实际使用边界
+
+`exchange` 是为**无法使用 Web Session** 的客户端设计的"用户名密码换 API Key"机制。各客户端的使用情况：
+
+| 客户端 | 是否使用 exchange | 替代方式 |
+|--------|------------------|---------|
+| **Web 端** | ❌ 不使用 | Web 界面调用 `apiKeys.create`（`sessionProcedure`，需登录） |
+| **浏览器扩展** | ✅ 使用（email+password） | 也支持直接粘贴 API Key（`apiKeys.validate`） |
+| **移动端** | ✅ 使用（email+password） | 也支持直接粘贴 API Key（`apiKeys.validate`） |
+| **CLI** | ❌ 不使用 | 用户手动从 Web 界面复制 key 到配置文件 |
+
+代码注释明确说明：`// Exchange the username and password with an API key. Homemade oAuth. This is used by the extension.`
+
+**移动端使用细节**（`apps/mobile/app/signin.tsx`）：
+- 提供两种登录方式：Password（调用 exchange）和 API Key（直接粘贴调用 validate）
+- exchange 调用时 `keyName` 格式：`Mobile App: (${randStr})`
+
+**浏览器扩展使用细节**（`apps/browser-extension/src/SignInPage.tsx`）：
+- 同样提供两种登录方式
+- exchange 调用时 `keyName` 格式：`Browser extension: (${randStr})`
+
+### 1.3 Key 生成算法
 
 核心逻辑在 `packages/trpc/auth.ts` 的 `generateApiKeySecret()`：
 
@@ -35,7 +56,7 @@ plain = "ak2" + "_" + keyId + "_" + secret
 
 数据库存储：`keyId`（唯一索引）+ `keyHash`（SHA256），**不存储明文 secret**。
 
-### 1.3 数据库 Schema
+### 1.4 数据库 Schema
 
 定义在 `packages/db/schema.ts` 的 `apiKeys` 表（`apiKey` 表名）：
 
@@ -50,7 +71,7 @@ plain = "ak2" + "_" + keyId + "_" + secret
 | `scopes` | text (JSON) | 授权范围数组 |
 | `userId` | text FK | 所属用户（`onDelete: cascade`） |
 
-### 1.4 V1/V2 兼容性
+### 1.5 V1/V2 兼容性
 
 `authenticateApiKey` 中存在两套验证逻辑：
 
@@ -126,63 +147,71 @@ admin:{resource}:{access}
 
 **关键设计：** `readwrite` 权限隐含 `read` 权限，即"包含式"授权。
 
-### 2.3 tRPC 层的 Scope 检查
+### 2.3 tRPC 与 REST 两条入口的 Scope 校验差异
 
-在 `packages/trpc/index.ts` 中实现了两层权限收敛：
+#### 2.3.1 tRPC 路径：强制自动 Scope 检查
 
-**(a) `createScopedAuthedProcedure(resource)`** — 普通资源范围：
+tRPC 所有业务 router 都使用 `createScopedAuthedProcedure(resource)` 包装，**scope 检查是强制自动注入的**：
 
+| 组件 | 机制 | 代码位置 |
+|------|------|---------|
+| `createScopedAuthedProcedure(resource)` | 根据 operation type 自动映射 access：query→read，mutation→readwrite | `trpc/index.ts:177` |
+| `createAdminScopedProcedure(resource)` | scope 检查 + isAdmin 角色检查 | `trpc/index.ts:199` |
+| `sessionProcedure` | 完全拒绝 API Key（`rejectApiKeyAuth`），用于 API Key 管理端点 | `trpc/index.ts:197` |
+
+**tRPC scope 检查流程：**
 ```
-authedProcedure → 检查 auth.type === "apiKey"
-  → 若不是 apiKey（即 session），直接放行
-  → 若是 apiKey，根据 operation type 自动映射 access：
-      query → "read"
-      mutation → "readwrite"
-  → 构造 scope = "{resource}:{access}"
-  → 调用 hasRequiredApiKeyScopes 检查
-```
-
-**(b) `createAdminScopedProcedure(resource)`** — 管理员范围：
-
-```
-authedProcedure → apiKey scope 检查 → isAdmin 角色检查
-```
-
-**(c) `sessionProcedure`** — 完全拒绝 API Key：
-
-```
-authedProcedure → rejectApiKeyAuth() 中间件
-  → 若 auth.type === "apiKey"，抛出 FORBIDDEN
+请求到达 procedure → 检查 auth.type
+  → auth.type === "session"：直接放行（无 scope 限制）
+  → auth.type === "apiKey"：
+      → 根据 procedure type 确定 access
+      → 构造 scope = "{resource}:{access}"
+      → apiKeyScopesGrantScope 检查
+      → 不通过 → TRPCError(FORBIDDEN)
 ```
 
-`sessionProcedure` 用于 API Key 管理端点（create/regenerate/revoke/list），防止 API Key 自我管理的递归权限。
+**所有业务 router 均已接入**（通过 grep 验证）：
+`bookmarks`, `assets`, `backups`, `feeds`, `highlights`, `lists`, `prompts`, `rules`, `tags`, `users`, `webhooks`, `importSessions`, `subscriptions`
 
-### 2.4 Hono REST 层的 Scope 检查
+#### 2.3.2 REST 路径：仅特定端点显式 Scope 检查
 
-`packages/api/middlewares/apiKeyScopes.ts` 的 `apiKeyScopeMiddleware(resource, access)`：
+REST 路径的 scope 检查**不是全局的**，只有特定端点显式添加 `apiKeyScopeMiddleware`：
 
-```
-auth.type !== "apiKey" → 放行（session 用户不受 scope 限制）
-auth.type === "apiKey" → 构造 scope → apiKeyScopesGrantScope 检查
-  → 失败则抛出 HTTP 403
-```
+| 层级 | 机制 | 代码位置 |
+|------|------|---------|
+| `authMiddleware` | 全局中间件，仅检查 `ctx.user != null`，**不检查 scope** | `api/middlewares/auth.ts:24` |
+| `apiKeyScopeMiddleware(resource, access)` | 仅在特定路由上手动添加，检查 apiKey 的 scope | `api/middlewares/apiKeyScopes.ts:14` |
 
-与 tRPC 不同，REST 路由**显式指定 access 级别**（不是根据 HTTP method 推断），例如：
+**已发现的 REST scope 检查端点：**
 
-```ts
-app.post("/", apiKeyScopeMiddleware("assets", "readwrite"), ...)
-app.get("/", apiKeyScopeMiddleware("bookmarks", "read"), ...)
-```
+| 端点 | 所需 scope | 代码位置 |
+|------|-----------|---------|
+| `POST /bookmarks/singlefile` | `assets:readwrite` + `bookmarks:readwrite` | `api/routes/bookmarks.ts:113` |
+| `POST /assets` | `assets:readwrite` | `api/routes/assets.ts:17` |
+| `GET /assets/:assetId` | `assets:read` | `api/routes/assets.ts:43` |
 
-### 2.5 Scope 边界总结
+**重要发现：** 大多数 REST 端点（如 `GET /bookmarks`, `POST /bookmarks`, `GET /bookmarks/search`, `GET /bookmarks/check-url` 等）**没有显式的 scope 检查**。只要通过 `authMiddleware`（即用户存在），无论 auth.type 是 apiKey 还是 session，都可以访问。
+
+#### 2.3.3 Scope 检查路径对比
+
+| 维度 | tRPC 路径 | REST 路径 |
+|------|----------|----------|
+| Scope 检查时机 | Procedure 定义时自动注入 | 特定路由手动添加 |
+| 覆盖范围 | 所有业务端点 | 仅 3 个端点有检查 |
+| Access 映射 | 自动根据 query/mutation 映射 | 显式指定 |
+| Session 用户 | 不受 scope 限制 | 不受 scope 限制 |
+| API Key 用户 | 所有端点强制 scope 检查 | 大部分端点无 scope 检查 |
+
+### 2.4 Scope 边界总结
 
 | 层级 | 机制 | 代码位置 |
 |------|------|---------|
 | 签发默认 | 默认 `fullaccess`，可显式指定 | `apiKeys.ts:48`, `apiKeys.ts:185` |
-| tRPC 资源 | `createScopedAuthedProcedure` 自动映射 read/readwrite | `trpc/index.ts:177` |
+| tRPC 资源 | `createScopedAuthedProcedure` 自动映射 read/readwrite，**强制检查** | `trpc/index.ts:177` |
 | tRPC 管理员 | `createAdminScopedProcedure` + 角色检查 | `trpc/index.ts:199` |
 | tRPC Key 管理 | `sessionProcedure` 禁止 apiKey 调用 | `trpc/index.ts:197` |
-| REST 路由 | `apiKeyScopeMiddleware` 显式指定 | `api/middlewares/apiKeyScopes.ts:14` |
+| REST 认证 | `authMiddleware` 仅检查用户存在，**不检查 scope** | `api/middlewares/auth.ts:24` |
+| REST 特定路由 | `apiKeyScopeMiddleware` 显式指定，**仅 3 个端点** | `api/middlewares/apiKeyScopes.ts:14` |
 | 全局拒绝 | `rejectApiKeyAuth` 中间件 | `trpc/index.ts:163` |
 
 ---
@@ -264,91 +293,34 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 ### 4.1 整体架构
 
 ```
-外部客户端 (CLI / 浏览器扩展 / 第三方脚本)
+外部客户端 (CLI / 浏览器扩展 / 移动端 / 第三方脚本)
     │
     │  HTTP 请求
     │  Header: Authorization: Bearer ak2_xxx_yyy
     ▼
 Web Server (Next.js API Route)
     │  apps/web/app/api/[[...route]]/route.ts
-    │  → createContextFromRequest()
+    │  → nextAuth 中间件 → createContextFromRequest()
     ▼
 认证与上下文注入
     │  apps/web/server/api/client.ts
     │  → authenticateApiKey()  [packages/trpc/auth.ts]
+    │  → ✅ 成功 → auth.type = "apiKey"
+    │  → ❌ 失败 → 静默回退 → auth.type = "session" (如果有有效 cookie)
     ▼
 Hono App (packages/api)
-    │  → authMiddleware / apiKeyScopeMiddleware
-    ▼
-tRPC Router (packages/trpc/routers)
-    │  → createScopedAuthedProcedure 做 scope 检查
+    │  → authMiddleware (检查 ctx.user != null)
+    │  → REST 路由: apiKeyScopeMiddleware (仅特定端点)
+    │  → tRPC 路由: createScopedAuthedProcedure (所有业务端点)
     ▼
 业务逻辑执行
 ```
 
-### 4.2 Token 获取方式
+### 4.2 Bearer 失败时的会话回退机制
 
-**方式 A：Web 界面创建（Session 认证）**
+#### 4.2.1 回退条件
 
-```
-用户登录 Web → Settings → API Keys → 创建
-  → POST /api/trpc/apiKeys.create
-  → sessionProcedure（cookie/session 认证）
-  → 返回明文 key（仅此一次）
-```
-
-**方式 B：浏览器扩展 Exchange（密码认证）**
-
-```
-扩展首次使用 → 用户输入 email + password
-  → POST /api/trpc/apiKeys.exchange
-  → publicProcedure（无需前置认证）
-  → validatePassword(email, password)
-  → 检查 emailVerificationRequired
-  → 返回明文 key（扩展存储在 chrome.storage.sync）
-```
-
-**方式 C：CLI 手动配置**
-
-```
-用户从 Web 界面复制 key → 运行 `karakeep auth init`
-  → 交互输入 serverAddr + apiKey
-  → 写入 ~/.config/karakeep/config.json (权限 0o600)
-```
-
-### 4.3 Token 注入与传递
-
-**浏览器扩展**（`apps/browser-extension/src/utils/trpc.ts`）：
-
-```ts
-// 创建 tRPC 客户端时注入
-httpLink({
-  url: `${address}/api/trpc`,
-  headers: {
-    Authorization: `Bearer ${apiKey}`,
-    ...customHeaders,
-  },
-})
-```
-
-**CLI**（`apps/cli/src/lib/trpc.ts`）：
-
-```
-从 ~/.config/karakeep/config.json 读取 apiKey
-→ 创建 tRPC client 时注入 Authorization header
-```
-
-**单文件上传（singlefile）**：
-
-```ts
-// apps/browser-extension/src/utils/singlefile.ts
-headers = { Authorization: `Bearer ${settings.apiKey}` }
-fetch(`${apiUrl}/api/v1/bookmarks`, { method: "POST", headers, body: formData })
-```
-
-### 4.4 Web Server 侧的认证注入
-
-`apps/web/server/api/client.ts` 的 `createContextFromRequest` 是核心入口：
+核心代码在 `apps/web/server/api/client.ts` 的 `createContextFromRequest`：
 
 ```ts
 export async function createContextFromRequest(req: Request) {
@@ -363,40 +335,139 @@ export async function createContextFromRequest(req: Request) {
         db, req: { ip },
       };
     } catch {
-      // API key 验证失败 → 回退到 cookie session 认证
+      // API key 验证失败 → 静默吞掉异常，回退到 cookie session 认证
     }
   }
   return createContext(db, ip); // 走 session 路径
 }
 ```
 
-**关键设计：** API Key 验证失败时静默回退到 session 认证，不是返回 401。这意味着同一个端点可以同时支持两种认证方式。
+**触发回退的场景：**
+1. Bearer token 格式错误（不是 `ak{1,2}_{keyId}_{secret}` 格式）
+2. keyId 在数据库中不存在
+3. secret 哈希比对失败
+4. 其他 `authenticateApiKey` 抛出的异常
 
-### 4.5 Scope 检查执行时机
-
-Scope 检查在**每次请求**的两个阶段进行：
-
-**阶段一：tRPC Procedure 级（隐式自动）**
-
-```
-请求到达 router → createScopedAuthedProcedure("bookmarks")
-  → opts.type === "query" → access = "read"
-  → scope = "bookmarks:read"
-  → apiKeyScopesGrantScope(auth.scopes, "bookmarks:read")
-  → 不通过 → TRPCError(FORBIDDEN, "API key is missing required scope: bookmarks:read")
-```
-
-**阶段二：Hono Middleware 级（显式手动）**
+#### 4.2.2 回退路径
 
 ```
-请求到达 REST 路由 → apiKeyScopeMiddleware("bookmarks", "readwrite")
-  → auth.type === "apiKey"
-  → scope = "bookmarks:readwrite"
-  → apiKeyScopesGrantScope(auth.scopes, "bookmarks:readwrite")
-  → 不通过 → HTTPException(403, "API key is missing required scope: bookmarks:readwrite")
+Bearer token 验证失败
+    ↓
+catch 块静默吞掉异常
+    ↓
+调用 createContext(db, ip)
+    ↓
+createContext 调用 getServerAuthSession()
+    ↓
+从 Next.js cookie 中读取 session（如果有）
+    ↓
+session 有效 → ctx.auth = { type: "session" }
+session 无效 → ctx.auth = null，后续 authMiddleware 返回 401
 ```
 
-### 4.6 完整调用时序图
+#### 4.2.3 安全影响
+
+**1. 混淆代理攻击（Confused Deputy）**
+
+如果用户已登录 Web 应用（有有效的 session cookie），攻击者可以构造带有**无效 Bearer token** 的请求：
+
+- 正常场景：`Authorization: Bearer <valid-api-key>` → auth.type = "apiKey" → 受 scope 限制
+- 攻击场景：`Authorization: Bearer <invalid-or-expired-key>` → 回退到 session → auth.type = "session" → **不受 scope 限制**
+
+攻击者可以利用用户的 session 权限执行超出 API Key 授权范围的操作。
+
+**2. Scope 检查绕过**
+
+回退到 session 后，`auth.type` 变为 `"session"`，所有 scope 检查中间件都会跳过：
+
+- tRPC 的 `createScopedAuthedProcedure` 检查 `auth.type !== "apiKey"` 时直接放行
+- REST 的 `apiKeyScopeMiddleware` 检查 `auth.type !== "apiKey"` 时直接放行
+
+这意味着 scope 边界仅在 Bearer token **验证成功** 时生效。
+
+**3. 信息泄露防护（双刃剑）**
+
+静默回退不返回 401，攻击者无法区分：
+- "API Key 不存在/无效"
+- "API Key 有效但权限不足"
+- "请求根本没有 API Key"
+
+这在一定程度上防止了 API Key 存在性探测，但也增加了调试难度。
+
+**4. 对纯 API 客户端的影响**
+
+对于没有 cookie 的纯 API 客户端（如 CLI、服务器脚本），回退会导致 `getServerAuthSession()` 返回 null，最终 `authMiddleware` 返回 401。这是预期行为，但错误信息不明确。
+
+### 4.3 Token 获取方式
+
+**方式 A：Web 界面创建（Session 认证）**
+
+```
+用户登录 Web → Settings → API Keys → 创建
+  → POST /api/trpc/apiKeys.create
+  → sessionProcedure（cookie/session 认证）
+  → 返回明文 key（仅此一次）
+```
+
+**方式 B：浏览器扩展/移动端 Exchange（密码认证）**
+
+```
+扩展/移动端首次使用 → 用户输入 email + password
+  → POST /api/trpc/apiKeys.exchange
+  → publicProcedure（无需前置认证）
+  → validatePassword(email, password)
+  → 检查 emailVerificationRequired
+  → 返回明文 key（存储在本地）
+```
+
+**方式 C：直接粘贴 API Key**
+
+```
+用户从 Web 界面复制 key → 粘贴到扩展/移动端
+  → POST /api/trpc/apiKeys.validate
+  → 验证成功后存储在本地
+```
+
+**方式 D：CLI 手动配置**
+
+```
+用户从 Web 界面复制 key → 运行 `karakeep auth init`
+  → 交互输入 serverAddr + apiKey
+  → 写入 ~/.config/karakeep/config.json (权限 0o600)
+```
+
+### 4.4 Token 注入与传递
+
+**浏览器扩展**（`apps/browser-extension/src/utils/trpc.ts`）：
+
+```ts
+httpLink({
+  url: `${address}/api/trpc`,
+  headers: {
+    Authorization: `Bearer ${apiKey}`,
+    ...customHeaders,
+  },
+})
+```
+
+**移动端**（类似 tRPC client 注入）。
+
+**CLI**（`apps/cli/src/lib/trpc.ts`）：
+
+```
+从 ~/.config/karakeep/config.json 读取 apiKey
+→ 创建 tRPC client 时注入 Authorization header
+```
+
+**单文件上传（singlefile）**：
+
+```ts
+// apps/browser-extension/src/utils/singlefile.ts
+headers = { Authorization: `Bearer ${settings.apiKey}` }
+fetch(`${apiUrl}/api/v1/bookmarks/singlefile`, { method: "POST", headers, body: formData })
+```
+
+### 4.5 完整调用时序图（tRPC 路径）
 
 ```
 [外部脚本]
@@ -406,7 +477,8 @@ Scope 检查在**每次请求**的两个阶段进行：
     │
     ▼
 [Next.js Route Handler]
-    │  route.ts → createContextFromRequest(rawRequest)
+    │  route.ts → nextAuth 中间件
+    │  → createContextFromRequest(rawRequest)
     │
     ▼
 [Token 解析]
@@ -415,11 +487,16 @@ Scope 检查在**每次请求**的两个阶段进行：
     │    ├── DB 查询 keyId
     │    ├── SHA256 比对 secret
     │    ├── 更新 lastUsedAt (10min 节流)
-    │    └── 返回 { user, apiKey: { keyId, scopes } }
+    │    └── ✅ 返回 { user, apiKey: { keyId, scopes } }
+    │       ❌ 失败 → 回退到 session 认证
     │
     ▼
 [上下文注入]
     │  ctx = { user, auth: { type: "apiKey", keyId, scopes }, db }
+    │
+    ▼
+[Hono tRPC Adapter]
+    │  trpcServer → 从 c.var.ctx 获取上下文
     │
     ▼
 [tRPC 调用链]
@@ -438,6 +515,35 @@ Scope 检查在**每次请求**的两个阶段进行：
     │ 返回书签列表数据
 ```
 
+### 4.6 完整调用时序图（REST 路径，无 scope 检查的端点）
+
+```
+[外部脚本]
+    │
+    │ 1. POST /api/v1/bookmarks
+    │    Authorization: Bearer ak2_abc123_def456
+    │    Body: { "url": "https://example.com" }
+    │
+    ▼
+[Next.js Route Handler]
+    │  → createContextFromRequest
+    │  → ✅ API Key 验证成功 → auth.type = "apiKey"
+    │
+    ▼
+[Hono App]
+    │  authMiddleware → 检查 ctx.user != null ✓
+    │
+    ▼
+[业务路由]
+    │  POST /bookmarks（无 apiKeyScopeMiddleware）
+    │  → 直接调用 c.var.api.bookmarks.createBookmark
+    │  → ❗ 无 scope 检查，只要认证通过即可访问
+    │
+    ▼
+[响应]
+    │ 返回创建的书签
+```
+
 ---
 
 ## 五、安全设计要点
@@ -454,19 +560,29 @@ Scope 检查在**每次请求**的两个阶段进行：
 - CORS 配置允许 `Authorization` 和 `Content-Type` 头
 - Web Server 中 API Key 失败时静默回退到 session，不泄露 key 是否有效
 
-### 5.3 权限最小化
+### 5.3 权限模型
 
-- 默认签发 `fullaccess`（向后兼容），但支持显式指定细粒度 scope
-- `sessionProcedure` 防止 API Key 管理 API Key（防止提权递归）
-- 管理员 scope 与普通 scope 命名空间隔离（`admin:` 前缀）
+- **tRPC 路径**：所有业务端点强制 scope 检查，权限边界清晰
+- **REST 路径**：大部分端点无 scope 检查，API Key 拥有等同于 session 的权限
+- **默认签发 `fullaccess`**：向后兼容，但支持显式指定细粒度 scope
+- **`sessionProcedure`**：防止 API Key 管理 API Key（防止提权递归）
+- **管理员 scope 命名空间隔离**：`admin:` 前缀
 
-### 5.4 撤销即时性
+### 5.4 回退机制的安全权衡
+
+| 设计选择 | 优点 | 风险 |
+|---------|------|------|
+| Bearer 失败静默回退 | 同一端点同时支持 API Key 和 Session，用户体验好 | 混淆代理攻击、scope 检查绕过 |
+| Session 用户不受 scope 限制 | Web 界面使用简单 | 回退时绕过 scope 边界 |
+| 不返回 401 区分 key 无效/权限不足 | 防止 key 存在性探测 | 调试困难，用户无法知道 key 是否正确 |
+
+### 5.5 撤销即时性
 
 - **无缓存**：每次请求实时查库验证，撤销即时生效
 - **硬删除**：revoke 是 DELETE 操作，记录彻底消失
 - **级联删除**：用户删除自动清理所有 key
 
-### 5.5 限速保护
+### 5.6 限速保护
 
 | 端点 | 窗口 | 最大请求 |
 |------|------|---------|
@@ -474,6 +590,7 @@ Scope 检查在**每次请求**的两个阶段进行：
 | `validate` | 1 分钟 | 30 |
 | 全局 public | 1 分钟 | 1000 |
 | 全局 authed | 1 分钟 | 3000 |
+| `assets.upload` | 1 分钟 | 30 |
 
 ---
 
@@ -486,9 +603,12 @@ Scope 检查在**每次请求**的两个阶段进行：
 | Scope 类型定义 | `packages/shared/types/apiKeys.ts` | `API_KEY_SCOPE_RESOURCES`, `apiKeyScopesGrantScope`, `getApiKeyScope` |
 | tRPC Scope 中间件 | `packages/trpc/index.ts` | `createScopedAuthedProcedure`, `sessionProcedure`, `rejectApiKeyAuth` |
 | Hono Scope 中间件 | `packages/api/middlewares/apiKeyScopes.ts` | `apiKeyScopeMiddleware` |
-| Web 上下文注入 | `apps/web/server/api/client.ts` | `createContextFromRequest` |
+| Hono 认证中间件 | `packages/api/middlewares/auth.ts` | `authMiddleware`（仅检查用户存在） |
+| Web 上下文注入 | `apps/web/server/api/client.ts` | `createContextFromRequest`（Bearer 回退逻辑） |
+| Web Session 认证 | `apps/web/server/auth.ts` | `getServerAuthSession`, NextAuth 配置 |
 | 数据库 Schema | `packages/db/schema.ts` | `apiKeys` table |
-| 浏览器扩展 | `apps/browser-extension/src/utils/trpc.ts` | `initializeClients`, Bearer header 注入 |
+| 浏览器扩展登录 | `apps/browser-extension/src/SignInPage.tsx` | exchange 调用 |
+| 移动端登录 | `apps/mobile/app/signin.tsx` | exchange 调用 |
+| 浏览器扩展 tRPC | `apps/browser-extension/src/utils/trpc.ts` | `initializeClients`, Bearer header 注入 |
 | CLI 配置 | `apps/cli/src/commands/auth.ts`, `apps/cli/src/lib/config.ts` | `auth init`, `~/.config/karakeep/config.json` |
-| REST 认证 | `packages/api/middlewares/auth.ts` | `authMiddleware`, `unauthedMiddleware` |
 | 测试用例 | `packages/trpc/routers/apiKeys.test.ts` | 完整生命周期/scope 强制/兼容性测试 |
