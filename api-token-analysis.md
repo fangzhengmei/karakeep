@@ -4,7 +4,7 @@
 
 Karakeep 使用 API Key（非 JWT/OAuth）作为外部脚本和客户端的身份认证凭证。系统采用 `ak2_{keyId}_{secret}` 格式，服务端仅存储 keyId 和 secret 的 SHA256 哈希值，明文 key 仅在创建/重新生成时返回给用户一次。整体链路涉及签发、权限收敛、调用注入、撤销回收四大环节。
 
-**核心发现（修正后）**：tRPC 和 REST 两条入口**共享相同的 scope 检查逻辑**。REST 路由通过 tRPC caller 间接触发 `createScopedAuthedProcedure` 的 scope 检查，不存在绕过。
+**核心架构**：tRPC 和 REST 两条入口共享相同的 scope 检查逻辑。REST 路由通过 tRPC caller 间接触发 `createScopedAuthedProcedure` 的 scope 检查，不存在绕过。
 
 ---
 
@@ -151,7 +151,7 @@ admin:{resource}:{access}
 
 ---
 
-## 三、REST 入口鉴权流程深度分析
+## 三、REST 入口鉴权流程：Route 层与 Procedure 层职责划分
 
 ### 3.1 整体架构
 
@@ -172,53 +172,168 @@ HTTP 请求 (REST)
     │    ✅ 成功 → ctx.auth = { type: "apiKey", keyId, scopes }
     │    ❌ 失败 → 回退到 session 认证
     ▼
-[Step 3] Hono 中间件层
+[Step 3] Hono Route 层中间件
     │  packages/api/middlewares/auth.ts
     │  → authMiddleware: 检查 ctx.user != null
     │  → ✅ 通过：c.set("api", createCaller(c.get("ctx")))
     │       【关键】创建 tRPC caller，绑定当前上下文
     ▼
-[Step 4] REST 路由处理
-    │  packages/api/routes/bookmarks.ts
-    │  → 调用 c.var.api.bookmarks.getBookmarks(params)
+[Step 4] Route 层输入验证
+    │  packages/api/routes/*.ts
+    │  → zValidator: 验证 query/body/params
+    ▼
+[Step 5] REST 路由处理
+    │  → 调用 c.var.api.{resource}.{operation}(params)
     │       【关键】通过 tRPC caller 调用 procedure
     ▼
-[Step 5] tRPC Procedure 层（Scope 校验生效处）
-    │  packages/trpc/routers/bookmarks.ts
-    │  → bookmarksProcedure = createScopedAuthedProcedure("bookmarks")
-    │  → Scope 检查中间件执行
-    │    • auth.type === "session" → 直接放行
-    │    • auth.type === "apiKey" → apiKeyScopesGrantScope 检查
+[Step 6] tRPC Procedure 层（Scope 校验 + 资源所有权校验）
+    │  packages/trpc/routers/*.ts
+    │  → createScopedAuthedProcedure(resource) → Scope 检查
+    │  → ensure*Ownership → 资源所有权检查（部分操作）
+    │  → 业务逻辑
     ▼
-[Step 6] 业务逻辑执行
+[Step 7] 响应格式化
+    │  → REST 路由可能进行响应格式转换
+    │  → 返回 JSON 响应
 ```
 
-### 3.2 Route 层中间件详解
+### 3.2 Route 层与 Procedure 层职责划分详解
 
-**authMiddleware**（`packages/api/middlewares/auth.ts:24`）是所有 REST 业务路由的前置中间件：
+#### 3.2.1 Route 层职责
+
+Route 层（Hono 路由 + 中间件）负责：
+
+| 职责 | 实现 | 说明 |
+|------|------|------|
+| **用户认证检查** | `authMiddleware` | 检查 `ctx.user != null`，确保请求已认证 |
+| **tRPC caller 创建** | `c.set("api", createCaller(c.get("ctx")))` | 将当前上下文绑定到 caller，使 procedure 能访问 auth 信息 |
+| **输入验证** | `zValidator` | 验证 HTTP 请求的 query/body/params |
+| **响应格式化** | 路由处理函数 | 进行响应格式转换（如分页适配、base64 编码） |
+| **速率限制** | `createRateLimitMiddleware` | 部分端点添加速率限制 |
+| **冗余 Scope 检查** | `apiKeyScopeMiddleware` | 仅 3 个端点添加，提前拒绝无效请求 |
+
+#### 3.2.2 Procedure 层职责
+
+Procedure 层（tRPC router + 中间件）负责：
+
+| 职责 | 实现 | 说明 |
+|------|------|------|
+| **Scope 检查** | `createScopedAuthedProcedure(resource)` | 检查 API Key 的 scope 是否满足操作要求 |
+| **资源所有权检查** | `ensure*Ownership` 中间件 | 确保用户拥有被操作的资源 |
+| **业务逻辑执行** | procedure handler | 执行业务操作（数据库查询/修改） |
+| **事件日志** | `createEventLogMiddleware` | 记录操作事件 |
+| **管理员角色检查** | `createAdminScopedProcedure(resource)` | 检查用户角色是否为 admin |
+
+### 3.3 REST 路由分类与校验职责
+
+#### 3.3.1 标准业务路由（authMiddleware + tRPC caller）
+
+这些路由的 scope 检查**完全由 tRPC procedure 层执行**：
+
+| 路由文件 | Scope 检查位置 | 额外资源所有权检查 |
+|---------|---------------|------------------|
+| `bookmarks.ts` | `bookmarksProcedure = createScopedAuthedProcedure("bookmarks")` | `ensureBookmarkOwnership`（update/delete） |
+| `tags.ts` | `tagsProcedure = createScopedAuthedProcedure("tags")` | `ensureTagOwnership`（get/delete/update） |
+| `lists.ts` | `listsProcedure = createScopedAuthedProcedure("lists")` | `ensureListAtLeastViewer/Owner`（edit/delete） |
+| `feeds.ts` | `feedsProcedure = createScopedAuthedProcedure("feeds")` | `ensureFeedOwnership`（get/update/delete/fetch） |
+| `highlights.ts` | `highlightsProcedure = createScopedAuthedProcedure("highlights")` | `ensureHighlightOwnership`（get/update/delete） |
+| `backups.ts` | `backupsProcedure = createScopedAuthedProcedure("backups")` | 无 |
+| `users.ts` | `usersProcedure = createScopedAuthedProcedure("users")` | 无 |
+| `webhooks.ts` | `webhooksProcedure = createScopedAuthedProcedure("webhooks")` | `ensureWebhookOwnership`（update/delete） |
+
+**关键代码模式**（以 `tags.ts` 为例）：
 
 ```ts
-export const authMiddleware = createMiddleware<{
-  Variables: {
-    ctx: AuthedContext;
-    api: ReturnType<typeof createCaller>;
-  };
-}>(async (c, next) => {
-  if (!c.var.ctx || !c.var.ctx.user || c.var.ctx.user === null) {
-    throw new HTTPException(401, { message: "Unauthorized" });
-  }
-  // 【关键】创建 tRPC caller，绑定当前上下文（包含 auth.type 和 scopes）
-  c.set("api", createCaller(c.get("ctx")));
-  await next();
+// Route 层：仅做输入验证，调用 c.var.api.tags.*
+.post("/", zValidator("json", zCreateTagRequestSchema), async (c) => {
+  const body = c.req.valid("json");
+  const tags = await c.var.api.tags.create(body);  // 通过 caller 调用 procedure
+  return c.json(tags, 201);
+})
+
+// Procedure 层：scope 检查由 createScopedAuthedProcedure 自动执行
+const tagsProcedure = createScopedAuthedProcedure("tags");
+
+export const tagsAppRouter = router({
+  create: tagsProcedure
+    .use(createEventLogMiddleware("tag.create"))
+    .input(zCreateTagRequestSchema)
+    .output(zTagBasicSchema)
+    .mutation(async ({ input, ctx }) => {
+      // 业务逻辑
+    }),
+  // ...
 });
 ```
 
-**核心作用：**
-1. 验证用户已认证（`ctx.user != null`）
-2. 创建 tRPC caller 并绑定到 `c.var.api`
-3. caller 携带完整的上下文信息，包括 `auth.type` 和 `auth.scopes`
+#### 3.3.2 管理员路由（adminAuthMiddleware + tRPC caller）
 
-### 3.3 createCaller 到 tRPC procedure 的调用过程
+这些路由需要**管理员 scope + 角色检查**：
+
+| 路由文件 | Scope 检查位置 | 角色检查 |
+|---------|---------------|---------|
+| `admin.ts` | `createAdminScopedProcedure("bookmarks"/"jobs"/"system"/"users")` | `adminAuthMiddleware` 检查 `user.role === "admin"` |
+
+**关键代码模式**：
+
+```ts
+// Route 层：adminAuthMiddleware 检查用户角色
+const app = new Hono().use(adminAuthMiddleware)
+
+// adminAuthMiddleware 实现
+if (c.var.ctx.user.role !== "admin") {
+  throw new HTTPException(403, { message: "Forbidden - Admin access required" });
+}
+
+// Procedure 层：createAdminScopedProcedure 执行管理员 scope 检查
+const adminBookmarksProcedure = createAdminScopedProcedure("bookmarks");
+```
+
+#### 3.3.3 有冗余 Scope 检查的路由
+
+这些路由在 Route 层额外添加了 `apiKeyScopeMiddleware`：
+
+| 端点 | Route 层检查 | Procedure 层检查 |
+|------|-------------|----------------|
+| `POST /assets` | `apiKeyScopeMiddleware("assets", "readwrite")` | `assetsProcedure = createScopedAuthedProcedure("assets")` |
+| `GET /assets/:assetId` | `apiKeyScopeMiddleware("assets", "read")` | `Asset.ensureCanView()` 资源访问检查 |
+| `POST /bookmarks/singlefile` | `apiKeyScopeMiddleware("assets", "readwrite")` + `apiKeyScopeMiddleware("bookmarks", "readwrite")` | `bookmarksProcedure` + `assetsProcedure` |
+
+**为什么是冗余的？**
+- Route 层的 `apiKeyScopeMiddleware` 和 Procedure 层的 `createScopedAuthedProcedure` 执行相同的 scope 检查
+- Route 层检查先执行，可以提前拒绝无效请求，减少不必要的 tRPC 调用
+- 但即使 Route 层没有检查，Procedure 层也会拒绝
+
+**可能的设计意图**：
+1. 提前拒绝无效请求，减少不必要的 tRPC 调用
+2. 在路由层明确标注权限要求，提高代码可读性
+
+#### 3.3.4 特殊认证路由
+
+这些路由使用独立的认证机制，**不经过标准的 API Key / Session 认证链路**：
+
+| 路由文件 | 认证方式 | 说明 |
+|---------|---------|------|
+| `webhooks/stripe` | Stripe 签名验证 | 独立的 webhook 认证 |
+| `rss/lists/:listId` | `unauthedMiddleware` + 公共 token | 公共 RSS 订阅，使用 list token |
+| `public/assets/:assetId` | `unauthedMiddleware` + 签名 token | 公共资产访问，使用签名 token |
+| `metrics` | `bearerAuth` + 独立 token | Prometheus 指标，使用独立配置 token |
+| `health` | 无认证 | 健康检查 |
+| `version` | 无认证 | 版本信息 |
+
+#### 3.3.5 仅 tRPC 访问的资源
+
+这些资源**没有 REST 路由**，仅通过 tRPC 路径访问：
+
+| 资源 | Router 文件 | Procedure 类型 |
+|------|-------------|---------------|
+| `apiKeys` | `apiKeys.ts` | `sessionProcedure`（仅 Web 界面） |
+| `rules` | `rules.ts` | `createScopedAuthedProcedure("rules")` |
+| `prompts` | `prompts.ts` | `createScopedAuthedProcedure("prompts")` |
+| `importSessions` | `importSessions.ts` | `createScopedAuthedProcedure("importSessions")` |
+| `subscriptions` | `subscriptions.ts` | `createScopedAuthedProcedure("subscriptions")` |
+
+### 3.4 createCaller 到 tRPC procedure 的调用过程详解
 
 `createCaller` 是 tRPC 官方提供的 `createCallerFactory`（`packages/trpc/index.ts:92`）：
 
@@ -229,43 +344,29 @@ export const createCallerFactory = t.createCallerFactory;
 **调用链详解：**
 
 1. **创建 caller**：`createCaller(ctx)` 创建一个代理对象，可直接调用 router 上的 procedure
-2. **调用 procedure**：`c.var.api.bookmarks.getBookmarks(params)` 触发以下流程：
-   ```
-   caller.bookmarks.getBookmarks(params)
-       ↓
-   tRPC 内部调用 router.bookmarks.getBookmarks
-       ↓
-   执行 procedure 的中间件链（从外到内）
-       ↓
-   1. createScopedAuthedProcedure("bookmarks") → Scope 检查
-   2. createBookmarksQueriedMiddleware() → 埋点
-   3. 输入验证 (zod)
-   4. 业务逻辑
-   ```
+2. **调用 procedure**：`c.var.api.tags.create(body)` 触发以下流程：
 
-**关键代码证据**（`packages/trpc/routers/bookmarks.ts:70, 951`）：
-
-```ts
-const bookmarksProcedure = createScopedAuthedProcedure("bookmarks");
-
-export const bookmarksAppRouter = router({
-  getBookmarks: bookmarksProcedure
-    .use(createBookmarksQueriedMiddleware())
-    .input(zGetBookmarksRequestSchema)
-    .output(zGetBookmarksResponseSchema)
-    .query(async ({ input, ctx }) => {
-      // 业务逻辑
-    }),
-  // ... 所有其他 procedure 都使用 bookmarksProcedure
-});
+```
+caller.tags.create(body)
+    ↓
+tRPC 内部调用 router.tags.create
+    ↓
+执行 procedure 的中间件链（从外到内）：
+    ↓
+1. createScopedAuthedProcedure("tags") → Scope 检查
+2. createEventLogMiddleware("tag.create") → 事件日志
+3. 输入验证 (zod) → zCreateTagRequestSchema
+4. 业务逻辑 → Tag.create(ctx, input)
 ```
 
-### 3.4 Scope 校验的生效层级
+**关键设计**：caller 携带完整的上下文信息（包括 `auth.type` 和 `auth.scopes`），确保 procedure 层能执行正确的 scope 检查。
+
+### 3.5 Scope 校验的生效层级
 
 **Scope 校验在 tRPC procedure 层生效**，无论通过 tRPC 直接调用还是通过 REST caller 间接调用，都会执行相同的检查：
 
 ```
-createScopedAuthedProcedure("bookmarks")
+createScopedAuthedProcedure("tags")
     │
     ▼
 中间件执行逻辑：
@@ -292,24 +393,24 @@ createScopedAuthedProcedure("bookmarks")
 - ✅ tRPC 和 REST 两条入口**共享完全相同的 scope 检查逻辑**
 - ❌ 不存在"REST 路由绕过 scope 检查"的情况
 
-### 3.5 apiKeyScopeMiddleware 的作用
+### 3.6 资源所有权检查（ensureOwnership）
 
-`apiKeyScopeMiddleware`（`packages/api/middlewares/apiKeyScopes.ts`）是**额外的冗余检查**，仅在 3 个端点显式添加：
+部分操作在 scope 检查之外，还需要检查用户是否拥有被操作的资源：
 
-| 端点 | 所需 scope | 说明 |
-|------|-----------|------|
-| `POST /bookmarks/singlefile` | `assets:readwrite` + `bookmarks:readwrite` | 上传单文件 |
-| `POST /assets` | `assets:readwrite` | 上传资产 |
-| `GET /assets/:assetId` | `assets:read` | 获取资产 |
+| 资源 | 中间件 | 应用的操作 | 检查逻辑 |
+|------|--------|-----------|---------|
+| `bookmarks` | `ensureBookmarkOwnership` | update, delete, recrawl | `bookmark.ensureOwnership()` 检查 `bookmark.userId === ctx.user.id` |
+| `bookmarks` | `ensureBookmarkAccess` | get, summarize | 检查用户是否有权访问书签（可能是共享列表） |
+| `tags` | `ensureTagOwnership` | get, delete, update | `Tag.fromId(ctx, tagId)` 加载标签，隐式检查所有权 |
+| `lists` | `ensureListAtLeastViewer/Owner` | edit, delete | `list.ensureCanEdit()` / `list.ensureCanManage()` |
+| `feeds` | `ensureFeedOwnership` | get, update, delete, fetch | 加载 feed 时隐式检查所有权 |
+| `highlights` | `ensureHighlightOwnership` | get, update, delete | 加载 highlight 时隐式检查所有权 |
+| `webhooks` | `ensureWebhookOwnership` | update, delete | `webhooksService.get(actor, webhookId)` 检查所有权 |
+| `assets` | `ensureBookmarkOwnership` | attach, replace, detach | 检查书签所有权（资产属于书签） |
 
-**为什么是冗余的？**
-- 这些路由最终也会通过 `c.var.api.*` 调用 tRPC procedure
-- tRPC procedure 已经执行了相同的 scope 检查
-- `apiKeyScopeMiddleware` 只是提前在路由层做了一次相同的检查
-
-**可能的设计意图**：
-1. 提前拒绝无效请求，减少不必要的 tRPC 调用
-2. 在路由层明确标注权限要求，提高代码可读性
+**关键设计**：资源所有权检查在 scope 检查之后执行，形成"两层防护"：
+1. 第一层：scope 检查 - 用户是否有权执行该类型的操作
+2. 第二层：所有权检查 - 用户是否有权操作该特定资源
 
 ---
 
@@ -326,7 +427,10 @@ createScopedAuthedProcedure("bookmarks")
 | **tRPC caller 创建** | tRPC 适配器内部创建 | `authMiddleware` 显式创建 |
 | **Scope 检查时机** | procedure 中间件直接执行 | 通过 caller 间接触发 procedure 中间件 |
 | **Scope 检查逻辑** | `createScopedAuthedProcedure` | `createScopedAuthedProcedure`（完全相同） |
+| **资源所有权检查** | `ensure*Ownership` 中间件 | `ensure*Ownership` 中间件（完全相同） |
 | **路由级 Scope 检查** | 无（procedure 层已覆盖） | `apiKeyScopeMiddleware`（仅 3 个端点，冗余） |
+| **输入验证** | tRPC 内置 zod 验证 | Hono `zValidator` |
+| **响应格式** | tRPC 标准格式 | 可能有额外格式化（分页适配等） |
 | **Session 用户** | 不受 scope 限制 | 不受 scope 限制 |
 | **API Key 用户** | 所有端点强制 scope 检查 | 所有端点强制 scope 检查（通过 caller） |
 | **Bearer 失败回退** | 静默回退到 session | 静默回退到 session |
@@ -336,9 +440,10 @@ createScopedAuthedProcedure("bookmarks")
 
 1. **共享认证链路**：两条路径都经过 `createContextFromRequest` 处理 Bearer Token 和 Session
 2. **共享 Scope 检查**：最终都执行 `createScopedAuthedProcedure` 的相同逻辑
-3. **共享业务逻辑**：调用相同的 tRPC procedure 执行业务操作
-4. **相同回退行为**：Bearer Token 失败时都静默回退到 Session 认证
-5. **相同撤销机制**：API Key 撤销对两条路径同时生效
+3. **共享资源所有权检查**：执行相同的 `ensure*Ownership` 中间件
+4. **共享业务逻辑**：调用相同的 tRPC procedure 执行业务操作
+5. **相同回退行为**：Bearer Token 失败时都静默回退到 Session 认证
+6. **相同撤销机制**：API Key 撤销对两条路径同时生效
 
 ### 4.3 核心不同点
 
@@ -357,6 +462,10 @@ createScopedAuthedProcedure("bookmarks")
 4. **冗余检查**：
    - tRPC：无冗余检查
    - REST：3 个端点有 `apiKeyScopeMiddleware` 冗余检查
+
+5. **响应格式化**：
+   - tRPC：返回原始 procedure 输出
+   - REST：可能有额外格式化（如分页适配、base64 编码 cursor）
 
 ---
 
@@ -409,43 +518,63 @@ session 有效 → ctx.auth = { type: "session" }
 session 无效 → ctx.auth = null，后续 authMiddleware 返回 401
 ```
 
-### 5.3 安全影响（修正后）
+### 5.3 权限边界与安全影响（重新分析）
 
-**之前的错误结论**：回退会绕过 scope 检查
+#### 5.3.1 回退不是 Scope 绕过
 
-**修正后的正确结论**：
+**之前的误解**：回退会绕过 scope 检查
 
-1. **Scope 检查不会被绕过**：
-   - 回退到 session 后，`auth.type = "session"`
-   - `createScopedAuthedProcedure` 对 session 用户直接放行（设计如此）
-   - 这不是"绕过"，而是 session 用户本来就不受 scope 限制
+**正确的理解**：
 
-2. **混淆代理攻击风险仍然存在**：
-   - 攻击者构造带有**无效 Bearer token** 的请求
-   - 如果用户已登录（有有效 session cookie），请求会以 session 身份执行
-   - 攻击者可以利用用户的 session 权限执行操作
-   - 但这是 Session 认证的固有风险，不是 scope 检查绕过
+回退到 session 后，`auth.type = "session"`，`createScopedAuthedProcedure` 对 session 用户直接放行。这不是"绕过"，而是**设计如此的行为**：
+- Session 用户代表"已登录的用户本人"，拥有完整的用户权限
+- API Key 用户代表"被授权的第三方客户端"，权限受 scope 限制
+- 两种认证方式的权限模型本来就不同
 
-3. **权限变化对比**：
+#### 5.3.2 回退的安全影响
 
-| 场景 | auth.type | 权限模型 |
-|------|-----------|---------|
-| Bearer token 有效 | `apiKey` | 受 scope 限制 |
-| Bearer token 无效 + 有效 session | `session` | 完整用户权限（不受 scope 限制） |
-| Bearer token 无效 + 无 session | `null` | 401 未认证 |
+| 影响 | 说明 | 严重程度 |
+|------|------|---------|
+| **混淆代理攻击** | 攻击者构造带有无效 Bearer token 的请求，如果用户已登录，请求会以 session 身份执行 | 中 |
+| **权限提升** | API Key 权限受 scope 限制，session 权限是完整用户权限，回退相当于权限提升 | 中 |
+| **调试困难** | 静默回退不返回 401，API 客户端无法知道 key 是否有效 | 低 |
+| **信息泄露防护** | 不返回 401，防止 API Key 存在性探测 | 正 |
 
-4. **信息泄露防护（双刃剑）**：
-   - 静默回退不返回 401，攻击者无法区分：
-     - "API Key 不存在/无效"
-     - "API Key 有效但权限不足"
-     - "请求根本没有 API Key"
-   - 防止 API Key 存在性探测，但增加调试难度
+#### 5.3.3 混淆代理攻击的具体场景
 
-5. **对纯 API 客户端的影响**：
-   - 没有 cookie 的纯 API 客户端（如 CLI、服务器脚本）
-   - Bearer 失败后 `getServerAuthSession()` 返回 null
-   - 最终 `authMiddleware` 返回 401
-   - 错误信息不明确，用户无法知道是 key 无效还是其他问题
+```
+攻击者视角：
+1. 受害者已登录 Web 应用（有有效 session cookie）
+2. 攻击者诱导受害者访问恶意页面
+3. 恶意页面发送请求：POST /api/v1/bookmarks
+   Header: Authorization: Bearer <无效的 API Key>
+   Body: { "url": "https://evil.com" }
+   
+4. 服务器处理：
+   → Bearer token 无效 → 回退到 session
+   → session 有效 → auth.type = "session"
+   → 以受害者身份创建书签
+
+风险：攻击者可以利用受害者的 session 权限执行操作
+缓解：这是所有基于 cookie 的 Web 应用的固有风险（CSRF）
+```
+
+#### 5.3.4 权限变化对比
+
+| 场景 | auth.type | 权限模型 | Scope 检查 | 资源所有权检查 |
+|------|-----------|---------|-----------|--------------|
+| Bearer token 有效 | `apiKey` | 受 scope 限制 | ✅ 执行 | ✅ 执行 |
+| Bearer token 无效 + 有效 session | `session` | 完整用户权限 | ❌ 跳过（设计如此） | ✅ 执行 |
+| Bearer token 无效 + 无 session | `null` | 未认证 | N/A | N/A |
+| 无 Bearer token + 有效 session | `session` | 完整用户权限 | ❌ 跳过（设计如此） | ✅ 执行 |
+| 无 Bearer token + 无 session | `null` | 未认证 | N/A | N/A |
+
+#### 5.3.5 对纯 API 客户端的影响
+
+对于没有 cookie 的纯 API 客户端（如 CLI、服务器脚本）：
+- Bearer 失败后 `getServerAuthSession()` 返回 null
+- 最终 `authMiddleware` 返回 401
+- 错误信息不明确，用户无法知道是 key 无效还是其他问题
 
 ---
 
@@ -528,9 +657,9 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 ```
 [外部脚本]
     │
-    │ 1. POST /api/trpc/bookmarks.getBookmarks
+    │ 1. POST /api/trpc/tags.create
     │    Authorization: Bearer ak2_abc123_def456
-    │    Body: { "input": { ... } }
+    │    Body: { "input": { "name": "my-tag" } }
     │
     ▼
 [Next.js Route Handler]
@@ -558,28 +687,29 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
     │
     ▼
 [tRPC 调用链]
-    │  router.bookmarks.getBookmarks
-    │    ├── bookmarksProcedure = createScopedAuthedProcedure("bookmarks")
+    │  router.tags.create
+    │    ├── tagsProcedure = createScopedAuthedProcedure("tags")
     │    │   ├── 检查 auth.type === "apiKey" ✓
-    │    │   ├── opts.type === "query" → access = "read"
-    │    │   ├── scope = "bookmarks:read"
+    │    │   ├── opts.type === "mutation" → access = "readwrite"
+    │    │   ├── scope = "tags:readwrite"
     │    │   └── apiKeyScopesGrantScope 检查 ✓
-    │    ├── createBookmarksQueriedMiddleware()
-    │    ├── 输入验证 (zod)
-    │    └── 执行业务逻辑
+    │    ├── createEventLogMiddleware("tag.create")
+    │    ├── 输入验证 (zod) → zCreateTagRequestSchema
+    │    └── 执行业务逻辑 → Tag.create(ctx, input)
     │
     ▼
 [响应]
     │ 返回 tRPC 格式响应
 ```
 
-### 7.2 REST 路径完整时序
+### 7.2 REST 路径完整时序（标准业务路由）
 
 ```
 [外部脚本]
     │
-    │ 1. GET /api/v1/bookmarks?limit=20
+    │ 1. POST /api/v1/tags
     │    Authorization: Bearer ak2_abc123_def456
+    │    Body: { "name": "my-tag" }
     │
     ▼
 [Next.js Route Handler]
@@ -587,32 +717,34 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
     │  → ✅ API Key 验证成功 → auth.type = "apiKey"
     │
     ▼
-[Hono App]
-    │  authMiddleware
+[Hono authMiddleware]
     │    ├── 检查 ctx.user != null ✓
     │    └── 【关键】c.set("api", createCaller(c.get("ctx")))
     │
     ▼
+[Route 层输入验证]
+    │  zValidator("json", zCreateTagRequestSchema) ✓
+    │
+    ▼
 [REST 路由处理]
-    │  GET /bookmarks 路由
-    │    ├── zValidator 验证 query 参数
-    │    └── 【关键】调用 c.var.api.bookmarks.getBookmarks(searchParams)
+    │  POST /tags 路由处理函数
+    │    └── 【关键】调用 c.var.api.tags.create(body)
     │
     ▼
 [tRPC Procedure 层]
-    │  caller 触发 bookmarks.getBookmarks procedure
-    │    ├── bookmarksProcedure = createScopedAuthedProcedure("bookmarks")
+    │  caller 触发 tags.create procedure
+    │    ├── tagsProcedure = createScopedAuthedProcedure("tags")
     │    │   ├── 检查 auth.type === "apiKey" ✓
-    │    │   ├── opts.type === "query" → access = "read"
-    │    │   ├── scope = "bookmarks:read"
+    │    │   ├── opts.type === "mutation" → access = "readwrite"
+    │    │   ├── scope = "tags:readwrite"
     │    │   └── apiKeyScopesGrantScope 检查 ✓
-    │    ├── createBookmarksQueriedMiddleware()
+    │    ├── createEventLogMiddleware("tag.create")
     │    ├── 输入验证 (zod)
-    │    └── 执行业务逻辑
+    │    └── 执行业务逻辑 → Tag.create(ctx, input)
     │
     ▼
-[响应]
-    │ 返回 REST 格式响应 (JSON + pagination)
+[响应格式化]
+    │  return c.json(tags, 201)
 ```
 
 ### 7.3 Token 获取方式
@@ -669,9 +801,10 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 - CORS 配置允许 `Authorization` 和 `Content-Type` 头
 - Web Server 中 API Key 失败时静默回退到 session，不泄露 key 是否有效
 
-### 8.3 权限模型（修正后）
+### 8.3 权限模型
 
 - **统一的 Scope 检查**：tRPC 和 REST 路径共享相同的 `createScopedAuthedProcedure` 检查
+- **两层防护**：Scope 检查 + 资源所有权检查（ensureOwnership）
 - **无绕过可能**：所有业务 procedure 都被 scope 中间件包装，REST 通过 caller 间接触发
 - **默认签发 `fullaccess`**：向后兼容，但支持显式指定细粒度 scope
 - **`sessionProcedure`**：防止 API Key 管理 API Key（防止提权递归）
@@ -681,9 +814,9 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 
 | 设计选择 | 优点 | 风险 |
 |---------|------|------|
-| Bearer 失败静默回退 | 同一端点同时支持 API Key 和 Session，用户体验好 | 混淆代理攻击（利用用户 session） |
-| Session 用户不受 scope 限制 | Web 界面使用简单 | 回退时权限从"受 scope 限制"变为"完整权限" |
-| 不返回 401 区分 key 无效/权限不足 | 防止 key 存在性探测 | 调试困难，用户无法知道 key 是否正确 |
+| Bearer 失败静默回退 | 同一端点同时支持 API Key 和 Session，用户体验好 | 混淆代理攻击（利用用户 session），权限从受限变为完整 |
+| Session 用户不受 scope 限制 | Web 界面使用简单 | 回退时权限模型切换（设计如此，但可能被误解为绕过） |
+| 不返回 401 区分 key 无效/权限不足 | 防止 key 存在性探测 | 调试困难，API 客户端无法知道 key 是否正确 |
 
 ### 8.5 撤销即时性
 
@@ -711,8 +844,8 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 | Key 生成/验证 | `packages/trpc/auth.ts` | `generateApiKey`, `authenticateApiKey`, `regenerateApiKey`, `parseApiKey` |
 | Key 管理路由 | `packages/trpc/routers/apiKeys.ts` | `apiKeysAppRouter` (create/revoke/regenerate/list/exchange/validate) |
 | Scope 类型定义 | `packages/shared/types/apiKeys.ts` | `API_KEY_SCOPE_RESOURCES`, `apiKeyScopesGrantScope`, `getApiKeyScope` |
-| tRPC Scope 中间件 | `packages/trpc/index.ts` | `createScopedAuthedProcedure`, `sessionProcedure`, `rejectApiKeyAuth`, `createCallerFactory` |
-| Hono 认证中间件 | `packages/api/middlewares/auth.ts` | `authMiddleware`（创建 tRPC caller） |
+| tRPC Scope 中间件 | `packages/trpc/index.ts` | `createScopedAuthedProcedure`, `createAdminScopedProcedure`, `sessionProcedure`, `rejectApiKeyAuth`, `createCallerFactory` |
+| Hono 认证中间件 | `packages/api/middlewares/auth.ts` | `authMiddleware`（创建 tRPC caller）, `adminAuthMiddleware`, `unauthedMiddleware` |
 | Hono Scope 中间件 | `packages/api/middlewares/apiKeyScopes.ts` | `apiKeyScopeMiddleware`（冗余检查） |
 | Web 上下文注入 | `apps/web/server/api/client.ts` | `createContextFromRequest`（Bearer 回退逻辑） |
 | Web Session 认证 | `apps/web/server/auth.ts` | `getServerAuthSession`, NextAuth 配置 |
@@ -721,6 +854,9 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 | 移动端登录 | `apps/mobile/app/signin.tsx` | exchange 调用 |
 | 浏览器扩展 tRPC | `apps/browser-extension/src/utils/trpc.ts` | `initializeClients`, Bearer header 注入 |
 | CLI 配置 | `apps/cli/src/commands/auth.ts`, `apps/cli/src/lib/config.ts` | `auth init`, `~/.config/karakeep/config.json` |
-| tRPC 路由示例 | `packages/trpc/routers/bookmarks.ts` | `bookmarksProcedure`, `bookmarksAppRouter` |
-| REST 路由示例 | `packages/api/routes/bookmarks.ts` | `c.var.api.bookmarks.getBookmarks` 调用 |
+| REST 路由（标准业务） | `packages/api/routes/bookmarks.ts`, `tags.ts`, `lists.ts`, `feeds.ts`, `highlights.ts`, `backups.ts`, `users.ts`, `webhooks.ts` | `c.var.api.*` 调用 |
+| REST 路由（管理员） | `packages/api/routes/admin.ts` | `adminAuthMiddleware` |
+| REST 路由（特殊认证） | `packages/api/routes/webhooks.ts`, `rss.ts`, `public/`, `metrics.ts` | 独立认证机制 |
+| tRPC Router 示例 | `packages/trpc/routers/bookmarks.ts`, `tags.ts`, `lists.ts`, `feeds.ts`, `highlights.ts` | `createScopedAuthedProcedure`, `ensure*Ownership` |
+| tRPC Admin Router | `packages/trpc/routers/admin.ts` | `createAdminScopedProcedure` |
 | 测试用例 | `packages/trpc/routers/apiKeys.test.ts` | 完整生命周期/scope 强制/兼容性测试 |
