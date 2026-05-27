@@ -14,7 +14,9 @@
 |------|------|------|
 | 资产数据库 | `packages/shared/assetdb.ts` | 资产存储、读取、缓存管理 |
 | 资产预处理 Worker | `apps/workers/workers/assetPreprocessingWorker.ts` | OCR 识别、PDF 截图生成、文本提取 |
-| 视频处理 Worker | `apps/workers/workers/videoWorker.ts` | 视频下载与转码 |
+| 视频处理 Worker | `apps/workers/workers/videoWorker.ts` | 视频下载（无转码） |
+| 签名令牌 | `packages/shared/signedTokens.ts` | 公共资产访问的签名验证 |
+| 鉴权中间件 | `packages/api/middlewares/auth.ts` | API 访问身份认证 |
 | 资产服务 API | `packages/api/utils/assets.ts` | HTTP 资源服务、流式传输 |
 | 前端预览组件 | `apps/web/components/dashboard/preview/` | UI 渲染、状态管理 |
 
@@ -122,11 +124,148 @@ if (文件 > 20MB && 存在截图) {
 
 ---
 
-## 4. 视频处理流程
+## 4. 鉴权与访问控制
+
+### 4.1 双轨访问机制
+
+Karakeep 采用**受保护访问**和**签名访问**两种并行的资产访问机制：
+
+```
+                        资产访问请求
+                             ↓
+                ┌───────────────────────┐
+                │ 判断访问路径          │
+                └───────────────────────┘
+                       ↓        ↓
+           /api/assets/        /public/assets/
+                ↓                      ↓
+        authMiddleware         unauthedMiddleware
+                ↓                      ↓
+        用户已登录?            验证 signed token
+            ↓   ↓                      ↓
+           是   否              token 有效?
+           ↓   ↓                   ↓   ↓
+   权限检查   401                是   否
+           ↓                       ↓   ↓
+   serveAsset                serveAsset  403
+```
+
+### 4.2 受保护访问流程 (`/api/assets/{assetId}`)
+
+**文件位置**: `packages/api/routes/assets.ts:13-50`
+
+```typescript
+// 中间件执行顺序
+app.use(authMiddleware)  // 1. 强制用户认证
+   .get("/:assetId", 
+     apiKeyScopeMiddleware("assets", "read"),  // 2. API Key 权限检查
+     async (c) => {
+       const asset = await Asset.fromId(c.var.ctx, assetId);
+       await asset.ensureCanView();  // 3. 业务权限检查
+       return serveAsset(c, assetId, asset.asset.userId);
+     }
+   );
+```
+
+**权限检查层级** (`packages/trpc/models/assets.ts:225-260`):
+1. **所有者检查**: `asset.userId === ctx.user.id` → 直接通过
+2. **公开资产**: `assetType === "avatar"` → 直接通过
+3. **关联书签权限**: 检查用户是否有权访问关联的 bookmark
+
+### 4.3 签名访问流程 (`/public/assets/{assetId}`)
+
+**文件位置**: `packages/api/routes/public/assets.ts:14-49`
+
+用于公开分享场景，无需登录，但需要携带签名 token：
+
+```typescript
+// 1. 无需登录，但需要签名 token
+app.get("/:assetId",
+  unauthedMiddleware,  // 仅验证上下文存在，不要求用户登录
+  zValidator("query", z.object({ token: z.string() })),
+  async (c) => {
+    // 2. 验证签名 token
+    const tokenPayload = verifySignedToken(
+      c.req.valid("query").token,
+      serverConfig.signingSecret(),
+      zAssetSignedTokenSchema,
+    );
+    
+    // 3. token 绑定到特定 assetId，防止重用
+    if (tokenPayload.assetId !== assetId) {
+      return 403;
+    }
+    
+    // 4. 验证资产存在性
+    const assetDb = await db.query.assets.findFirst(...);
+    
+    return serveAsset(c, assetId, userId);
+  }
+);
+```
+
+### 4.4 签名令牌机制
+
+**文件位置**: `packages/shared/signedTokens.ts`
+
+```typescript
+// Token 结构
+{
+  payload: {
+    assetId: string,    // 绑定的资产 ID
+    userId: string,     // 资产所有者
+  },
+  expiresAt: number,    // 过期时间戳
+  signature: string,    // HMAC-SHA256 签名
+}
+
+// 过期策略
+const expiresAt = getAlignedExpiry(
+  3600,   // 1小时间隔对齐
+  900,    // 15分钟宽限期
+);
+```
+
+**签名 URL 生成** (`packages/trpc/models/assets.ts:266-281`):
+```typescript
+static getPublicSignedAssetUrl(assetId, assetOwnerId, expireAt) {
+  const payload = { assetId, userId: assetOwnerId };
+  const signedToken = createSignedToken(
+    payload, 
+    serverConfig.signingSecret(), 
+    expireAt
+  );
+  return `${serverConfig.publicApiUrl}/public/assets/${assetId}?token=${signedToken}`;
+}
+```
+
+### 4.5 访问路径选择逻辑
+
+**签名 URL 生成时机** (`packages/trpc/models/bookmarks.ts:768-860`):
+
+```
+asPublicBookmark() 转换为公开视图时
+    ↓
+为每个资产生成带签名的 URL
+    ↓
+├─→ 资产内容 URL: assetUrl = getPublicSignedAssetUrl(assetId)
+├─→ 横幅图片 URL: bannerImageUrl = getPublicSignedAssetUrl(bannerAssetId)
+└─→ 截图 URL: screenshotUrl = getPublicSignedAssetUrl(screenshotAssetId)
+```
+
+**Token 有效期**:
+- 普通列表查询: 10分钟 (`Date.now() + 10 * 60 * 1000`)
+- 公开列表视图: 1小时 + 15分钟宽限期 (`getAlignedExpiry(3600, 900)`)
+
+---
+
+## 5. 视频处理流程（修正：仅下载，无转码）
 
 **文件位置**: `apps/workers/workers/videoWorker.ts`
 
-### 4.1 视频下载转码流程
+### 5.1 视频下载流程（无转码）
+
+**重要修正**: 视频处理仅使用 `yt-dlp` 进行下载，**不执行任何格式转码或编码转换**。下载的视频格式由 yt-dlp 根据远程源自动选择。
 
 ```
 视频链接
@@ -134,17 +273,42 @@ if (文件 > 20MB && 存在截图) {
 URL 规范化 + 重定向验证
     ↓
 yt-dlp 下载 (支持代理)
+│  参数: -f "best[filesize<MAX_SIZE]M"
+│        选择最佳可用格式，不进行转码
     ↓
 临时文件: os.tmpdir()/video_downloads/{assetId}*
+│  yt-dlp 自动添加文件扩展名（.mp4, .webm, .mkv 等）
     ↓
 配额检查 → 保存到 AssetDB
+│  contentType 硬编码为 "video/mp4"
+│  （注意：实际格式可能不是 MP4，此处存在不匹配风险）
     ↓
 更新数据库关联 → 删除旧资产
     ↓
 清理临时文件
 ```
 
-### 4.2 资源释放关键点
+### 5.2 关键实现细节
+
+```typescript
+// packages/shared/assetdb.ts:37-41
+// 支持的视频格式
+export const VIDEO_ASSET_TYPES: Set<string> = new Set<string>([
+  ASSET_TYPES.VIDEO_MP4,    // video/mp4
+  ASSET_TYPES.VIDEO_WEBM,   // video/webm
+  ASSET_TYPES.VIDEO_MKV,    // video/x-matroska
+]);
+
+// videoWorker.ts:206 - 硬编码为 MP4，但实际可能不是
+metadata: { contentType: ASSET_TYPES.VIDEO_MP4 },
+```
+
+**潜在问题**: 
+- 下载的视频格式取决于远程源，可能是 webm、mkv 等
+- 但 contentType 被硬编码为 `video/mp4`
+- 浏览器播放时依赖文件实际内容而非 Content-Type 头
+
+### 5.3 资源释放关键点
 
 1. **下载取消**: `execa("yt-dlp", { cancelSignal: job.abortSignal })` (L155-157)
 2. **失败清理**: `deleteLeftOverAssetFile()` 在异常时调用 (L183, L234)
@@ -152,9 +316,9 @@ yt-dlp 下载 (支持代理)
 
 ---
 
-## 5. 前端预览状态机
+## 6. 前端预览状态机
 
-### 5.1 BookmarkPreview 主状态机
+### 6.1 BookmarkPreview 主状态机
 
 **文件位置**: `apps/web/components/dashboard/preview/BookmarkPreview.tsx`
 
@@ -171,7 +335,7 @@ yt-dlp 下载 (支持代理)
     └─→ ASSET → AssetContentSection
 ```
 
-### 5.2 AssetContentSection 分支逻辑
+### 6.2 AssetContentSection 分支逻辑
 
 **文件位置**: `apps/web/components/dashboard/preview/AssetContentSection.tsx:107-118`
 
@@ -188,7 +352,7 @@ ASSET 类型
 - 用户通过 `<Select>` 手动切换
 - 初始状态由文件大小 + 截图存在性决定
 
-### 5.3 LinkContentSection 多视图状态机
+### 6.3 LinkContentSection 多视图状态机
 
 **文件位置**: `apps/web/components/dashboard/preview/LinkContentSection.tsx:118-291`
 
@@ -210,7 +374,7 @@ LINK 类型
 - 使用 `nuqs` 的 `useQueryState` 持久化到 URL query 参数
 - 默认视图: 优先自定义渲染器，其次 "cached"
 
-### 5.4 ReaderView 阅读状态机
+### 6.4 ReaderView 阅读状态机
 
 **文件位置**: `apps/web/components/dashboard/preview/ReaderView.tsx`
 
@@ -226,11 +390,11 @@ ReaderView
 
 ---
 
-## 6. HTTP 资源服务层
+## 7. HTTP 资源服务层
 
 **文件位置**: `packages/api/utils/assets.ts:12-75`
 
-### 6.1 服务流程
+### 7.1 服务流程
 
 ```
 GET /api/assets/{assetId}
@@ -250,7 +414,7 @@ Range 头检测?
 流式传输 (hono/streaming)
 ```
 
-### 6.2 安全策略
+### 7.2 安全策略
 
 **内容安全策略** (CSP):
 ```
@@ -263,9 +427,9 @@ media-src https: data: blob:     ; 媒体来源
 
 ---
 
-## 7. 资源释放机制
+## 8. 资源释放机制
 
-### 7.1 服务器端资源释放
+### 8.1 服务器端资源释放
 
 | 资源类型 | 释放位置 | 释放方式 |
 |---------|---------|---------|
@@ -275,7 +439,7 @@ media-src https: data: blob:     ; 媒体来源
 | 旧版本资产 | `videoWorker.ts:224` | `silentDeleteAsset()` |
 | S3 连接 | S3Client 内部 | 连接池管理 |
 
-### 7.2 客户端资源释放
+### 8.2 客户端资源释放
 
 **注意**: 当前前端代码未显式实现组件卸载时的资源清理：
 
@@ -301,9 +465,9 @@ useEffect(() => {
 
 ---
 
-## 8. 缓存层级设计
+## 9. 缓存层级设计
 
-### 8.1 多层缓存策略
+### 9.1 多层缓存策略
 
 ```
 ┌─────────────────────────────────┐
@@ -329,7 +493,7 @@ useEffect(() => {
 └─────────────────────────────────┘
 ```
 
-### 8.2 缓存失效机制
+### 9.2 缓存失效机制
 
 1. **浏览器缓存**: 基于 `immutable` 标志，资产 ID 变化时自动失效
 2. **React Query**: 通过 `refetchInterval` 轮询更新（正在抓取的 bookmark）
@@ -337,9 +501,9 @@ useEffect(() => {
 
 ---
 
-## 9. 类型分支汇总
+## 10. 类型分支汇总
 
-### 9.1 Bookmark 类型分支
+### 10.1 Bookmark 类型分支
 
 | 类型 | 预览方式 | 预处理 |
 |------|---------|--------|
@@ -348,7 +512,7 @@ useEffect(() => {
 | ASSET (image) | ImageContentSection | OCR 文本提取 |
 | ASSET (pdf) | PDF iframe / Screenshot | 文本提取 + 首页截图 |
 
-### 9.2 资产类型枚举
+### 10.2 资产类型枚举
 
 **文件位置**: `packages/shared/assetdb.ts:23-70`
 
@@ -360,9 +524,9 @@ useEffect(() => {
 
 ---
 
-## 10. 关键代码路径
+## 11. 关键代码路径
 
-### 10.1 打开附件预览的完整调用链
+### 11.1 打开附件预览的完整调用链
 
 ```
 用户点击书签
@@ -384,7 +548,7 @@ BookmarkPreview.tsx
          ↳ 或其他视图
 ```
 
-### 10.2 预处理调用链
+### 11.2 预处理调用链
 
 ```
 资产创建
@@ -407,31 +571,206 @@ assetPreprocessingWorker.run()
 
 ---
 
+## 12. PDF 与截图视图状态一致性分析
+
+### 12.1 初始状态选择逻辑
+
+**文件位置**: `apps/web/components/dashboard/preview/AssetContentSection.tsx:20-41`
+
+```typescript
+const initialSection = useMemo(() => {
+  const screenshot = bookmark.assets.find(
+    (item) => item.assetType === "assetScreenshot",
+  );
+  const bigSize =
+    bookmark.content.size && bookmark.content.size > BIG_FILE_SIZE;
+  if (bigSize && screenshot) {
+    return "screenshot";
+  }
+  return "pdf";
+}, [bookmark]);
+
+const [section, setSection] = useState(initialSection);
+```
+
+**状态初始化时机**:
+- `useMemo` 仅在 `bookmark` 引用变化时重新计算
+- `useState(initialSection)` 仅在组件**首次挂载**时使用初始值
+- 后续 `bookmark` 数据更新**不会**自动改变 `section` 状态
+
+### 12.2 数据刷新机制
+
+**文件位置**: `apps/web/components/dashboard/preview/BookmarkPreview.tsx:141-156`
+
+```typescript
+const { data: bookmark } = useQuery(
+  api.bookmarks.getBookmark.queryOptions(
+    { bookmarkId },
+    {
+      initialData,
+      refetchInterval: (query) => {
+        const data = query.state.data;
+        if (!data) return false;
+        return getBookmarkRefreshInterval(data);
+      },
+    }
+  ),
+);
+```
+
+**刷新触发条件** (`packages/shared/utils/bookmarkUtils.ts`):
+- 正在抓取的 bookmark: 2秒轮询
+- 预处理中 (taggingStatus/summarizationStatus === "pending"): 2秒轮询
+- 其他情况: 不自动刷新
+
+### 12.3 状态不一致场景分析
+
+#### 场景1: 截图生成完成后视图不自动切换
+
+```
+时间线:
+t0: 用户打开 PDF (文件 > 20MB, 无截图)
+    → initialSection = "pdf"
+    → section = "pdf" (显示 iframe)
+
+t1: 后台 Worker 完成 PDF 截图生成
+    → bookmark.assets 新增 assetScreenshot
+
+t2: React Query 轮询获取更新后的 bookmark
+    → bookmark 引用变化
+    → useMemo 重新计算: initialSection = "screenshot"
+    → ⚠️  section 仍为 "pdf" (useState 不更新)
+```
+
+**问题**: 截图已生成，但用户仍看到 PDF iframe，不会自动切换到轻量的截图视图。
+
+#### 场景2: 用户手动切换后数据刷新
+
+```
+t0: 大 PDF 已有截图
+    → initialSection = "screenshot"
+    → section = "screenshot"
+
+t1: 用户手动切换到 "pdf" 视图
+    → section = "pdf"
+
+t2: 其他字段更新触发 bookmark 刷新
+    → bookmark 引用变化
+    → useMemo 重新计算: initialSection = "screenshot"
+    → ⚠️  section 仍为 "pdf" (覆盖用户选择)
+```
+
+**问题**: 用户的手动选择在数据刷新后被保留，但初始逻辑意图可能已失效。
+
+#### 场景3: 预处理中打开预览
+
+```
+t0: PDF 上传完成，开始预处理
+    → bookmark.content.size 可能为 null
+    → initialSection = "pdf" (因 size 判断失败)
+    → section = "pdf"
+
+t1: 预处理完成，size 更新为 25MB，截图生成
+    → bookmark 刷新
+    → initialSection = "screenshot"
+    → ⚠️  section 仍为 "pdf"
+```
+
+**问题**: 预处理完成后，大小信息可用，但视图策略不会自动调整。
+
+### 12.4 状态同步实现方案对比
+
+| 方案 | 实现方式 | 优点 | 缺点 |
+|------|---------|------|------|
+| **当前实现** | `useState(initialSection)` + 手动 `setSection` | 尊重用户选择，不自动切换 | 新截图生成后不更新视图 |
+| **useDerivedState** | `useEffect(() => setSection(initialSection), [initialSection])` | 数据变化时自动同步 | 可能覆盖用户手动选择 |
+| **条件同步** | 仅在用户未手动切换时自动更新 | 平衡自动同步和用户选择 | 实现复杂度增加 |
+| **key 重置** | 给组件添加 `key={bookmark.id}` | bookmark 变化时完全重置状态 | 会丢失所有本地状态 |
+
+### 12.5 建议的改进方案
+
+```typescript
+// 方案: 跟踪用户是否手动切换过
+const [section, setSection] = useState(initialSection);
+const [userManuallyChanged, setUserManuallyChanged] = useState(false);
+
+// 仅在用户未手动切换时，自动同步新的初始状态
+useEffect(() => {
+  if (!userManuallyChanged) {
+    setSection(initialSection);
+  }
+}, [initialSection, userManuallyChanged]);
+
+// 用户手动切换时标记
+const handleSectionChange = (newSection: string) => {
+  setUserManuallyChanged(true);
+  setSection(newSection);
+};
+```
+
+### 12.6 公开视图中的签名 URL 过期问题
+
+**文件位置**: `packages/trpc/models/bookmarks.ts:768-776`
+
+```typescript
+const getPublicSignedAssetUrl = (assetId: string) => {
+  return Asset.getPublicSignedAssetUrl(
+    assetId,
+    this.bookmark.userId,
+    getAlignedExpiry(3600, 900),  // 1小时 + 15分钟宽限期
+  );
+};
+```
+
+**状态不一致风险**:
+1. 公开页面加载时生成签名 URL（有效期1小时）
+2. 用户停留超过1小时后切换到 PDF 视图
+3. iframe 请求 `/public/assets/{id}?token=...`
+4. token 已过期 → 403 错误
+5. 页面无刷新机制 → URL 不会自动更新
+
+**缓解方案**:
+- 缩短过期时间但增加刷新频率
+- 或在前端检测到 403 时触发数据刷新获取新 token
+
+---
+
 ## 总结
 
 ### 设计优点
 
-1. **分层缓存**: 浏览器 → React Query → 预处理结果 → 存储层，多级优化
-2. **流式处理**: 大文件通过流传输，避免内存溢出
-3. **队列解耦**: 耗时操作（OCR、视频下载）通过 Worker 队列异步处理
-4. **安全可靠**: 严格的 CSP、沙箱 iframe、配额检查
-5. **多后端支持**: 本地 FS 和 S3 统一接口
+1. **双轨鉴权**: 受保护访问（登录用户）+ 签名访问（公开分享），灵活覆盖多种场景
+2. **分层缓存**: 浏览器 → React Query → 预处理结果 → 存储层，多级优化
+3. **流式处理**: 大文件通过流传输，避免内存溢出
+4. **队列解耦**: 耗时操作（OCR、视频下载）通过 Worker 队列异步处理
+5. **安全可靠**: 严格的 CSP、沙箱 iframe、配额检查
+6. **多后端支持**: 本地 FS 和 S3 统一接口
+7. **签名令牌**: HMAC-SHA256 签名 + 过期时间对齐，安全且高效
 
 ### 关注点
 
 1. **前端资源释放**: iframe/video 元素缺少显式清理
-2. **状态复杂度**: 多视图切换 + 多类型分支，维护成本较高
-3. **错误边界**: 自定义渲染器有 ErrorBoundary，但基础视图缺少
-4. **内存占用**: 大 PDF iframe 可能导致浏览器内存累积
+2. **状态一致性**: PDF 与截图视图在数据刷新后不会自动同步
+3. **状态复杂度**: 多视图切换 + 多类型分支，维护成本较高
+4. **视频格式**: 视频下载无转码，ContentType 硬编码可能与实际格式不匹配
+5. **错误边界**: 自定义渲染器有 ErrorBoundary，但基础视图缺少
+6. **内存占用**: 大 PDF iframe 可能导致浏览器内存累积
+7. **签名 URL 过期**: 公开页面签名 URL 1小时过期，长时间停留后访问失败
 
 ### 关键文件速查表
 
 | 文件 | 核心职责 |
 |------|---------|
 | `packages/shared/assetdb.ts` | 资产存储抽象 |
+| `packages/shared/signedTokens.ts` | 签名令牌生成与验证 |
+| `packages/api/middlewares/auth.ts` | 鉴权中间件 |
+| `packages/api/routes/assets.ts` | 受保护资产路由 |
+| `packages/api/routes/public/assets.ts` | 公开签名资产路由 |
 | `packages/api/utils/assets.ts` | HTTP 资源服务 |
 | `apps/workers/workers/assetPreprocessingWorker.ts` | OCR + PDF 处理 |
-| `apps/workers/workers/videoWorker.ts` | 视频下载 |
+| `apps/workers/workers/videoWorker.ts` | 视频下载（无转码） |
 | `apps/web/components/dashboard/preview/BookmarkPreview.tsx` | 预览入口 |
 | `apps/web/components/dashboard/preview/AssetContentSection.tsx` | 资产类型分支 |
 | `apps/web/components/dashboard/preview/LinkContentSection.tsx` | 链接多视图 |
+| `packages/trpc/models/assets.ts` | 资产模型与权限检查 |
+| `packages/trpc/models/bookmarks.ts` | 书签模型与公开视图转换 |
