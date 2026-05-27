@@ -495,35 +495,61 @@ useEffect(() => {
 
 ### 9.2 轮询触发机制与刷新节奏
 
-**轮询触发位置**:
-轮询仅在两个组件中激活：
+#### 9.2.1 轮询触发位置
+
+轮询仅在两个组件中通过 `refetchInterval` 动态计算激活：
 1. `BookmarkPreview.tsx:148-154` - 预览弹窗/页面
 2. `BookmarkCard.tsx:29-35` - 列表中的单个书签卡片
 
-**轮询激活条件**:
+#### 9.2.2 刷新触发条件（三层判断）
+
+**第一层: React Query 回调判断**
 ```typescript
 // BookmarkPreview.tsx:148-154
 refetchInterval: (query) => {
   const data = query.state.data;
   if (!data) {
-    return false;
+    return false;  // 无数据时不轮询
   }
-  return getBookmarkRefreshInterval(data);  // 非加载状态返回 false
+  return getBookmarkRefreshInterval(data);
 }
 ```
 
-**渐进式退避刷新策略** (`packages/shared/utils/bookmarkUtils.ts:56-83`):
+**第二层: 加载状态总判断** (`packages/shared/utils/bookmarkUtils.ts:48-54`)
+```typescript
+function isBookmarkStillLoading(bookmark) {
+  return (
+    isBookmarkStillTagging(bookmark) ||      // taggingStatus == "pending"
+    isBookmarkStillCrawling(bookmark) ||     // crawlStatus == "pending" 或 !crawledAt
+    isBookmarkStillSummarizing(bookmark)     // summarizationStatus == "pending"
+  );
+}
+```
+
+**第三层: 各子状态详细判断**
+
+| 条件 | 触发刷新 | 说明 |
+|------|---------|------|
+| `taggingStatus === "pending"` | ✅ 是 | 标签生成中 |
+| `summarizationStatus === "pending"` | ✅ 是 | 摘要生成中 |
+| `crawlStatus === "pending"` | ✅ 是 | 网页抓取中 |
+| `!crawledAt && type === LINK` | ✅ 是 | 从未抓取过的链接 |
+| 以上都不满足 | ❌ 否 | 所有处理完成，停止轮询 |
+
+#### 9.2.3 渐进式退避刷新策略
+
+**文件位置**: `packages/shared/utils/bookmarkUtils.ts:56-83`
 
 ```typescript
 export function getBookmarkRefreshInterval(
   bookmark: ZBookmark,
 ): number | false {
-  // 1. 非加载状态: 不刷新
+  // 1. 非加载状态: 立即返回 false，停止刷新
   if (!isBookmarkStillLoading(bookmark)) {
     return false;
   }
 
-  // 2. 前30秒: 每秒刷新一次
+  // 2. 前30秒: 每秒刷新一次（高实时性）
   if (Date.now() - bookmark.createdAt < 30 * 1000) {
     return 1000;  // 1秒
   }
@@ -538,23 +564,13 @@ export function getBookmarkRefreshInterval(
     return 60_000;  // 60秒
   }
 
-  // 5. 超过6小时: 停止刷新
+  // 5. 超过6小时: 强制停止刷新
   return false;
 }
 ```
 
-**加载状态判断** (`packages/shared/utils/bookmarkUtils.ts:48-54`):
-```typescript
-function isBookmarkStillLoading(bookmark) {
-  return (
-    isBookmarkStillTagging(bookmark) ||      // taggingStatus == "pending"
-    isBookmarkStillCrawling(bookmark) ||     // crawlStatus == "pending" 或 !crawledAt
-    isBookmarkStillSummarizing(bookmark)     // summarizationStatus == "pending"
-  );
-}
-```
+#### 9.2.4 实际轮询节奏示例
 
-**实际轮询节奏示例**:
 ```
 用户创建书签 (t=0)
     ↓
@@ -569,10 +585,21 @@ t>6小时: 停止刷新
 总计: 约437次请求 / 书签 (完整加载周期)
 ```
 
-**重要限制**:
-- 轮询**仅在组件挂载时**生效
-- 用户关闭预览弹窗或离开页面时，轮询自动停止
-- 公开列表页面 (`PublicBookmarkGrid`) **没有轮询机制**
+**关键发现**:
+- 时间基准是 `bookmark.createdAt`（书签创建时间），**不是**组件挂载时间
+- 即使组件在 t=5分钟 时才挂载，也会立即进入 10秒 间隔的轮询阶段
+- 书签创建超过6小时后，无论处理状态如何，**强制停止轮询**
+
+#### 9.2.5 轮询生命周期边界
+
+| 场景 | 轮询行为 |
+|------|---------|
+| 组件首次挂载 | 立即触发一次查询，然后按间隔轮询 |
+| 组件卸载 | React Query 自动清理定时器 |
+| 用户关闭预览弹窗 | Dialog 关闭 → 组件卸载 → 轮询停止 |
+| 切换到其他书签 | bookmarkId 变化 → 旧查询取消 → 新查询开始 |
+| 处理完成 (所有状态非 pending) | getBookmarkRefreshInterval 返回 false → 轮询停止 |
+| 公开页面 PublicBookmarkGrid | 无轮询机制，数据静态 |
 
 ### 9.3 React Query 缓存配置
 
@@ -603,7 +630,7 @@ new QueryClient({
 
 ---
 
-## 10. LinkContentSection 视图恢复与路径冲突分析
+## 10. LinkContentSection 视图恢复、路径界限与降级路径分析
 
 ### 10.1 查询参数恢复机制（仅受保护路径）
 
@@ -617,10 +644,14 @@ const [section, setSection] = useQueryState("section", {
 });
 ```
 
-**适用范围**:
-- ✅ 受保护预览页面: `/dashboard/preview/[bookmarkId]`
-- ✅ 受保护预览弹窗: `/dashboard/@modal/(.)preview/[bookmarkId]`
-- ❌ 公开列表页面: `/public/lists/[listId]` (无此组件)
+**适用范围界限**:
+| 路径类型 | URL 模式 | 是否支持 ?section= | 组件 |
+|---------|---------|-------------------|------|
+| ✅ 受保护预览页面 | `/dashboard/preview/[bookmarkId]` | 是 | `LinkContentSection` |
+| ✅ 受保护预览弹窗 | `/dashboard/@modal/(.)preview/[bookmarkId]` | 是 | `LinkContentSection` |
+| ❌ 受保护列表页面 | `/dashboard/bookmarks` | 否 | 无预览组件 |
+| ❌ 公开列表页面 | `/public/lists/[listId]` | 否 | `PublicBookmarkGrid` (仅卡片) |
+| ❌ 公开单个书签 | 不存在此路由 | - | - |
 
 **视图恢复流程**:
 ```
@@ -635,35 +666,38 @@ const [section, setSection] = useQueryState("section", {
               └─→ 无 → "cached"
 ```
 
-**nuqs useQueryState 行为**:
+**nuqs useQueryState 关键行为**:
 - 参数缺失时返回 `defaultValue`
-- 不自动验证参数值的有效性（如对应资产是否存在）
+- **不自动验证**参数值的有效性（如对应资产是否存在）
 - `defaultValue` 不会同步回 URL
+- 值变化时自动更新 URL query 参数
 
-### 10.2 受保护路径 vs 公开路径：核心差异
+### 10.2 受保护路径 vs 公开路径：核心差异与界限
 
-#### 10.2.1 数据结构差异
+#### 10.2.1 数据结构与访问路径界限
 
-| 特性 | 受保护路径 (`ZBookmark`) | 公开路径 (`ZPublicBookmark`) |
-|------|-------------------------|----------------------------|
-| 资产引用方式 | 存储 `assetId` (字符串) | 存储 `assetUrl` (完整签名URL) |
-| 资产访问路径 | 前端拼接: `/api/assets/{assetId}` | 后端生成: `/public/assets/{assetId}?token=xxx` |
-| 多视图支持 | ✅ 支持 (cached/screenshot/archive/video/pdf) | ❌ 不支持 (仅卡片展示) |
-| URL 参数恢复 | ✅ `?section=` | ❌ 无意义 |
-| 轮询刷新 | ✅ 渐进式退避 | ❌ 无轮询 |
+| 维度 | 受保护路径 (`ZBookmark`) | 公开路径 (`ZPublicBookmark`) | 界限说明 |
+|------|-------------------------|----------------------------|---------|
+| 资产引用方式 | 存储 `assetId` (字符串) | 存储 `assetUrl` (完整URL) | 受保护路径前端拼接，公开路径后端生成 |
+| 资产访问路径 | `/api/assets/{assetId}` | `/public/assets/{id}?token=xxx` | 两条完全独立的路由 |
+| 鉴权方式 | Cookie + Session | Signed Token (HMAC) | 互斥，不能混用 |
+| 多视图支持 | ✅ 6种视图切换 | ❌ 仅卡片展示 | 功能边界完全不同 |
+| URL 参数恢复 | ✅ `?section=` 有效 | ❌ 参数被忽略 | 公开页面无解析逻辑 |
+| 轮询刷新 | ✅ 渐进式退避 | ❌ 静态数据 | 公开页面无轮询机制 |
 
-#### 10.2.2 资产 URL 生成路径
+#### 10.2.2 资产 URL 生成路径界限
 
-**受保护路径** (`packages/shared/utils/assetUtils.ts:1-3`):
+**受保护路径（前端拼接）** (`packages/shared/utils/assetUtils.ts:1-3`):
 ```typescript
 export function getAssetUrl(assetId: string) {
-  return `/api/assets/${assetId}`;  // 简单拼接，依赖 Cookie 鉴权
+  return `/api/assets/${assetId}`;  // 依赖 Cookie 鉴权，无签名
 }
 ```
+→ **界限**: 仅在登录用户的 dashboard 上下文中有效
 
-**公开路径** (`packages/trpc/models/bookmarks.ts:768-860`):
+**公开路径（服务端签名）** (`packages/trpc/models/bookmarks.ts:768-860`):
 ```typescript
-// 服务端生成签名 URL
+// 服务端生成签名 URL，绑定 userId + assetId + 过期时间
 const getPublicSignedAssetUrl = (assetId: string) => {
   return Asset.getPublicSignedAssetUrl(
     assetId,
@@ -671,101 +705,202 @@ const getPublicSignedAssetUrl = (assetId: string) => {
     getAlignedExpiry(3600, 900),  // 1小时 + 15分钟宽限期
   );
 };
-
-// 返回给前端时已包含完整 URL
-// ZPublicBookmark.content.assetUrl = "https://.../public/assets/abc?token=xxx"
+// 返回格式: /public/assets/{assetId}?token={signed_jwt}
 ```
+→ **界限**: 仅在服务端生成，前端直接使用，不能修改
 
-#### 10.2.3 预览功能差异
+#### 10.2.3 预览功能流程界限
 
-**受保护预览流程**:
+**受保护预览完整流程**:
 ```
-用户点击书签卡片
+用户点击书签 (dashboard内)
     ↓
-导航到 /dashboard/preview/[bookmarkId] 或打开弹窗
+导航到 /dashboard/preview/[bookmarkId]
     ↓
-BookmarkPreview 组件挂载
+BookmarkPreview 挂载
     ↓
-useQuery 加载 bookmark 数据 (含轮询)
+useQuery 加载 bookmark (含轮询)
     ↓
 LinkContentSection 渲染
     ↓
-useQueryState 从 ?section= 恢复视图
+useQueryState 解析 ?section= 参数
     ↓
-根据 section 渲染对应组件
+根据 section 选择子组件
+    ├─→ cached → ReaderView (重新查询 htmlContent)
+    ├─→ screenshot → ScreenshotSection (/api/assets/xxx)
+    ├─→ archive → FullPageArchiveSection (/api/assets/xxx)
+    ├─→ video → VideoSection (/api/assets/xxx)
+    └─→ pdf → PDFSection (/api/assets/xxx)
     ↓
-组件内部拼接 /api/assets/{assetId}
+浏览器请求 /api/assets/xxx (带 Cookie)
     ↓
-浏览器发起请求 (带 Cookie)
+authMiddleware 验证 Session
     ↓
-authMiddleware 验证用户身份
+Asset.ensureCanView() 检查权限
     ↓
 返回资产内容
 ```
 
-**公开页面流程**:
+**公开页面流程（无预览组件）**:
 ```
 用户访问 /public/lists/[listId]
     ↓
-服务端渲染 PublicBookmarkGrid
+服务端 RSC 获取 ZPublicBookmark 列表
     ↓
-ZPublicBookmark 数据已包含签名 assetUrl
+PublicBookmarkGrid 渲染卡片
     ↓
-PublicBookmarkCard 渲染
+用户点击资产链接
     ↓
-点击资产 → 直接跳转到 assetUrl (新标签页)
+新标签页打开 assetUrl (/public/assets/xxx?token=xxx)
     ↓
-浏览器请求 /public/assets/{assetId}?token=xxx
+浏览器请求（无 Cookie）
     ↓
 verifySignedToken 验证签名
+    ↓
+检查 token.assetId === 路径 assetId
     ↓
 返回资产内容
 ```
 
-### 10.3 路径冲突点分析
+### 10.3 路径冲突点与失败降级路径
 
-#### 冲突点1: LinkContentSection 硬编码受保护路径
+#### 10.3.1 冲突点1: LinkContentSection 硬编码受保护路径
 
-**问题**: `LinkContentSection` 中的子组件全部硬编码使用 `/api/assets/` 路径：
+**代码位置**: `apps/web/components/dashboard/preview/LinkContentSection.tsx:65-116`
 
 ```typescript
-// LinkContentSection.tsx:65-76
+// 所有子组件全部硬编码 /api/assets/ 路径
 function FullPageArchiveSection({ link }) {
   const archiveAssetId = link.fullPageArchiveAssetId ?? link.precrawledArchiveAssetId;
-  return <iframe src={`/api/assets/${archiveAssetId}`} />;  // 硬编码受保护路径
+  return <iframe src={`/api/assets/${archiveAssetId}`} />;  // 受保护路径
 }
 
-// VideoSection.tsx:94-106
 function VideoSection({ link }) {
-  return <video><source src={`/api/assets/${link.videoAssetId}`} /></video>;  // 硬编码
+  return <video><source src={`/api/assets/${link.videoAssetId}`} /></video>;
 }
 
-// ScreenshotSection.tsx:78-92
 function ScreenshotSection({ link }) {
-  return <Image src={`/api/assets/${link.screenshotAssetId}`} />;  // 硬编码
+  return <Image src={`/api/assets/${link.screenshotAssetId}`} />;
+}
+
+function PDFSection({ link }) {
+  return <iframe src={`/api/assets/${link.pdfAssetId}`} />;
 }
 ```
 
-**冲突场景**:
-如果尝试在公开页面中复用 `LinkContentSection` 组件，会导致：
-1. 资产请求路径为 `/api/assets/{id}`（受保护路径）
-2. 公开页面用户未登录，Cookie 不存在
-3. `authMiddleware` 返回 401 错误
-4. 所有资产无法加载
+**冲突场景：在公开页面误用组件**
+```
+尝试在 /public/lists/[listId] 中使用 LinkContentSection
+    ↓
+组件渲染 VideoSection
+    ↓
+请求 /api/assets/xxx (无 Cookie)
+    ↓
+authMiddleware 返回 401 Unauthorized
+    ↓
+video 元素显示加载失败
+    ↓
+❌ 无降级处理，仅显示浏览器默认错误
+```
 
-#### 冲突点2: URL 参数在公开页面无意义
+**降级路径：无自动降级**
+- 组件不会检测 401/403 错误
+- 不会自动切换到其他视图
+- 不会提示用户登录
 
-**问题**: `?section=` 参数仅在 `LinkContentSection` 中解析：
-- 公开页面没有 `LinkContentSection` 组件
-- 即使手动添加 `?section=video` 到公开页面 URL，也不会生效
-- 公开页面点击资产直接跳转原始 URL，不支持多视图切换
+#### 10.3.2 冲突点2: URL 参数恢复与资产存在性校验缺失
 
-#### 冲突点3: 轮询机制仅适用于受保护路径
+**问题**: `useQueryState` 直接使用 URL 参数值，不校验资产是否存在
 
-**问题**: 公开页面的书签数据是静态的：
-- 服务端一次性获取，没有轮询刷新
-- 预处理完成后，公开页面不会自动更新
-- 用户需要手动刷新页面才能看到新生成的截图/归档
+```typescript
+// LinkContentSection.tsx:128-130
+const [section, setSection] = useQueryState("section", {
+  defaultValue: defaultSection,
+});
+// ⚠️ 没有检查: section 对应的 assetId 是否存在
+```
+
+**失败场景：URL 指定无效视图**
+```
+用户访问 ?bookmarkId=123&section=video
+    ↓
+bookmark.videoAssetId = null (视频资产不存在)
+    ↓
+section = "video" (从 URL 恢复)
+    ↓
+SelectItem video 被 disabled (UI 禁用)
+    ↓
+SelectValue 仍显示 "video" (无效值)
+    ↓
+VideoSection 渲染
+    ↓
+<source src={`/api/assets/null`}>
+    ↓
+GET /api/assets/null → 404 Not Found
+    ↓
+❌ 无降级，video 显示空白
+```
+
+**降级路径：无自动回退**
+- Select 组件显示无效值（Radix UI 行为未定义）
+- 不会自动回退到 defaultSection
+- 用户需要手动选择其他视图
+
+#### 10.3.3 冲突点3: ReaderView 内容加载失败降级
+
+**ReaderView 有降级处理** (`apps/web/components/dashboard/preview/ReaderView.tsx:112-133`):
+```typescript
+const { data: cachedContent, isPending: isCachedContentLoading } = useQuery(
+  api.bookmarks.getBookmark.queryOptions(
+    { bookmarkId, includeContent: true },
+    { select: (data) => data.content.htmlContent ?? null }
+  )
+);
+
+if (isCachedContentLoading) {
+  content = <FullPageSpinner />;                    // 降级1: 加载中显示 spinner
+} else if (!cachedContent) {
+  content = <FileX 图标 + 错误提示>;               // 降级2: 无内容显示友好错误
+} else {
+  content = <BookmarkHTMLHighlighter />;           // 正常渲染
+}
+```
+✅ **ReaderView 是唯一有完整降级路径的视图**
+
+#### 10.3.4 冲突点4: 自定义渲染器 ErrorBoundary 降级
+
+**自定义渲染器有降级** (`LinkContentSection.tsx:144-148`):
+```typescript
+<ErrorBoundary FallbackComponent={CustomRendererErrorFallback}>
+  <RendererComponent bookmark={bookmark} />
+</ErrorBoundary>
+```
+
+**降级组件** (`LinkContentSection.tsx:45-63`):
+```typescript
+function CustomRendererErrorFallback({ error }) {
+  return (
+    <Alert variant="destructive">
+      <AlertTitle>Renderer Error</AlertTitle>
+      <AlertDescription>
+        Failed to load custom content renderer.
+        <details><code>{error.message}</code></details>
+      </AlertDescription>
+    </Alert>
+  );
+}
+```
+✅ **自定义渲染器有 ErrorBoundary 降级**
+
+#### 10.3.5 其他视图：无降级路径
+
+| 视图组件 | 错误场景 | 降级行为 |
+|---------|---------|---------|
+| ScreenshotSection | assetId = null | 请求 `/api/assets/null` → 404 → Next.js Image 报错 |
+| VideoSection | assetId = null | 请求 `/api/assets/null` → 404 → 显示 "Not supported" |
+| FullPageArchiveSection | assetId = null | 请求 `/api/assets/null` → 404 → iframe 空白 |
+| PDFSection | assetId = null | 请求 `/api/assets/null` → 404 → iframe 空白 |
+| 以上所有 | 签名 token 过期 | 403 → 浏览器默认错误 |
 
 ### 10.4 禁用项与资产缺失检测
 
@@ -1242,17 +1377,25 @@ const getPublicSignedAssetUrl = (assetId: string) => {
 2. **视图状态一致性**:
    - PDF 与截图视图在数据刷新后不会自动同步
    - URL 参数恢复视图时不校验资产是否存在
-3. **路径耦合**: `LinkContentSection` 硬编码 `/api/assets/` 路径，无法在公开页面复用
+3. **路径耦合界限**:
+   - `LinkContentSection` 硬编码 `/api/assets/` 路径
+   - 受保护/公开路径完全独立，组件不能跨路径复用
+   - 误用会导致 401/403 错误，无降级处理
 4. **状态复杂度**: 多视图切换 + 多类型分支，维护成本较高
 5. **视频格式**: 视频下载无转码，ContentType 硬编码可能与实际格式不匹配
-6. **降级处理不完善**:
-   - 自定义渲染器有 ErrorBoundary，但基础视图缺少
-   - 资产 ID 为 null 时直接请求无效 URL
-   - 签名 token 过期时显示浏览器默认错误，用户体验差
+6. **降级处理不完善（分层）**:
+   - ✅ ReaderView: 完整降级（加载中 → 无内容）
+   - ✅ 自定义渲染器: ErrorBoundary 降级
+   - ❌ Screenshot/Video/Archive/PDF: 无降级，直接请求无效 URL
+   - ❌ 签名 token 过期: 显示浏览器默认错误
 7. **内存占用**: 大 PDF iframe 可能导致浏览器内存累积
 8. **签名 URL 过期**: 公开页面签名 URL 1小时过期，长时间停留后访问失败
-9. **无效参数处理**: Select 可能显示已 disabled 的值，行为未定义
-10. **轮询成本**: 完整加载周期约 437 次请求/书签，高并发场景需关注
+9. **无效参数处理**: Select 可能显示已 disabled 的值，Radix UI 行为未定义
+10. **轮询成本**:
+    - 时间基准是 `bookmark.createdAt`（不是组件挂载时间）
+    - 完整加载周期约 437 次请求/书签
+    - 6小时后强制停止，即使处理未完成
+11. **轮询触发条件**: 三层判断（数据存在 → 加载状态 → 时间退避）
 
 ### 关键文件速查表
 
