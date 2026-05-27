@@ -493,17 +493,337 @@ useEffect(() => {
 └─────────────────────────────────┘
 ```
 
-### 9.2 缓存失效机制
+### 9.2 刷新时间策略
+
+**文件位置**: `packages/shared/utils/bookmarkUtils.ts:56-83`
+
+采用**渐进式退避刷新策略**，根据 bookmark 年龄动态调整轮询间隔：
+
+```typescript
+export function getBookmarkRefreshInterval(
+  bookmark: ZBookmark,
+): number | false {
+  // 1. 非加载状态: 不刷新
+  if (!isBookmarkStillLoading(bookmark)) {
+    return false;
+  }
+
+  // 2. 前30秒: 每秒刷新一次
+  if (Date.now() - bookmark.createdAt < 30 * 1000) {
+    return 1000;  // 1秒
+  }
+
+  // 3. 30秒 ~ 10分钟: 每10秒刷新一次
+  if (Date.now() - bookmark.createdAt < 10 * 60 * 1000) {
+    return 10_000;  // 10秒
+  }
+
+  // 4. 10分钟 ~ 6小时: 每分钟刷新一次
+  if (Date.now() - bookmark.createdAt < 6 * 60 * 60 * 1000) {
+    return 60_000;  // 60秒
+  }
+
+  // 5. 超过6小时: 停止刷新
+  return false;
+}
+```
+
+**加载状态判断** (`packages/shared/utils/bookmarkUtils.ts:48-54`):
+```typescript
+function isBookmarkStillLoading(bookmark) {
+  return (
+    isBookmarkStillTagging(bookmark) ||      // taggingStatus == "pending"
+    isBookmarkStillCrawling(bookmark) ||     // crawlStatus == "pending" 或 !crawledAt
+    isBookmarkStillSummarizing(bookmark)     // summarizationStatus == "pending"
+  );
+}
+```
+
+### 9.3 React Query 缓存配置
+
+**文件位置**: `apps/web/lib/providers.tsx:23-33`
+
+```typescript
+// 全局默认配置
+new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 60 * 1000,  // 数据60秒后视为陈旧
+    },
+  },
+});
+```
+
+**缓存层级总结**:
+1. **React Query 内存缓存**: staleTime = 60秒
+2. **轮询刷新**: 1秒 → 10秒 → 60秒 渐进退避（仅加载状态）
+3. **浏览器 HTTP 缓存**: Cache-Control: max-age=31536000 (1年)
+4. **预处理结果缓存**: 数据库持久化，fixMode 时跳过重复处理
+
+### 9.4 缓存失效机制
 
 1. **浏览器缓存**: 基于 `immutable` 标志，资产 ID 变化时自动失效
-2. **React Query**: 通过 `refetchInterval` 轮询更新（正在抓取的 bookmark）
+2. **React Query**: 通过 `refetchInterval` 轮询更新（正在加载的 bookmark）
 3. **预处理缓存**: 通过 `fixMode` 参数 + 数据库字段检查 (`alreadyHasText` / `alreadyHasScreenshot`)
 
 ---
 
-## 10. 类型分支汇总
+## 10. LinkContentSection 视图恢复与降级处理
 
-### 10.1 Bookmark 类型分支
+### 10.1 查询参数恢复机制
+
+**文件位置**: `apps/web/components/dashboard/preview/LinkContentSection.tsx:126-130`
+
+```typescript
+const defaultSection =
+  availableRenderers.length > 0 ? availableRenderers[0].id : "cached";
+const [section, setSection] = useQueryState("section", {
+  defaultValue: defaultSection,
+});
+```
+
+**视图恢复流程**:
+```
+页面加载 / 书签切换
+    ↓
+从 URL query 读取 ?section=xxx 参数
+    ↓
+参数存在且有效?
+    ├─→ 是 → 使用该值作为当前 section
+    └─→ 否 → 使用 defaultSection
+              ├─→ 有自定义渲染器? → 第一个自定义渲染器
+              └─→ 无 → "cached"
+```
+
+**nuqs useQueryState 行为**:
+- 参数缺失时返回 `defaultValue`
+- 不自动验证参数值的有效性（如对应资产是否存在）
+- `defaultValue` 不会同步回 URL
+
+### 10.2 禁用项与资产缺失检测
+
+**文件位置**: `apps/web/components/dashboard/preview/LinkContentSection.tsx:206-240`
+
+```typescript
+<SelectItem
+  value="screenshot"
+  disabled={!bookmark.content.screenshotAssetId}
+>
+<SelectItem
+  value="pdf"
+  disabled={!bookmark.content.pdfAssetId}
+>
+<SelectItem
+  value="archive"
+  disabled={
+    !bookmark.content.fullPageArchiveAssetId &&
+    !bookmark.content.precrawledArchiveAssetId
+  }
+>
+<SelectItem
+  value="video"
+  disabled={!bookmark.content.videoAssetId}
+>
+```
+
+**禁用逻辑**:
+| 视图 | 启用条件 |
+|------|---------|
+| screenshot | `screenshotAssetId != null` |
+| pdf | `pdfAssetId != null` |
+| archive | `fullPageArchiveAssetId != null || precrawledArchiveAssetId != null` |
+| video | `videoAssetId != null` |
+| cached | 始终启用（兜底视图） |
+| 自定义渲染器 | 由渲染器注册表决定 |
+
+### 10.3 无效参数场景：资产缺失
+
+**场景**: URL 中 `?section=video` 但 `videoAssetId` 为 null
+
+```
+时间线:
+t0: 用户访问 ?bookmarkId=123&section=video
+    ↓
+t1: useQueryState 读取 section = "video"
+    ↓
+t2: 渲染 Select 组件，value = "video"
+    ↓
+t3: SelectItem video 被 disabled (因 assetId 缺失)
+    ↓
+t4: SelectValue 显示 "video" (但选项不可选)
+    ↓
+t5: 渲染 VideoSection
+    ↓
+t6: <source src={`/api/assets/null`}> ❌ 无效请求
+```
+
+**问题**:
+1. Select 显示无效值（已被 disabled 的选项）
+2. Radix UI Select 对无效 value 的行为未定义
+3. 可能导致渲染异常或静默失败
+
+**资产访问路径 (缺失时)**:
+```typescript
+// FullPageArchiveSection - assetId 为 null 时
+src={`/api/assets/${null}`}
+// → GET /api/assets/null → 404 或 500
+
+// VideoSection - assetId 为 null 时
+<source src={`/api/assets/${null}`} />
+// → GET /api/assets/null → 404
+
+// ScreenshotSection - assetId 为 null 时
+src={`/api/assets/${undefined}`}
+// → Next.js Image 组件报错
+```
+
+### 10.4 公开视图场景：签名令牌过期
+
+**文件位置**: `packages/trpc/models/bookmarks.ts:768-860`
+
+公开列表页面的资产 URL 包含签名 token:
+```typescript
+const getPublicSignedAssetUrl = (assetId: string) => {
+  return Asset.getPublicSignedAssetUrl(
+    assetId,
+    this.bookmark.userId,
+    getAlignedExpiry(3600, 900),  // 1小时 + 15分钟宽限期
+  );
+};
+```
+
+**令牌过期流程**:
+```
+t0: 公开列表页面加载
+    ↓
+生成签名 URL: /public/assets/abc?token=xxx (有效期1小时)
+    ↓
+t1: 用户停留 70 分钟
+    ↓
+t2: 用户切换到 ?section=video
+    ↓
+t3: VideoSection 渲染
+    ↓
+t4: <source src="/public/assets/abc?token=xxx">
+    ↓
+t5: 浏览器发起请求
+    ↓
+t6: 服务器验证 token → 已过期 → 返回 403
+    ↓
+t7: video 元素显示 "Not supported by your browser" ❌ 误导性提示
+```
+
+**错误请求路径**:
+```
+GET /public/assets/{assetId}?token={expired_token}
+    ↓
+verifySignedToken() → null (过期)
+    ↓
+返回 403 { error: "Invalid or expired token" }
+    ↓
+浏览器: video 元素加载失败 → 显示备用文本
+```
+
+### 10.5 降级处理机制分析
+
+**当前实现的降级策略**:
+
+| 场景 | 降级行为 | 问题 |
+|------|---------|------|
+| 自定义渲染器出错 | ErrorBoundary → 显示错误提示 | ✅ 有处理 |
+| ReaderView 无内容 | FileX 图标 + 错误文案 | ✅ 有处理 |
+| 资产 ID 为 null | 直接请求 `/api/assets/null` | ❌ 无降级 |
+| 签名 token 过期 | 资源 403 → 浏览器默认错误 | ❌ 无降级 |
+| 资源加载失败 (iframe/image) | 浏览器默认错误状态 | ❌ 无降级 |
+
+**自定义渲染器的 ErrorBoundary**:
+```typescript
+// LinkContentSection.tsx:144-148
+<ErrorBoundary FallbackComponent={CustomRendererErrorFallback}>
+  <RendererComponent bookmark={bookmark} />
+</ErrorBoundary>
+```
+
+**ReaderView 的错误处理**:
+```typescript
+// ReaderView.tsx:114-133
+if (!cachedContent) {
+  content = (
+    <div className="flex h-full w-full items-center justify-center p-4">
+      <FileX className="h-8 w-8 text-muted-foreground" />
+      <h3>{t("preview.fetch_error_title")}</h3>
+      <p>{t("preview.fetch_error_description")}</p>
+    </div>
+  );
+}
+```
+
+### 10.6 建议的降级改进方案
+
+**方案1: 参数有效性校验 + 自动回退**
+```typescript
+// LinkContentSection 中添加
+const availableSections = useMemo(() => {
+  const sections: string[] = [...availableRenderers.map(r => r.id), "cached"];
+  if (bookmark.content.screenshotAssetId) sections.push("screenshot");
+  if (bookmark.content.pdfAssetId) sections.push("pdf");
+  if (bookmark.content.fullPageArchiveAssetId || 
+      bookmark.content.precrawledArchiveAssetId) sections.push("archive");
+  if (bookmark.content.videoAssetId) sections.push("video");
+  return sections;
+}, [bookmark, availableRenderers]);
+
+// 校验并修正 section
+useEffect(() => {
+  if (!availableSections.includes(section)) {
+    setSection(defaultSection);  // 自动回退到默认视图
+  }
+}, [section, availableSections, defaultSection, setSection]);
+```
+
+**方案2: 资源加载错误捕获**
+```typescript
+// VideoSection 改进
+function VideoSection({ link }: { link: ZBookmarkedLink }) {
+  const [hasError, setHasError] = useState(false);
+  
+  if (hasError) {
+    return (
+      <div className="flex h-full items-center justify-center">
+        <Alert variant="destructive">
+          <AlertTitle>视频加载失败</AlertTitle>
+          <AlertDescription>
+            视频资源无法访问，请尝试其他视图
+          </AlertDescription>
+        </Alert>
+      </div>
+    );
+  }
+  
+  return (
+    <video controls onError={() => setHasError(true)}>
+      <source src={`/api/assets/${link.videoAssetId}`} />
+    </video>
+  );
+}
+```
+
+**方案3: 公开视图令牌刷新**
+```typescript
+// 检测到 403 时触发刷新获取新 token
+const refreshPublicBookmark = useMutation({
+  mutationFn: () => api.publicBookmarks.getPublicBookmark.refetch(),
+  onSuccess: (data) => {
+    // 更新 bookmark 数据，包含新的签名 URL
+  },
+});
+```
+
+---
+
+## 11. 类型分支汇总
+
+### 11.1 Bookmark 类型分支
 
 | 类型 | 预览方式 | 预处理 |
 |------|---------|--------|
@@ -512,7 +832,7 @@ useEffect(() => {
 | ASSET (image) | ImageContentSection | OCR 文本提取 |
 | ASSET (pdf) | PDF iframe / Screenshot | 文本提取 + 首页截图 |
 
-### 10.2 资产类型枚举
+### 11.2 资产类型枚举
 
 **文件位置**: `packages/shared/assetdb.ts:23-70`
 
@@ -524,9 +844,9 @@ useEffect(() => {
 
 ---
 
-## 11. 关键代码路径
+## 12. 关键代码路径
 
-### 11.1 打开附件预览的完整调用链
+### 12.1 打开附件预览的完整调用链
 
 ```
 用户点击书签
@@ -548,7 +868,7 @@ BookmarkPreview.tsx
          ↳ 或其他视图
 ```
 
-### 11.2 预处理调用链
+### 12.2 预处理调用链
 
 ```
 资产创建
@@ -571,9 +891,9 @@ assetPreprocessingWorker.run()
 
 ---
 
-## 12. PDF 与截图视图状态一致性分析
+## 13. PDF 与截图视图状态一致性分析
 
-### 12.1 初始状态选择逻辑
+### 13.1 初始状态选择逻辑
 
 **文件位置**: `apps/web/components/dashboard/preview/AssetContentSection.tsx:20-41`
 
@@ -598,7 +918,7 @@ const [section, setSection] = useState(initialSection);
 - `useState(initialSection)` 仅在组件**首次挂载**时使用初始值
 - 后续 `bookmark` 数据更新**不会**自动改变 `section` 状态
 
-### 12.2 数据刷新机制
+### 13.2 数据刷新机制
 
 **文件位置**: `apps/web/components/dashboard/preview/BookmarkPreview.tsx:141-156`
 
@@ -623,7 +943,7 @@ const { data: bookmark } = useQuery(
 - 预处理中 (taggingStatus/summarizationStatus === "pending"): 2秒轮询
 - 其他情况: 不自动刷新
 
-### 12.3 状态不一致场景分析
+### 13.3 状态不一致场景分析
 
 #### 场景1: 截图生成完成后视图不自动切换
 
@@ -678,7 +998,7 @@ t1: 预处理完成，size 更新为 25MB，截图生成
 
 **问题**: 预处理完成后，大小信息可用，但视图策略不会自动调整。
 
-### 12.4 状态同步实现方案对比
+### 13.4 状态同步实现方案对比
 
 | 方案 | 实现方式 | 优点 | 缺点 |
 |------|---------|------|------|
@@ -687,7 +1007,7 @@ t1: 预处理完成，size 更新为 25MB，截图生成
 | **条件同步** | 仅在用户未手动切换时自动更新 | 平衡自动同步和用户选择 | 实现复杂度增加 |
 | **key 重置** | 给组件添加 `key={bookmark.id}` | bookmark 变化时完全重置状态 | 会丢失所有本地状态 |
 
-### 12.5 建议的改进方案
+### 13.5 建议的改进方案
 
 ```typescript
 // 方案: 跟踪用户是否手动切换过
@@ -708,7 +1028,7 @@ const handleSectionChange = (newSection: string) => {
 };
 ```
 
-### 12.6 公开视图中的签名 URL 过期问题
+### 13.6 公开视图中的签名 URL 过期问题
 
 **文件位置**: `packages/trpc/models/bookmarks.ts:768-776`
 
@@ -740,22 +1060,30 @@ const getPublicSignedAssetUrl = (assetId: string) => {
 ### 设计优点
 
 1. **双轨鉴权**: 受保护访问（登录用户）+ 签名访问（公开分享），灵活覆盖多种场景
-2. **分层缓存**: 浏览器 → React Query → 预处理结果 → 存储层，多级优化
-3. **流式处理**: 大文件通过流传输，避免内存溢出
-4. **队列解耦**: 耗时操作（OCR、视频下载）通过 Worker 队列异步处理
-5. **安全可靠**: 严格的 CSP、沙箱 iframe、配额检查
-6. **多后端支持**: 本地 FS 和 S3 统一接口
-7. **签名令牌**: HMAC-SHA256 签名 + 过期时间对齐，安全且高效
+2. **渐进式刷新**: 1秒 → 10秒 → 60秒 渐进退避策略，平衡实时性与性能
+3. **分层缓存**: 浏览器 → React Query → 预处理结果 → 存储层，多级优化
+4. **流式处理**: 大文件通过流传输，避免内存溢出
+5. **队列解耦**: 耗时操作（OCR、视频下载）通过 Worker 队列异步处理
+6. **安全可靠**: 严格的 CSP、沙箱 iframe、配额检查
+7. **多后端支持**: 本地 FS 和 S3 统一接口
+8. **签名令牌**: HMAC-SHA256 签名 + 过期时间对齐，安全且高效
+9. **URL 状态持久化**: 使用 nuqs 将视图状态同步到 URL query 参数
 
 ### 关注点
 
 1. **前端资源释放**: iframe/video 元素缺少显式清理
-2. **状态一致性**: PDF 与截图视图在数据刷新后不会自动同步
+2. **视图状态一致性**:
+   - PDF 与截图视图在数据刷新后不会自动同步
+   - URL 参数恢复视图时不校验资产是否存在
 3. **状态复杂度**: 多视图切换 + 多类型分支，维护成本较高
 4. **视频格式**: 视频下载无转码，ContentType 硬编码可能与实际格式不匹配
-5. **错误边界**: 自定义渲染器有 ErrorBoundary，但基础视图缺少
+5. **降级处理不完善**:
+   - 自定义渲染器有 ErrorBoundary，但基础视图缺少
+   - 资产 ID 为 null 时直接请求无效 URL
+   - 签名 token 过期时显示浏览器默认错误，用户体验差
 6. **内存占用**: 大 PDF iframe 可能导致浏览器内存累积
 7. **签名 URL 过期**: 公开页面签名 URL 1小时过期，长时间停留后访问失败
+8. **无效参数处理**: Select 可能显示已 disabled 的值，行为未定义
 
 ### 关键文件速查表
 
@@ -763,14 +1091,16 @@ const getPublicSignedAssetUrl = (assetId: string) => {
 |------|---------|
 | `packages/shared/assetdb.ts` | 资产存储抽象 |
 | `packages/shared/signedTokens.ts` | 签名令牌生成与验证 |
+| `packages/shared/utils/bookmarkUtils.ts` | 刷新时间策略 + 加载状态判断 |
 | `packages/api/middlewares/auth.ts` | 鉴权中间件 |
 | `packages/api/routes/assets.ts` | 受保护资产路由 |
 | `packages/api/routes/public/assets.ts` | 公开签名资产路由 |
 | `packages/api/utils/assets.ts` | HTTP 资源服务 |
 | `apps/workers/workers/assetPreprocessingWorker.ts` | OCR + PDF 处理 |
 | `apps/workers/workers/videoWorker.ts` | 视频下载（无转码） |
-| `apps/web/components/dashboard/preview/BookmarkPreview.tsx` | 预览入口 |
+| `apps/web/lib/providers.tsx` | React Query 全局配置 |
+| `apps/web/components/dashboard/preview/BookmarkPreview.tsx` | 预览入口 + 轮询刷新 |
 | `apps/web/components/dashboard/preview/AssetContentSection.tsx` | 资产类型分支 |
-| `apps/web/components/dashboard/preview/LinkContentSection.tsx` | 链接多视图 |
+| `apps/web/components/dashboard/preview/LinkContentSection.tsx` | 链接多视图 + URL 参数恢复 |
 | `packages/trpc/models/assets.ts` | 资产模型与权限检查 |
 | `packages/trpc/models/bookmarks.ts` | 书签模型与公开视图转换 |
