@@ -493,11 +493,26 @@ useEffect(() => {
 └─────────────────────────────────┘
 ```
 
-### 9.2 刷新时间策略
+### 9.2 轮询触发机制与刷新节奏
 
-**文件位置**: `packages/shared/utils/bookmarkUtils.ts:56-83`
+**轮询触发位置**:
+轮询仅在两个组件中激活：
+1. `BookmarkPreview.tsx:148-154` - 预览弹窗/页面
+2. `BookmarkCard.tsx:29-35` - 列表中的单个书签卡片
 
-采用**渐进式退避刷新策略**，根据 bookmark 年龄动态调整轮询间隔：
+**轮询激活条件**:
+```typescript
+// BookmarkPreview.tsx:148-154
+refetchInterval: (query) => {
+  const data = query.state.data;
+  if (!data) {
+    return false;
+  }
+  return getBookmarkRefreshInterval(data);  // 非加载状态返回 false
+}
+```
+
+**渐进式退避刷新策略** (`packages/shared/utils/bookmarkUtils.ts:56-83`):
 
 ```typescript
 export function getBookmarkRefreshInterval(
@@ -539,6 +554,26 @@ function isBookmarkStillLoading(bookmark) {
 }
 ```
 
+**实际轮询节奏示例**:
+```
+用户创建书签 (t=0)
+    ↓
+t=0~30秒: 每秒刷新一次 (共约30次请求)
+    ↓
+t=30秒~10分钟: 每10秒刷新一次 (共约57次请求)
+    ↓
+t=10分钟~6小时: 每分钟刷新一次 (共约350次请求)
+    ↓
+t>6小时: 停止刷新
+    ↓
+总计: 约437次请求 / 书签 (完整加载周期)
+```
+
+**重要限制**:
+- 轮询**仅在组件挂载时**生效
+- 用户关闭预览弹窗或离开页面时，轮询自动停止
+- 公开列表页面 (`PublicBookmarkGrid`) **没有轮询机制**
+
 ### 9.3 React Query 缓存配置
 
 **文件位置**: `apps/web/lib/providers.tsx:23-33`
@@ -556,21 +591,21 @@ new QueryClient({
 
 **缓存层级总结**:
 1. **React Query 内存缓存**: staleTime = 60秒
-2. **轮询刷新**: 1秒 → 10秒 → 60秒 渐进退避（仅加载状态）
+2. **轮询刷新**: 1秒 → 10秒 → 60秒 渐进退避（仅加载状态的组件）
 3. **浏览器 HTTP 缓存**: Cache-Control: max-age=31536000 (1年)
 4. **预处理结果缓存**: 数据库持久化，fixMode 时跳过重复处理
 
 ### 9.4 缓存失效机制
 
 1. **浏览器缓存**: 基于 `immutable` 标志，资产 ID 变化时自动失效
-2. **React Query**: 通过 `refetchInterval` 轮询更新（正在加载的 bookmark）
+2. **React Query**: 通过 `refetchInterval` 轮询更新（仅正在加载的 bookmark）
 3. **预处理缓存**: 通过 `fixMode` 参数 + 数据库字段检查 (`alreadyHasText` / `alreadyHasScreenshot`)
 
 ---
 
-## 10. LinkContentSection 视图恢复与降级处理
+## 10. LinkContentSection 视图恢复与路径冲突分析
 
-### 10.1 查询参数恢复机制
+### 10.1 查询参数恢复机制（仅受保护路径）
 
 **文件位置**: `apps/web/components/dashboard/preview/LinkContentSection.tsx:126-130`
 
@@ -581,6 +616,11 @@ const [section, setSection] = useQueryState("section", {
   defaultValue: defaultSection,
 });
 ```
+
+**适用范围**:
+- ✅ 受保护预览页面: `/dashboard/preview/[bookmarkId]`
+- ✅ 受保护预览弹窗: `/dashboard/@modal/(.)preview/[bookmarkId]`
+- ❌ 公开列表页面: `/public/lists/[listId]` (无此组件)
 
 **视图恢复流程**:
 ```
@@ -600,7 +640,134 @@ const [section, setSection] = useQueryState("section", {
 - 不自动验证参数值的有效性（如对应资产是否存在）
 - `defaultValue` 不会同步回 URL
 
-### 10.2 禁用项与资产缺失检测
+### 10.2 受保护路径 vs 公开路径：核心差异
+
+#### 10.2.1 数据结构差异
+
+| 特性 | 受保护路径 (`ZBookmark`) | 公开路径 (`ZPublicBookmark`) |
+|------|-------------------------|----------------------------|
+| 资产引用方式 | 存储 `assetId` (字符串) | 存储 `assetUrl` (完整签名URL) |
+| 资产访问路径 | 前端拼接: `/api/assets/{assetId}` | 后端生成: `/public/assets/{assetId}?token=xxx` |
+| 多视图支持 | ✅ 支持 (cached/screenshot/archive/video/pdf) | ❌ 不支持 (仅卡片展示) |
+| URL 参数恢复 | ✅ `?section=` | ❌ 无意义 |
+| 轮询刷新 | ✅ 渐进式退避 | ❌ 无轮询 |
+
+#### 10.2.2 资产 URL 生成路径
+
+**受保护路径** (`packages/shared/utils/assetUtils.ts:1-3`):
+```typescript
+export function getAssetUrl(assetId: string) {
+  return `/api/assets/${assetId}`;  // 简单拼接，依赖 Cookie 鉴权
+}
+```
+
+**公开路径** (`packages/trpc/models/bookmarks.ts:768-860`):
+```typescript
+// 服务端生成签名 URL
+const getPublicSignedAssetUrl = (assetId: string) => {
+  return Asset.getPublicSignedAssetUrl(
+    assetId,
+    this.bookmark.userId,
+    getAlignedExpiry(3600, 900),  // 1小时 + 15分钟宽限期
+  );
+};
+
+// 返回给前端时已包含完整 URL
+// ZPublicBookmark.content.assetUrl = "https://.../public/assets/abc?token=xxx"
+```
+
+#### 10.2.3 预览功能差异
+
+**受保护预览流程**:
+```
+用户点击书签卡片
+    ↓
+导航到 /dashboard/preview/[bookmarkId] 或打开弹窗
+    ↓
+BookmarkPreview 组件挂载
+    ↓
+useQuery 加载 bookmark 数据 (含轮询)
+    ↓
+LinkContentSection 渲染
+    ↓
+useQueryState 从 ?section= 恢复视图
+    ↓
+根据 section 渲染对应组件
+    ↓
+组件内部拼接 /api/assets/{assetId}
+    ↓
+浏览器发起请求 (带 Cookie)
+    ↓
+authMiddleware 验证用户身份
+    ↓
+返回资产内容
+```
+
+**公开页面流程**:
+```
+用户访问 /public/lists/[listId]
+    ↓
+服务端渲染 PublicBookmarkGrid
+    ↓
+ZPublicBookmark 数据已包含签名 assetUrl
+    ↓
+PublicBookmarkCard 渲染
+    ↓
+点击资产 → 直接跳转到 assetUrl (新标签页)
+    ↓
+浏览器请求 /public/assets/{assetId}?token=xxx
+    ↓
+verifySignedToken 验证签名
+    ↓
+返回资产内容
+```
+
+### 10.3 路径冲突点分析
+
+#### 冲突点1: LinkContentSection 硬编码受保护路径
+
+**问题**: `LinkContentSection` 中的子组件全部硬编码使用 `/api/assets/` 路径：
+
+```typescript
+// LinkContentSection.tsx:65-76
+function FullPageArchiveSection({ link }) {
+  const archiveAssetId = link.fullPageArchiveAssetId ?? link.precrawledArchiveAssetId;
+  return <iframe src={`/api/assets/${archiveAssetId}`} />;  // 硬编码受保护路径
+}
+
+// VideoSection.tsx:94-106
+function VideoSection({ link }) {
+  return <video><source src={`/api/assets/${link.videoAssetId}`} /></video>;  // 硬编码
+}
+
+// ScreenshotSection.tsx:78-92
+function ScreenshotSection({ link }) {
+  return <Image src={`/api/assets/${link.screenshotAssetId}`} />;  // 硬编码
+}
+```
+
+**冲突场景**:
+如果尝试在公开页面中复用 `LinkContentSection` 组件，会导致：
+1. 资产请求路径为 `/api/assets/{id}`（受保护路径）
+2. 公开页面用户未登录，Cookie 不存在
+3. `authMiddleware` 返回 401 错误
+4. 所有资产无法加载
+
+#### 冲突点2: URL 参数在公开页面无意义
+
+**问题**: `?section=` 参数仅在 `LinkContentSection` 中解析：
+- 公开页面没有 `LinkContentSection` 组件
+- 即使手动添加 `?section=video` 到公开页面 URL，也不会生效
+- 公开页面点击资产直接跳转原始 URL，不支持多视图切换
+
+#### 冲突点3: 轮询机制仅适用于受保护路径
+
+**问题**: 公开页面的书签数据是静态的：
+- 服务端一次性获取，没有轮询刷新
+- 预处理完成后，公开页面不会自动更新
+- 用户需要手动刷新页面才能看到新生成的截图/归档
+
+### 10.4 禁用项与资产缺失检测
 
 **文件位置**: `apps/web/components/dashboard/preview/LinkContentSection.tsx:206-240`
 
@@ -1075,15 +1242,17 @@ const getPublicSignedAssetUrl = (assetId: string) => {
 2. **视图状态一致性**:
    - PDF 与截图视图在数据刷新后不会自动同步
    - URL 参数恢复视图时不校验资产是否存在
-3. **状态复杂度**: 多视图切换 + 多类型分支，维护成本较高
-4. **视频格式**: 视频下载无转码，ContentType 硬编码可能与实际格式不匹配
-5. **降级处理不完善**:
+3. **路径耦合**: `LinkContentSection` 硬编码 `/api/assets/` 路径，无法在公开页面复用
+4. **状态复杂度**: 多视图切换 + 多类型分支，维护成本较高
+5. **视频格式**: 视频下载无转码，ContentType 硬编码可能与实际格式不匹配
+6. **降级处理不完善**:
    - 自定义渲染器有 ErrorBoundary，但基础视图缺少
    - 资产 ID 为 null 时直接请求无效 URL
    - 签名 token 过期时显示浏览器默认错误，用户体验差
-6. **内存占用**: 大 PDF iframe 可能导致浏览器内存累积
-7. **签名 URL 过期**: 公开页面签名 URL 1小时过期，长时间停留后访问失败
-8. **无效参数处理**: Select 可能显示已 disabled 的值，行为未定义
+7. **内存占用**: 大 PDF iframe 可能导致浏览器内存累积
+8. **签名 URL 过期**: 公开页面签名 URL 1小时过期，长时间停留后访问失败
+9. **无效参数处理**: Select 可能显示已 disabled 的值，行为未定义
+10. **轮询成本**: 完整加载周期约 437 次请求/书签，高并发场景需关注
 
 ### 关键文件速查表
 
@@ -1091,6 +1260,7 @@ const getPublicSignedAssetUrl = (assetId: string) => {
 |------|---------|
 | `packages/shared/assetdb.ts` | 资产存储抽象 |
 | `packages/shared/signedTokens.ts` | 签名令牌生成与验证 |
+| `packages/shared/utils/assetUtils.ts` | 受保护资产 URL 生成 |
 | `packages/shared/utils/bookmarkUtils.ts` | 刷新时间策略 + 加载状态判断 |
 | `packages/api/middlewares/auth.ts` | 鉴权中间件 |
 | `packages/api/routes/assets.ts` | 受保护资产路由 |
@@ -1102,5 +1272,6 @@ const getPublicSignedAssetUrl = (assetId: string) => {
 | `apps/web/components/dashboard/preview/BookmarkPreview.tsx` | 预览入口 + 轮询刷新 |
 | `apps/web/components/dashboard/preview/AssetContentSection.tsx` | 资产类型分支 |
 | `apps/web/components/dashboard/preview/LinkContentSection.tsx` | 链接多视图 + URL 参数恢复 |
+| `apps/web/components/public/lists/PublicBookmarkGrid.tsx` | 公开列表展示（无预览） |
 | `packages/trpc/models/assets.ts` | 资产模型与权限检查 |
 | `packages/trpc/models/bookmarks.ts` | 书签模型与公开视图转换 |
