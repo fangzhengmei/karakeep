@@ -31,7 +31,7 @@ Karakeep 采用**插件化架构**，搜索引擎通过 `PluginManager` 动态�
 
 ---
 
-## 二、收藏内容写入流程
+## 二、收藏内容写入与索引触发流程
 
 ### 2.1 写入入口
 
@@ -58,26 +58,49 @@ await Promise.all([
 ]);
 ```
 
-### 2.2 触发重新索引的事件
+### 2.2 触发重新索引的完整事件列表
 
-索引更新通过 `triggerSearchReindex` 函数统一触发 (`packages/shared-server/src/queues.ts:189-203`)，该函数将索引任务加入 `SearchIndexingQueue` 队列。
+索引更新主要通过两种方式触发：
+1. **`triggerSearchReindex` 函数** (`packages/shared-server/src/queues.ts:189-203`)：触发 `type: "index"` 操作
+2. **直接入队**：仅删除书签时使用，触发 `type: "delete"` 操作
 
-**触发索引的完整事件列表：**
+| 事件类型 | 触发位置 | 索引类型 | 说明 |
+|---------|---------|---------|------|
+| **书签生命周期** | | | |
+| 创建书签 | `packages/trpc/routers/bookmarks.ts:443` | `index` | 创建后立即触发 |
+| 更新书签 | `packages/trpc/routers/bookmarks.ts:626` | `index` | 更新元数据、内容后触发 |
+| 更新书签文本 | `packages/trpc/routers/bookmarks.ts:677` | `index` | 废弃 API，仍兼容 |
+| **删除书签** | `packages/trpc/models/bookmarks.ts:934-942` | **`delete`** | ⚠️ 直接调用 `SearchIndexingQueue.enqueue`，**不使用 `triggerSearchReindex`** |
+| 更新书签标签 | `packages/trpc/routers/bookmarks.ts:1148` | `index` | 标签增删后触发 |
+| 生成书签摘要 | `packages/trpc/routers/bookmarks.ts:1322` | `index` | AI 摘要生成后触发 |
+| **标签操作** | | | |
+| 标签合并 | `packages/trpc/models/tags.ts:285-295` | `index` | `Tag.merge()` 中对所有受影响书签批量触发 |
+| 标签删除 | `packages/trpc/models/tags.ts:324-330` | `index` | `Tag.delete()` 中对所有受影响书签批量触发 |
+| 标签重命名 | `packages/trpc/models/tags.ts:362-368` | `index` | `Tag.update()` 中对所有受影响书签批量触发 |
+| **异步任务完成** | | | |
+| 爬虫完成 | `apps/workers/workers/crawlerWorker.ts:2317` | `index` | 页面抓取完成后触发 |
+| AI 打标完成 | `apps/workers/workers/inference/tagging.ts:596` | `index` | 自动标签生成后触发 |
+| 资产预处理完成 | `apps/workers/workers/assetPreprocessingWorker.ts:480` | `index` | OCR/PDF 解析后触发 |
+| 摘要生成完成 | `apps/workers/workers/inference/summarize.ts:188` | `index` | 摘要任务完成后触发 |
+| **管理员操作** | | | |
+| 管理员单条重索引 | `packages/trpc/routers/admin.ts:700` | `index` | 手动触发 |
+| 管理员全量重索引 | `packages/trpc/routers/admin.ts:248-263` | `index` | 先清空再逐条重建 |
 
-| 事件类型 | 触发位置 | 说明 |
-|---------|---------|------|
-| **创建书签** | `bookmarks.ts:443` | 创建后立即触发 |
-| **更新书签** | `bookmarks.ts:626` | 更新元数据、内容后触发 |
-| **更新书签文本** | `bookmarks.ts:677` | 废弃 API，仍兼容 |
-| **删除书签** | `bookmarks.ts:934` | 触发 `type: "delete"` 操作 |
-| **更新标签** | `bookmarks.ts:1148` | 标签增删后触发 |
-| **生成摘要** | `bookmarks.ts:1322` | AI 摘要生成后触发 |
-| **爬虫完成** | `crawlerWorker.ts:2317` | 页面抓取完成后触发 |
-| **AI 打标完成** | `tagging.ts:596` | 自动标签生成后触发 |
-| **资产预处理完成** | `assetPreprocessingWorker.ts:480` | OCR/PDF 解析后触发 |
-| **摘要生成完成** | `summarize.ts:188` | 摘要任务完成后触发 |
-| **管理员单条重索引** | `admin.ts:700` | 手动触发 |
-| **管理员全量重索引** | `admin.ts:248-263` | 先清空再逐条重建 |
+> **⚠️ 重要修正**：删除书签的代码位置是 `packages/trpc/models/bookmarks.ts:934-942`（模型层），**不是**路由层。且该位置直接调用 `SearchIndexingQueue.enqueue` 传入 `type: "delete"`，**不经过 `triggerSearchReindex` 函数**。
+
+**删除书签触发 delete 索引的精确代码：**
+```typescript
+// packages/trpc/models/bookmarks.ts:934-942
+await SearchIndexingQueue.enqueue(
+  {
+    bookmarkId: this.bookmark.id,
+    type: "delete",  // 直接指定 delete 类型
+  },
+  {
+    groupId: this.ctx.user.id,
+  },
+);
+```
 
 **幂等性保证：**
 ```typescript
@@ -101,9 +124,9 @@ await SearchIndexingQueue.enqueue(
 
 **流程：**
 1. `triggerSearchReindex(bookmarkId)` 入队
-2. `SearchIndexingWorker` 消费队列 (`searchWorker.ts:23-176`)
+2. `SearchIndexingWorker` 消费队列 (`apps/workers/workers/searchWorker.ts:23-176`)
 3. 从数据库读取完整书签数据，构建 `BookmarkSearchDocument`
-4. 调用 `searchClient.addDocuments([document])`
+4. 调用 `searchClient.addDocuments([document])` 或 `searchClient.removeDocuments([id])`
 
 **文档结构定义** (`packages/shared/search.ts:5-23`)：
 ```typescript
@@ -128,7 +151,7 @@ interface BookmarkSearchDocument {
 }
 ```
 
-**文档构建逻辑** (`searchWorker.ts:89-119`)：
+**文档构建逻辑** (`apps/workers/workers/searchWorker.ts:89-119`)：
 ```typescript
 const document: BookmarkSearchDocument = {
   id: bookmark.id,
@@ -157,7 +180,7 @@ const document: BookmarkSearchDocument = {
 | 维度 | 增量索引 | 全量索引 |
 |------|---------|---------|
 | **触发方式** | 事件驱动（内容变更时自动触发） | 管理员手动调用 `reindexAllBookmarks` |
-| **触发入口** | `triggerSearchReindex(bookmarkId)` | `admin.ts:248-263` |
+| **触发入口** | `triggerSearchReindex(bookmarkId)` 或直接入队 | `packages/trpc/routers/admin.ts:248-263` |
 | **数据范围** | 单条书签 | 所有书签 |
 | **前置操作** | 无 | 先调用 `clearIndex()` 清空整个索引 |
 | **队列优先级** | `QueuePriority.Default` (0) | `QueuePriority.Low` (50) |
@@ -165,7 +188,7 @@ const document: BookmarkSearchDocument = {
 
 **全量索引实现：**
 ```typescript
-// admin.ts:248-263
+// packages/trpc/routers/admin.ts:248-263
 reindexAllBookmarks: adminBookmarksProcedure.mutation(async ({ ctx }) => {
   const searchIdx = await getSearchClient();
   await searchIdx?.clearIndex();                    // 先清空索引
@@ -186,7 +209,7 @@ reindexAllBookmarks: adminBookmarksProcedure.mutation(async ({ ctx }) => {
 
 Meilisearch 插件实现了**客户端级别的批量队列** (`BatchingDocumentQueue`)，但这是**请求合并**而非全量索引。
 
-**设计要点** (`search-meilisearch/src/index.ts:46-207`)：
+**设计要点** (`packages/plugins/search-meilisearch/src/index.ts:46-207`)：
 
 1. **自动批处理**：
    - 积累到 `MEILI_BATCH_SIZE` 条或超时 `MEILI_BATCH_TIMEOUT_MS` 后批量发送
@@ -204,10 +227,33 @@ Meilisearch 插件实现了**客户端级别的批量队列** (`BatchingDocument
 
 3. **重试策略**：
    ```typescript
-   // searchWorker.ts:160
+   // apps/workers/workers/searchWorker.ts:160
    const batch = job.runNumber === 0;  // 首次执行启用批量，重试时禁用
    // 重试时直接发送，不经过批量队列，提高可靠性
    ```
+
+### 3.4 多次索引的时间顺序一致性问题
+
+**场景**：同一书签可能在短时间内多次触发索引，例如：
+1. 创建书签 → 触发首次索引（T0）
+2. 爬虫完成 → 触发第二次索引（T1）
+3. AI 打标完成 → 触发第三次索引（T2）
+4. 摘要生成完成 → 触发第四次索引（T3）
+
+**一致性保证机制**：
+
+| 层级 | 保证方式 | 效果 |
+|------|---------|------|
+| **队列层** | `idempotencyKey: index:{bookmarkId}` | 防止**同一时刻**的重复入队，但不保证顺序 |
+| **批量队列层** | `BatchingDocumentQueue` 去重 | 同一批次内只保留最后一次操作 |
+| **数据库读取** | Worker 执行时从 DB 读取最新数据 | 最终索引的是数据库中的最新状态 |
+
+**潜在时序问题：**
+- 如果任务分布在不同批次，且 Worker 并发执行，可能出现旧数据覆盖新数据的情况
+- 但由于索引操作是幂等的（最后一次执行的是数据库的最新数据），**最终一致性可以保证**
+- **groupId 机制**：索引任务使用 `groupId: userId`，如果队列实现支持按组串行化，可以保证同一用户的索引任务顺序执行（取决于具体队列插件实现）
+
+> **结论**：系统实现了**最终一致性**，但不保证**强顺序一致性**。由于索引操作读取的是数据库的最新状态，即使执行顺序颠倒，最终索引内容也是正确的。
 
 ---
 
@@ -215,11 +261,11 @@ Meilisearch 插件实现了**客户端级别的批量队列** (`BatchingDocument
 
 ### 4.1 查询入口
 
-搜索主入口是 `bookmarksAppRouter.searchBookmarks` (`bookmarks.ts:804-902`)。
+搜索主入口是 `bookmarksAppRouter.searchBookmarks` (`packages/trpc/routers/bookmarks.ts:804-902`)。
 
-### 4.2 高级查询语法解析
+### 4.2 高级查询语法解析与语义降级
 
-用户输入的查询字符串首先经过 `parseSearchQuery` 解析器 (`packages/shared/searchQueryParser.ts`)，分离出**全文搜索文本**和**结构化过滤条件**。
+用户输入的查询字符串首先经过 `parseSearchQuery` 解析器 (`packages/shared/searchQueryParser.ts:414-451`)，分离出**全文搜索文本**和**结构化过滤条件**。
 
 **支持的查询语法：**
 ```
@@ -242,6 +288,58 @@ feed:tech-news            # 按 RSS 订阅过滤
 - 词法分析器 (Lexer) 将输入转换为 Token 流
 - 语法分析器 (Parser) 构建表达式树
 - 支持 `AND`（默认，空格分隔）和 `OR` 逻辑
+
+**语义降级策略（Graceful Degradation）**：
+
+解析器返回三种结果类型：
+
+```typescript
+function parseSearchQuery(
+  query: string,
+): TextAndMatcher & { result: "full" | "partial" | "invalid" }
+```
+
+| 结果类型 | 触发条件 | 降级行为 | 代码位置 |
+|---------|---------|---------|---------|
+| **`full`** | 完全解析成功，所有 Token 被消费 | 正常返回 `text` 和 `matcher` | `searchQueryParser.ts:447-451` |
+| **`partial`** | 解析成功但部分 Token 未被消费（通常是用户正在输入） | 已解析的 matcher 保留，未消费的 Token 追加到 `text` 中 | `searchQueryParser.ts:433-444` |
+| **`invalid`** | 解析完全失败（语法错误、多歧义等） | **整个查询作为纯文本处理**，`matcher` 为 undefined | `searchQueryParser.ts:419-424` |
+
+**单限定符解析失败的降级：**
+```typescript
+// searchQueryParser.ts:253-307 - 日期解析失败时降级为纯文本
+case "after:":
+  try {
+    return {
+      text: "",
+      matcher: { type: "dateAfter", dateAfter: z.coerce.date().parse(ident), ... },
+    };
+  } catch {
+    return {
+      text: (minus?.text ?? "") + qualifier.text + ident,  // 降级为纯文本
+      matcher: undefined,
+    };
+  }
+```
+
+**未知限定符的降级：**
+```typescript
+// searchQueryParser.ts:304-310
+default:
+  // If the token is not known, emit it as pure text
+  return {
+    text: (minus?.text ?? "") + qualifier.text + ident,
+    matcher: undefined,
+  };
+```
+
+**降级示例：**
+| 输入查询 | 结果类型 | 降级后 text | matcher |
+|---------|---------|------------|---------|
+| `is:fav is:helloworld` | `full` | `"is:helloworld"` | `{type: "favourited", favourited: true}` |
+| `(is:archived) or ` | `partial` | `"or"` | `{type: "archived", archived: true}` |
+| `is:fav is: ( random` | `partial` | `"is: ( random"` | `{type: "favourited", favourited: true}` |
+| `完全无效的语法 @#$%` | `invalid` | `"完全无效的语法 @#$%"` | `undefined` |
 
 **解析结果结构：**
 ```typescript
@@ -270,7 +368,7 @@ type Matcher =
 
 **关键代码示例：**
 ```typescript
-// search.ts:40-69 - 交集实现
+// packages/trpc/lib/search.ts:40-69 - 交集实现
 function intersect(vals: BookmarkQueryReturnType[][]): BookmarkQueryReturnType[] {
   const countMap = new Map<string, number>();
   for (const arr of vals) {
@@ -291,7 +389,7 @@ function intersect(vals: BookmarkQueryReturnType[][]): BookmarkQueryReturnType[]
 
 **搜索调用：**
 ```typescript
-// bookmarks.ts:831-860
+// packages/trpc/routers/bookmarks.ts:831-860
 let filter: FilterQuery[];
 if (parsedQuery.matcher) {
   const bookmarkIds = await getBookmarkIdsFromMatcher(ctx, parsedQuery.matcher);
@@ -314,7 +412,7 @@ const resp = await client.search({
 
 **Meilisearch 查询参数：**
 ```typescript
-// search-meilisearch/src/index.ts:262-281
+// packages/plugins/search-meilisearch/src/index.ts:262-281
 const result = await this.index.search(options.query, {
   filter: options.filter?.map((f) => filterToMeiliSearchFilter(f)),
   limit: options.limit,
@@ -341,7 +439,7 @@ const result = await this.index.search(options.query, {
 阶段3: 应用层排序     →  按用户选择的排序策略重新排序
 ```
 
-**排序策略** (`bookmarks.ts:880-890`)：
+**排序策略** (`packages/trpc/routers/bookmarks.ts:880-890`)：
 ```typescript
 switch (true) {
   case sortOrder === "relevance":
@@ -376,7 +474,7 @@ switch (true) {
 证据：
 ```typescript
 // Meilisearch 查询时只请求 id 字段
-attributesToRetrieve: ["id"],  // search-meilisearch/src/index.ts:268
+attributesToRetrieve: ["id"],  // packages/plugins/search-meilisearch/src/index.ts:268
 
 // 没有请求高亮参数
 // 缺失: attributesToHighlight, highlightPreTag, highlightPostTag
@@ -392,7 +490,7 @@ interface SearchResult {
 
 如果需要实现高亮，需要修改以下位置：
 
-1. **Meilisearch 查询参数** (`search-meilisearch/src/index.ts:262-271`)：
+1. **Meilisearch 查询参数** (`packages/plugins/search-meilisearch/src/index.ts:262-271`)：
    ```typescript
    // 需要添加
    attributesToHighlight: ["title", "content", "description"],
@@ -411,7 +509,7 @@ interface SearchResult {
    }
    ```
 
-3. **搜索响应处理** (`search-meilisearch/src/index.ts:273-280`)：
+3. **搜索响应处理** (`packages/plugins/search-meilisearch/src/index.ts:273-280`)：
    ```typescript
    return {
      hits: result.hits.map((hit) => ({
@@ -426,13 +524,21 @@ interface SearchResult {
 
 ---
 
-## 六、权限过滤层级
+## 六、权限过滤层级与协作者访问机制
 
-系统采用**三层权限过滤机制**，确保数据安全：
+### 6.1 三层权限过滤机制
 
-### 第一层：搜索引擎级过滤（查询时）
+系统采用**三层权限过滤机制**，但各层的作用范围和协作者支持程度不同：
 
-**位置：** `bookmarks.ts:831-843`
+| 层级 | 位置 | 过滤逻辑 | 协作者支持 | 粒度 |
+|------|------|---------|-----------|------|
+| **L1 搜索引擎** | `routers/bookmarks.ts:838-842` | `userId = currentUser` | ❌ **不支持** | 行级 |
+| **L2 数据库加载** | `models/bookmarks.ts:122-131` | 所有权 + 共享列表权限 | ✅ 支持 | 行级 |
+| **L3 字段脱敏** | `models/bookmarks.ts:753-766` | 非所有者隐藏敏感字段 | ✅ 支持 | 字段级 |
+
+### 6.2 第一层：搜索引擎级过滤（查询时）
+
+**位置：** `packages/trpc/routers/bookmarks.ts:838-842`
 
 在搜索请求中强制加入 `userId` 过滤条件，在搜索引擎层面就排除其他用户的数据。
 
@@ -442,14 +548,16 @@ filter = [
 ];
 ```
 
+**⚠️ 关键限制**：这一层过滤**只返回当前用户作为所有者**的书签，**完全排除协作者可以访问的共享书签**。
+
 **Meilisearch 配置：**
 ```typescript
-// search-meilisearch/src/index.ts:364
+// packages/plugins/search-meilisearch/src/index.ts:364
 const desiredFilterableAttributes = ["id", "userId"].sort();
 // userId 被配置为可过滤字段，确保可以在查询时过滤
 ```
 
-### 第二层：数据加载时权限校验
+### 6.3 第二层：数据加载时权限校验
 
 **位置：** `packages/trpc/models/bookmarks.ts:122-131`
 
@@ -470,7 +578,9 @@ protected static async isAllowedToAccessBookmark(
 }
 ```
 
-### 第三层：数据返回时字段过滤
+**协作者支持**：这一层支持协作者访问，但由于 L1 已经过滤掉了所有非所有者的书签，**在 `searchBookmarks` 流程中这一层实际上不会检测到协作者书签**。
+
+### 6.4 第三层：数据返回时字段过滤
 
 **位置：** `packages/trpc/models/bookmarks.ts:753-766`
 
@@ -491,13 +601,37 @@ asZBookmark(): ZBookmark {
 }
 ```
 
-### 权限过滤总结
+### 6.5 协作者访问机制与全局搜索的关系
 
-| 层级 | 位置 | 过滤逻辑 | 粒度 |
-|------|------|---------|------|
-| **L1 搜索引擎** | `bookmarks.ts:842` | `userId = currentUser` | 行级（排除其他用户数据） |
-| **L2 数据库加载** | `bookmarks.ts:122-131` | 所有权 + 共享列表权限 | 行级（校验单条访问权限） |
-| **L3 字段脱敏** | `bookmarks.ts:753-766` | 非所有者隐藏敏感字段 | 字段级（数据脱敏） |
+**关键发现**：协作者无法通过 `searchBookmarks` API 搜索到共享列表中的书签。
+
+**原因分析**：
+
+```
+用户 A 分享列表给 用户 B
+         │
+         ▼
+用户 B 调用 searchBookmarks("keyword")
+         │
+         ▼
+L1: userId = B 的 ID 过滤 → ❌ 排除所有用户 A 的书签
+         │
+         ▼
+结果为空（即使有匹配的共享书签）
+```
+
+**协作者的搜索路径**：
+
+协作者只能通过**列表上下文**查看和搜索共享书签：
+1. 进入共享列表详情页 → 列表内搜索使用 `getBookmarkIdsFromMatcher` 过滤
+2. 列表内搜索**不经过全局搜索引擎**，直接在数据库层面执行过滤
+3. 列表内搜索可以访问到协作者有权限的书签
+
+**设计权衡**：
+- ✅ 简化全局搜索的权限模型，性能最优
+- ✅ 避免索引中存储复杂的共享权限信息
+- ❌ 协作者无法使用全局搜索功能
+- ❌ 共享书签的全文搜索能力受限
 
 ---
 
@@ -549,7 +683,10 @@ filter = [
 2. **性能**：避免搜索时的表关联，搜索引擎可以直接匹配标签名
 3. **更新成本**：标签名称很少变化，更新成本可接受
 
-**同步机制：** 标签更新时 (`bookmarks.ts:1148`) 会触发重新索引，确保数据一致。
+**同步机制**：标签更新时触发重新索引，确保数据一致。标签变更会批量触发所有受影响书签的重新索引：
+- 标签合并：`packages/trpc/models/tags.ts:285-295`
+- 标签删除：`packages/trpc/models/tags.ts:324-330`
+- 标签重命名：`packages/trpc/models/tags.ts:362-368`
 
 ### 7.4 为什么批量处理仅在首次执行时启用？
 
@@ -559,6 +696,21 @@ filter = [
 1. **首次执行**：批量可显著减少 Meilisearch 的任务数，提高吞吐量
 2. **重试场景**：批量中的单个文档失败会导致整个批次重试，浪费资源
 3. **可靠性优先**：重试时应该直接发送单个任务，避免被其他文档牵连
+
+### 7.5 为什么全局搜索不支持协作者访问？
+
+**设计：** L1 搜索引擎层仅过滤 `userId = currentUser`，不考虑共享权限
+
+**理由：**
+1. **性能**：避免在搜索引擎中存储复杂的权限矩阵
+2. **简化模型**：索引文档只需存储 `userId`，无需维护协作者列表
+3. **更新成本**：协作者变更时无需重新索引所有相关书签
+4. **使用场景**：协作者通常在列表上下文内工作，全局搜索需求较少
+
+**权衡**：
+- ✅ 索引结构简单，更新成本低
+- ✅ 搜索查询性能最优
+- ❌ 协作者无法使用全局搜索
 
 ---
 
@@ -601,6 +753,7 @@ SearchIndexingWorker.run()          │
     │
     ▼
 parseSearchQuery()
+    ├─ result: "full" / "partial" / "invalid"
     ├─ text: "react"
     └─ matcher: AND(
           tagName: "tutorial",
@@ -616,7 +769,7 @@ getBookmarkIdsFromMatcher()
     ▼
 Meilisearch.search()
     query: "react"
-    filter: [id IN [id2, id3], userId = currentUser]
+    filter: [id IN [id2, id3], userId = currentUser]  ← ⚠️ 协作者被排除
     sort: createdAt:desc
     │
     ▼
@@ -625,7 +778,7 @@ Meilisearch.search()
     ▼
 Bookmark.loadMulti([id3, id2])
     ├─ 从 DB 读取完整数据
-    └─ isAllowedToAccessBookmark() 权限校验
+    └─ isAllowedToAccessBookmark() 权限校验  ← ⚠️ 但 L1 已过滤协作者
     │
     ▼
 按相关性重新排序 → [id3, id2]
@@ -648,12 +801,18 @@ asZBookmark() 字段脱敏
 | 批量队列实现 | `packages/plugins/search-meilisearch/src/index.ts` | 46-207 |
 | 搜索 Worker | `apps/workers/workers/searchWorker.ts` | 全文件 |
 | 触发索引函数 | `packages/shared-server/src/queues.ts` | 189-203 |
+| **删除书签触发 delete** | `packages/trpc/models/bookmarks.ts` | **934-942** |
 | 查询解析器 | `packages/shared/searchQueryParser.ts` | 全文件 |
+| **语义降级逻辑** | `packages/shared/searchQueryParser.ts` | **414-451** |
 | 数据库过滤逻辑 | `packages/trpc/lib/search.ts` | 全文件 |
 | 搜索 API 路由 | `packages/trpc/routers/bookmarks.ts` | 804-902 |
 | 创建书签触发索引 | `packages/trpc/routers/bookmarks.ts` | 431-451 |
+| **L1 userId 过滤** | `packages/trpc/routers/bookmarks.ts` | **838-842** |
 | 权限校验 | `packages/trpc/models/bookmarks.ts` | 122-131 |
 | 字段脱敏 | `packages/trpc/models/bookmarks.ts` | 753-766 |
+| **标签合并触发索引** | `packages/trpc/models/tags.ts` | **285-295** |
+| **标签删除触发索引** | `packages/trpc/models/tags.ts` | **324-330** |
+| **标签重命名触发索引** | `packages/trpc/models/tags.ts` | **362-368** |
 | 全量重索引 | `packages/trpc/routers/admin.ts` | 248-263 |
 | 搜索结果排序 | `packages/trpc/routers/bookmarks.ts` | 880-890 |
 
@@ -667,3 +826,5 @@ asZBookmark() 字段脱敏
 4. **同义词支持**：可配置 Meilisearch 同义词词典提升召回率
 5. **中文分词**：Meilisearch 默认中文分词效果一般，可考虑接入更专业的中文分词器
 6. **索引监控**：增加索引延迟、失败率等监控指标
+7. **协作者全局搜索**：可考虑在 L1 过滤后补充协作者可访问的书签 ID，或使用更复杂的权限模型
+8. **索引顺序保证**：可考虑使用有序队列或版本号确保索引操作的顺序一致性
