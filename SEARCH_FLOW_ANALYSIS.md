@@ -91,25 +91,29 @@ await Promise.all([
 **删除书签触发 delete 索引的精确代码：**
 ```typescript
 // packages/trpc/models/bookmarks.ts:934-942
+// 注意：这里直接调用 SearchIndexingQueue.enqueue，不经过 triggerSearchReindex
+// 且设置了 groupId（index 操作不设置 groupId，仅 delete 操作设置）
 await SearchIndexingQueue.enqueue(
   {
     bookmarkId: this.bookmark.id,
-    type: "delete",  // 直接指定 delete 类型
+    type: "delete",
   },
   {
-    groupId: this.ctx.user.id,
+    groupId: this.ctx.user.id,  // 仅 delete 操作设置 groupId
   },
 );
 ```
 
-**幂等性保证：**
+**幂等性保证（仅 index 操作）：**
 ```typescript
-// triggerSearchReindex 使用 idempotencyKey 防止重复入队
+// packages/shared-server/src/queues.ts:189-203
+// triggerSearchReindex 仅设置 idempotencyKey，不设置 groupId
 await SearchIndexingQueue.enqueue(
   { bookmarkId, type: "index" },
   {
     ...opts,
     idempotencyKey: `index:${bookmarkId}`,  // 同一书签的索引任务会去重
+    // 注意：不设置 groupId，与 delete 操作不同
   }
 );
 ```
@@ -126,7 +130,9 @@ await SearchIndexingQueue.enqueue(
 1. `triggerSearchReindex(bookmarkId)` 入队
 2. `SearchIndexingWorker` 消费队列 (`apps/workers/workers/searchWorker.ts:23-176`)
 3. 从数据库读取完整书签数据，构建 `BookmarkSearchDocument`
-4. 调用 `searchClient.addDocuments([document])` 或 `searchClient.removeDocuments([id])`
+4. 调用 `searchClient.addDocuments([document])` 或 `searchClient.deleteDocuments([id])`
+
+> **⚠️ 接口名称勘误**：`SearchIndexClient` 接口中删除方法名为 `deleteDocuments`（`packages/shared/search.ts:76`），Meilisearch 实现中调用 `this.index.deleteDocuments(ids)`（`packages/plugins/search-meilisearch/src/index.ts:190,257`）。Worker 的 `runDelete` 函数调用的是 `searchClient.deleteDocuments([bookmarkId], { batch })`（`apps/workers/workers/searchWorker.ts:133`）。早期版本中曾误写为 `removeDocuments`，实际代码中不存在该方法名。
 
 **文档结构定义** (`packages/shared/search.ts:5-23`)：
 ```typescript
@@ -250,10 +256,29 @@ Meilisearch 插件实现了**客户端级别的批量队列** (`BatchingDocument
 
 **潜在时序问题：**
 - 如果任务分布在不同批次，且 Worker 并发执行，可能出现旧数据覆盖新数据的情况
-- 但由于索引操作是幂等的（最后一次执行的是数据库的最新数据），**最终一致性可以保证**
-- **groupId 机制**：索引任务使用 `groupId: userId`，如果队列实现支持按组串行化，可以保证同一用户的索引任务顺序执行（取决于具体队列插件实现）
+- **`idempotencyKey` 机制**：`triggerSearchReindex` 为 index 操作设置 `idempotencyKey: index:{bookmarkId}`（`packages/shared-server/src/queues.ts:200`），防止同一时刻对同一书签重复入队，但不保证执行顺序
+- **`groupId` 机制**：仅 delete 操作设置 `groupId: userId`（`packages/trpc/models/bookmarks.ts:100`），index 操作**不设置 `groupId`**（`packages/shared-server/src/queues.ts:193-202` 中 `triggerSearchReindex` 只传 `idempotencyKey`，不传 `groupId`）。若队列实现按 `groupId` 串行化，仅能约束同一用户的 delete 操作顺序，对 index 操作无约束
 
-> **结论**：系统实现了**最终一致性**，但不保证**强顺序一致性**。由于索引操作读取的是数据库的最新状态，即使执行顺序颠倒，最终索引内容也是正确的。
+#### 可收敛性分析
+
+索引状态是否最终收敛取决于以下前提条件：
+
+| 前提条件 | 代码依据 | 不满足时的后果 |
+|---------|---------|--------------|
+| ① Worker 执行 `runIndex` 时从 DB 读取的数据是当时最新已提交状态 | `searchWorker.ts:68-80` 使用 `db.query.bookmarks.findFirst` 无锁读 | 若 DB 有未提交事务，Worker 可能读到稍旧数据；但事务提交后再次索引即可修正 |
+| ② 对同一书签的多次索引任务最终全部被消费（无永久失败） | 队列配置 `numRetries: 5`（`packages/shared-server/src/queues.ts:145`），失败 5 次后永久丢弃 | 若 5 次重试均失败，该书签索引可能停留在旧状态，**不会自动收敛** |
+| ③ 同一书签的并发索引任务不会无限交替执行 | `idempotencyKey` 防止同一时刻重复入队（`packages/shared-server/src/queues.ts:200`）；`BatchingDocumentQueue` 批次内去重（`packages/plugins/search-meilisearch/src/index.ts:100-105`） | 若任务持续产生且交替进入不同批次，理论上存在活锁风险，但实际场景中书签数据变更频率远低于索引消费速度 |
+
+> **审慎结论**：在以下前提同时满足时，索引状态**可收敛至数据库最新已提交状态**：
+> - ① Worker 正常消费、重试未耗尽（5 次，`packages/shared-server/src/queues.ts:145`）
+> - ② DB 读取时无长事务阻塞导致 Worker 读到旧快照
+> - ③ 对同一书签不再产生新的索引触发（否则新的触发可能因 `idempotencyKey` 去重而被丢弃，此时正在队列中的旧任务读取的可能是旧数据）
+>
+> 系统不提供强顺序一致性保证，且存在以下边界：
+> - 重试 5 次全部失败后，索引将永久停留在失败前的状态，需管理员手动触发 `reindexAllBookmarks` 修复
+> - index 操作不设置 `groupId`（仅 delete 操作设置），因此 Worker 并发数 `> 1`（`serverConfig.search.numWorkers`，`apps/workers/workers/searchWorker.ts:53`）时，同一书签的两次 index 任务可能交错执行，短暂呈现旧数据覆盖新数据的中间态
+> - `BatchingDocumentQueue` 的去重仅在同一批次内生效（`packages/plugins/search-meilisearch/src/index.ts:100-105`），跨批次的不同任务仍会各自执行一次完整的 DB 读取 + 索引写入
+> - `idempotencyKey: index:{bookmarkId}` 在任务仍在队列中时阻止新入队，但若旧任务失败后新触发已因去重被丢弃，可能出现索引停留于旧状态直到下一次变更触发
 
 ---
 
@@ -303,7 +328,9 @@ function parseSearchQuery(
 |---------|---------|---------|---------|
 | **`full`** | 完全解析成功，所有 Token 被消费 | 正常返回 `text` 和 `matcher` | `searchQueryParser.ts:447-451` |
 | **`partial`** | 解析成功但部分 Token 未被消费（通常是用户正在输入） | 已解析的 matcher 保留，未消费的 Token 追加到 `text` 中 | `searchQueryParser.ts:433-444` |
-| **`invalid`** | 解析完全失败（语法错误、多歧义等） | **整个查询作为纯文本处理**，`matcher` 为 undefined | `searchQueryParser.ts:419-424` |
+| **`invalid`** | 解析器返回零个候选或多个歧义候选 | **整个查询作为纯文本处理**，`matcher` 为 undefined | `searchQueryParser.ts:419-424` |
+
+> **⚠️ `invalid` 触发条件说明**：`invalid` 仅在 `!parsed.successful || parsed.candidates.length != 1` 时触发（`searchQueryParser.ts:419`）。MATCHER 规则的四个分支依次为：① `is:` + Ident（`searchQueryParser.ts:122-189`）、② Qualifier/Hash + Ident/StringLiteral（`searchQueryParser.ts:191-311`）、③ **兜底分支** `alt(tok(TokenType.Ident), tok(TokenType.Qualifier))`（`searchQueryParser.ts:314`）、④ `kmid(LParen, EXP, RParen)`（`searchQueryParser.ts:320`）。由于兜底分支的存在，`Ident` 和 `Qualifier` 类型的 Token 永远能被成功解析为纯文本。**只有当 Token 流的首个 Token 不属于 `Ident` 或 `Qualifier` 类型、且无法匹配其他分支时**，才会触发 `invalid`。具体而言，以下 Token 类型不在兜底分支覆盖范围内：`RParen`、`StringLiteral`（作为独立首 Token）、`LParen`（若 `kmid` 内部解析失败）。
 
 **单限定符解析失败的降级：**
 ```typescript
@@ -339,7 +366,12 @@ default:
 | `is:fav is:helloworld` | `full` | `"is:helloworld"` | `{type: "favourited", favourited: true}` |
 | `(is:archived) or ` | `partial` | `"or"` | `{type: "archived", archived: true}` |
 | `is:fav is: ( random` | `partial` | `"is: ( random"` | `{type: "favourited", favourited: true}` |
-| `完全无效的语法 @#$%` | `invalid` | `"完全无效的语法 @#$%"` | `undefined` |
+| `hello world` | `full` | `"hello world"` | `undefined` |
+| `@#$%` | `full` | `"@#$%"` | `undefined`（Ident 规则兜底） |
+| `)` | **`invalid`** | `")"` | `undefined`（首 Token 为 RParen，MATCHER 无分支可匹配） |
+| `"hello"` | **`invalid`** | `"\"hello\""` | `undefined`（首 Token 为 StringLiteral，MATCHER 无独立分支处理） |
+
+> `hello world` 和 `@#$%` 被 `Ident` 词法规则 `/^[^ )(]+/`（`searchQueryParser.ts:59`）tokenize 后，MATCHER 的兜底分支（`searchQueryParser.ts:314`）将其归为纯文本，因此结果为 `full`。而 `)` 产生 `RParen` Token、`"hello"` 产生 `StringLiteral` Token——这两种 Token 类型不在兜底分支 `alt(tok(Ident), tok(Qualifier))` 的覆盖范围内，也不匹配其他 MATCHER 分支，因此触发 `invalid`。测试文件（`packages/shared/searchQueryParser.test.ts`）中未覆盖 `invalid` 场景。
 
 **解析结果结构：**
 ```typescript
@@ -620,12 +652,30 @@ L1: userId = B 的 ID 过滤 → ❌ 排除所有用户 A 的书签
 结果为空（即使有匹配的共享书签）
 ```
 
-**协作者的搜索路径**：
+#### 6.5.1 全局搜索路径 `searchBookmarks` 与列表浏览路径 `getBookmarks` 的区别
 
-协作者只能通过**列表上下文**查看和搜索共享书签：
-1. 进入共享列表详情页 → 列表内搜索使用 `getBookmarkIdsFromMatcher` 过滤
-2. 列表内搜索**不经过全局搜索引擎**，直接在数据库层面执行过滤
-3. 列表内搜索可以访问到协作者有权限的书签
+这两条数据路径在权限过滤的入口处就已分叉，不可混淆：
+
+| 维度 | `searchBookmarks` 路径 | `getBookmarks` 路径 |
+|------|----------------------|---------------------|
+| **入口** | `routers/bookmarks.ts:804` | `routers/bookmarks.ts:951` |
+| **数据获取** | 先经 Meilisearch 全文搜索，再 `Bookmark.loadMulti` | 直接 `Bookmark.loadMulti`，不经搜索引擎 |
+| **过滤逻辑** | `parseSearchQuery` → `getBookmarkIdsFromMatcher`（数据库结构化过滤）→ Meilisearch 全文搜索 + `userId` 过滤 | `Bookmark.loadMulti` 内部的 DB 查询过滤（按 `listId`/`tagId`/`rssFeedId`/`archived`/`favourited`/`type`/`ids`，`models/bookmarks.ts:400-460`） |
+| **L1 权限过滤** | Meilisearch 强制 `userId = currentUser`（`routers/bookmarks.ts:838-842`） | 无 L1 搜索引擎过滤；`loadMulti` 的 DB 查询本身不限制 `userId` |
+| **L2 权限校验** | `Bookmark.loadMulti` → `isAllowedToAccessBookmark`（`models/bookmarks.ts:122-131`），但 L1 已排除协作者可见书签 | 同样经过 `isAllowedToAccessBookmark`，但输入 ID 未被 L1 截断，**协作者可见书签可以通过** |
+| **全文搜索** | ✅ 支持（Meilisearch） | ❌ 不支持 |
+| **协作者可见** | ❌ 不可以 | ✅ 可以（`isAllowedToAccessBookmark` 会校验共享列表权限） |
+
+> **⚠️ 两条路径的过滤机制完全不同**：`searchBookmarks` 使用 `parseSearchQuery` + `getBookmarkIdsFromMatcher`（`packages/trpc/lib/search.ts`）将查询解析为 Matcher AST 再转为 DB 查询，而 `getBookmarks` 使用 `Bookmark.loadMulti`（`packages/trpc/models/bookmarks.ts:400-460`）直接根据 `zGetBookmarksRequestSchema` 的字段构建 DB 查询。**两者不共享过滤逻辑**，不能将 `getBookmarks` 的协作者可见性推广到 `searchBookmarks`。
+
+#### 6.5.2 协作者的实际访问路径
+
+协作者只能通过**列表上下文**查看共享书签：
+1. 进入共享列表详情页 → 前端调用 `getBookmarks` 接口（`routers/bookmarks.ts:951`）
+2. 该接口走 `Bookmark.loadMulti(ctx, input)`（`models/bookmarks.ts:400-460`），根据 `listId` 等 `zGetBookmarksRequestSchema` 字段构建 DB 查询，**不经过全局搜索引擎**
+3. `loadMulti` 内部对每条结果调用 `isAllowedToAccessBookmark`（`models/bookmarks.ts:122-131`），校验共享列表权限
+4. **协作者对共享书签没有全文搜索能力**——因为全文搜索唯一走 `searchBookmarks`，而 `searchBookmarks` 的 L1 已排除所有非所有者书签
+5. 列表浏览中的过滤（按标签、按类型、按收藏等）由 `loadMulti` 内部 DB 查询实现（`models/bookmarks.ts:428-460`），**不使用 `getBookmarkIdsFromMatcher`**（该函数仅用于 `searchBookmarks` 路径）
 
 **设计权衡**：
 - ✅ 简化全局搜索的权限模型，性能最优
@@ -797,17 +847,25 @@ asZBookmark() 字段脱敏
 | 功能模块 | 文件路径 | 关键行号 |
 |---------|---------|---------|
 | 搜索接口定义 | `packages/shared/search.ts` | 全文件 |
+| **deleteDocuments 接口** | `packages/shared/search.ts` | **76** |
 | Meilisearch 插件 | `packages/plugins/search-meilisearch/src/index.ts` | 全文件 |
+| **deleteDocuments 实现** | `packages/plugins/search-meilisearch/src/index.ts` | **190, 247-259** |
 | 批量队列实现 | `packages/plugins/search-meilisearch/src/index.ts` | 46-207 |
 | 搜索 Worker | `apps/workers/workers/searchWorker.ts` | 全文件 |
+| **runDelete 调用 deleteDocuments** | `apps/workers/workers/searchWorker.ts` | **133** |
 | 触发索引函数 | `packages/shared-server/src/queues.ts` | 189-203 |
+| **队列 numRetries 配置** | `packages/shared-server/src/queues.ts` | **145** |
 | **删除书签触发 delete** | `packages/trpc/models/bookmarks.ts` | **934-942** |
 | 查询解析器 | `packages/shared/searchQueryParser.ts` | 全文件 |
+| **Ident 词法规则** | `packages/shared/searchQueryParser.ts` | **59** |
+| **MATCHER 兜底分支** | `packages/shared/searchQueryParser.ts` | **314** |
 | **语义降级逻辑** | `packages/shared/searchQueryParser.ts` | **414-451** |
 | 数据库过滤逻辑 | `packages/trpc/lib/search.ts` | 全文件 |
 | 搜索 API 路由 | `packages/trpc/routers/bookmarks.ts` | 804-902 |
 | 创建书签触发索引 | `packages/trpc/routers/bookmarks.ts` | 431-451 |
 | **L1 userId 过滤** | `packages/trpc/routers/bookmarks.ts` | **838-842** |
+| **getBookmarks 入口** | `packages/trpc/routers/bookmarks.ts` | **951** |
+| **Bookmark.loadMulti** | `packages/trpc/models/bookmarks.ts` | **400-460** |
 | 权限校验 | `packages/trpc/models/bookmarks.ts` | 122-131 |
 | 字段脱敏 | `packages/trpc/models/bookmarks.ts` | 753-766 |
 | **标签合并触发索引** | `packages/trpc/models/tags.ts` | **285-295** |
