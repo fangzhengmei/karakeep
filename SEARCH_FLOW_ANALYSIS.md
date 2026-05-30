@@ -92,31 +92,65 @@ await Promise.all([
 ```typescript
 // packages/trpc/models/bookmarks.ts:934-942
 // 注意：这里直接调用 SearchIndexingQueue.enqueue，不经过 triggerSearchReindex
-// 且设置了 groupId（index 操作不设置 groupId，仅 delete 操作设置）
 await SearchIndexingQueue.enqueue(
   {
     bookmarkId: this.bookmark.id,
     type: "delete",
   },
   {
-    groupId: this.ctx.user.id,  // 仅 delete 操作设置 groupId
+    groupId: this.ctx.user.id,  // delete 操作设置 groupId，与 index 操作一致
   },
 );
 ```
 
-**幂等性保证（仅 index 操作）：**
+**幂等性与 groupId 透传（index 操作）：**
 ```typescript
 // packages/shared-server/src/queues.ts:189-203
-// triggerSearchReindex 仅设置 idempotencyKey，不设置 groupId
-await SearchIndexingQueue.enqueue(
-  { bookmarkId, type: "index" },
-  {
-    ...opts,
-    idempotencyKey: `index:${bookmarkId}`,  // 同一书签的索引任务会去重
-    // 注意：不设置 groupId，与 delete 操作不同
-  }
-);
+// triggerSearchReindex 签名接受 Omit<EnqueueOptions, "idempotencyKey">，
+// 因此 groupId、priority、delayMs 等字段会通过 ...opts 透传给队列
+export async function triggerSearchReindex(
+  bookmarkId: string,
+  opts?: Omit<EnqueueOptions, "idempotencyKey">,  // 透传除 idempotencyKey 外的所有字段
+) {
+  await SearchIndexingQueue.enqueue(
+    { bookmarkId, type: "index" },
+    {
+      ...opts,  // groupId、priority 等在此透传
+      idempotencyKey: `index:${bookmarkId}`,
+    },
+  );
+}
+
+// 调用示例（routers/bookmarks.ts:386-392, 443）
+const enqueueOpts: EnqueueOptions = {
+  priority: QueuePriority.Default,
+  groupId: ctx.user.id,  // 包含 groupId
+};
+await triggerSearchReindex(bookmark.id, enqueueOpts);  // groupId 被透传
 ```
+
+> **⚠️ 重要修正**：之前的"index 操作不设置 groupId"表述不准确。实际上 `triggerSearchReindex` 通过 `opts` 参数透传 `groupId`，且**所有业务调用点（创建、更新、打标签、生成摘要、标签合并/删除/重命名）均传入了 `groupId: ctx.user.id`**。唯一例外是全量重索引（`routers/admin.ts:259`）只传 `priority`，不传 `groupId`。
+
+**`triggerSearchReindex` 调用点 groupId 传递汇总：**
+
+| 调用场景 | 文件位置 | groupId 传递 |
+|---------|---------|-------------|
+| 创建书签 | `routers/bookmarks.ts:443` | 透传 `enqueueOpts.groupId = ctx.user.id`（`routers/bookmarks.ts:386-392`） |
+| 更新书签 | `routers/bookmarks.ts:626` | 显式传递 `{ groupId: ctx.user.id }` |
+| 更新书签文本（废弃 API） | `routers/bookmarks.ts:677` | 显式传递 `{ groupId: ctx.user.id }` |
+| 更新书签标签 | `routers/bookmarks.ts:1148` | 显式传递 `{ groupId: ctx.user.id }` |
+| 生成书签摘要 | `routers/bookmarks.ts:1322` | 显式传递 `{ groupId: ctx.user.id }` |
+| 标签合并 | `models/tags.ts:288` | 显式传递 `{ groupId: ctx.user.id }` |
+| 标签删除 | `models/tags.ts:326` | 显式传递 `{ groupId: this.ctx.user.id }` |
+| 标签重命名 | `models/tags.ts:364` | 显式传递 `{ groupId: this.ctx.user.id }` |
+| 爬虫完成 | `crawlerWorker.ts:2317` | 透传 `enqueueOpts.groupId = userId`（`crawlerWorker.ts:2293-2296`） |
+| AI 打标完成 | `tagging.ts:596` | 透传 `enqueueOpts.groupId = bookmark.userId`（`tagging.ts:579-582`） |
+| 资产预处理完成 | `assetPreprocessingWorker.ts:480` | 透传 `enqueueOpts.groupId = bookmark.userId`（`assetPreprocessingWorker.ts:459-462`） |
+| 摘要生成完成 | `summarize.ts:188` | 显式传递 `{ groupId: bookmarkData.userId }` |
+| 管理员单条重索引 | `admin.ts:700` | 显式传递 `{ priority: QueuePriority.Low, groupId: "admin" }` |
+| 管理员全量重索引 | `admin.ts:259` | 仅传递 `{ priority: QueuePriority.Low }`，**未传递 groupId** |
+
+> **结论**：除全量重索引（`routers/admin.ts:259`）外，**所有 `triggerSearchReindex` 调用点均传递了 `groupId`**。其中用户相关操作传递 `groupId: userId`，管理员单条操作传递 `groupId: "admin"`。若队列实现（如 BullMQ）支持按 `groupId` 串行化，则同一用户的所有 index 和 delete 操作将按入队顺序依次执行。
 
 ---
 
@@ -250,14 +284,14 @@ Meilisearch 插件实现了**客户端级别的批量队列** (`BatchingDocument
 
 | 层级 | 保证方式 | 效果 |
 |------|---------|------|
-| **队列层** | `idempotencyKey: index:{bookmarkId}` | 防止**同一时刻**的重复入队，但不保证顺序 |
+| **队列层** | `idempotencyKey: index:{bookmarkId}` + `groupId: userId`（全量重索引除外） | `idempotencyKey` 防止同一时刻重复入队；除全量重索引外，所有调用均传递 `groupId`，若队列实现（如 BullMQ）支持按 `groupId` 串行化，可保证同一用户的索引任务按入队顺序执行 |
 | **批量队列层** | `BatchingDocumentQueue` 去重 | 同一批次内只保留最后一次操作 |
 | **数据库读取** | Worker 执行时从 DB 读取最新数据 | 最终索引的是数据库中的最新状态 |
 
 **潜在时序问题：**
-- 如果任务分布在不同批次，且 Worker 并发执行，可能出现旧数据覆盖新数据的情况
-- **`idempotencyKey` 机制**：`triggerSearchReindex` 为 index 操作设置 `idempotencyKey: index:{bookmarkId}`（`packages/shared-server/src/queues.ts:200`），防止同一时刻对同一书签重复入队，但不保证执行顺序
-- **`groupId` 机制**：仅 delete 操作设置 `groupId: userId`（`packages/trpc/models/bookmarks.ts:100`），index 操作**不设置 `groupId`**（`packages/shared-server/src/queues.ts:193-202` 中 `triggerSearchReindex` 只传 `idempotencyKey`，不传 `groupId`）。若队列实现按 `groupId` 串行化，仅能约束同一用户的 delete 操作顺序，对 index 操作无约束
+- 如果任务分布在不同批次，且队列实现不支持 `groupId` 串行化时，Worker 并发执行可能出现旧数据覆盖新数据的情况
+- **`idempotencyKey` 机制**：`triggerSearchReindex` 为 index 操作设置 `idempotencyKey: index:{bookmarkId}`（`packages/shared-server/src/queues.ts:200`），防止同一时刻对同一书签重复入队，但不保证跨时刻的执行顺序
+- **`groupId` 机制**：`triggerSearchReindex` 的 `opts` 参数透传 `groupId`（`packages/shared-server/src/queues.ts:191-201` 使用 `...opts` 展开）。除全量重索引（`routers/admin.ts:259`）外，**所有 `triggerSearchReindex` 调用点均传递了 `groupId`**（用户操作传递 `userId`，管理员单条操作传递 `"admin"`）。若队列实现（如 BullMQ）支持按 `groupId` 串行化，则同一用户的所有 index 操作和 delete 操作将按入队顺序依次执行，可保证顺序一致性
 
 #### 可收敛性分析
 
@@ -273,10 +307,11 @@ Meilisearch 插件实现了**客户端级别的批量队列** (`BatchingDocument
 > - ① Worker 正常消费、重试未耗尽（5 次，`packages/shared-server/src/queues.ts:145`）
 > - ② DB 读取时无长事务阻塞导致 Worker 读到旧快照
 > - ③ 对同一书签不再产生新的索引触发（否则新的触发可能因 `idempotencyKey` 去重而被丢弃，此时正在队列中的旧任务读取的可能是旧数据）
+> - ④ 若队列实现支持 `groupId` 串行化（如 BullMQ），则**同一用户的所有 index/delete 操作按入队顺序执行**，可进一步保证顺序一致性；全量重索引（`routers/admin.ts:259`）不传递 `groupId`，若与用户正常操作交错可能出现中间态不一致
 >
-> 系统不提供强顺序一致性保证，且存在以下边界：
+> 系统不提供强顺序一致性保证（除非 `groupId` 串行化被队列实现支持），且存在以下边界：
 > - 重试 5 次全部失败后，索引将永久停留在失败前的状态，需管理员手动触发 `reindexAllBookmarks` 修复
-> - index 操作不设置 `groupId`（仅 delete 操作设置），因此 Worker 并发数 `> 1`（`serverConfig.search.numWorkers`，`apps/workers/workers/searchWorker.ts:53`）时，同一书签的两次 index 任务可能交错执行，短暂呈现旧数据覆盖新数据的中间态
+> - 全量重索引（`routers/admin.ts:259`）不传递 `groupId`，若队列实现依赖 `groupId` 串行化，则全量重索引任务可能与用户正常索引任务交错执行
 > - `BatchingDocumentQueue` 的去重仅在同一批次内生效（`packages/plugins/search-meilisearch/src/index.ts:100-105`），跨批次的不同任务仍会各自执行一次完整的 DB 读取 + 索引写入
 > - `idempotencyKey: index:{bookmarkId}` 在任务仍在队列中时阻止新入队，但若旧任务失败后新触发已因去重被丢弃，可能出现索引停留于旧状态直到下一次变更触发
 
@@ -853,7 +888,9 @@ asZBookmark() 字段脱敏
 | 批量队列实现 | `packages/plugins/search-meilisearch/src/index.ts` | 46-207 |
 | 搜索 Worker | `apps/workers/workers/searchWorker.ts` | 全文件 |
 | **runDelete 调用 deleteDocuments** | `apps/workers/workers/searchWorker.ts` | **133** |
-| 触发索引函数 | `packages/shared-server/src/queues.ts` | 189-203 |
+| **触发索引函数** | `packages/shared-server/src/queues.ts` | 189-203 |
+| **triggerSearchReindex opts 透传** | `packages/shared-server/src/queues.ts` | **191, 199** |
+| **创建书签 enqueueOpts（含 groupId）** | `packages/trpc/routers/bookmarks.ts` | **386-392** |
 | **队列 numRetries 配置** | `packages/shared-server/src/queues.ts` | **145** |
 | **删除书签触发 delete** | `packages/trpc/models/bookmarks.ts` | **934-942** |
 | 查询解析器 | `packages/shared/searchQueryParser.ts` | 全文件 |
