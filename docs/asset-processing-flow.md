@@ -8,7 +8,7 @@
 2. 哪些类型会在创建资产书签时被拒绝
 3. 图片与 PDF 的后台处理分支分别执行了什么任务
 4. "提取未落库但任务成功完成"的分支在什么情况下仍会入队 AI 任务
-5. tagging 和 summarization 的状态如何变化
+5. tagging 和 summarization 的状态如何变化，特别是 `taggingStatus = "success"` 的统一判定标准
 6. 这些条件为何会影响状态卡顿的排查
 
 ---
@@ -195,9 +195,222 @@ if (!isFixMode || anythingChanged) {
 
 ---
 
-## 五、AI 任务入队后的处理流程
+## 五、`taggingStatus = "success"` 的统一判定标准
 
-### 5.1 图片类型：打标签绕过 OCR 结果
+这是之前结论存在矛盾的核心。现在统一梳理所有能得到 `taggingStatus = "success"` 的执行路径。
+
+### 5.1 状态更新的唯一入口
+
+`taggingStatus` 的更新只有一个入口：`attemptMarkStatus()` 函数。
+
+```typescript
+// inferenceWorker.ts:21-41
+async function attemptMarkStatus(
+  jobData: object | undefined,
+  status: "success" | "failure",
+) {
+  if (!jobData) return;
+  try {
+    const request = zOpenAIRequestSchema.parse(jobData);
+    await db
+      .update(bookmarks)
+      .set({
+        ...(request.type === "tag" ? { taggingStatus: status } : {}),
+      })
+      .where(eq(bookmarks.id, request.bookmarkId));
+  } catch (e) {
+    logger.error(`Something went wrong when marking the tagging status: ${e}`);
+  }
+}
+```
+
+`attemptMarkStatus()` 仅在两个地方被调用：
+1. **`onComplete` 回调**（第 58 行）：`attemptMarkStatus(job.data, "success")`
+2. **`onError` 回调**（第 68 行）：`attemptMarkStatus(job?.data, "failure")`（仅当 `job.numRetriesLeft == 0`）
+
+**核心规则：只要 `runOpenAI()` 函数正常返回（不抛异常），`onComplete` 就会被调用，`taggingStatus` 就会被设为 `"success"`。**
+
+### 5.2 `taggingStatus = "success"` 且**有标签产物**的路径
+
+**唯一一条路径**：
+
+```
+入队 tag 任务
+  ↓
+inferenceClient 存在
+  ↓
+全局开关 enableAutoTagging = true
+  ↓
+用户开关 autoTaggingEnabled = true
+  ↓
+inferTags() 返回非 null 且非空数组
+  ↓
+connectTags() 执行标签匹配/创建/关联
+  ↓
+runOpenAI() 正常返回
+  ↓
+onComplete → taggingStatus = "success"
+  ↓
+✅ tagsOnBookmarks 表中有记录
+```
+
+**触发条件：**
+- AI 配置完整且服务可用
+- 用户开启了自动标签功能
+- 内容充足（非 GIF、有 OCR 文本或可视觉分析）
+- AI 返回了符合 schema 的非空标签数组
+
+**可观察证据：**
+- `tagsOnBookmarks` 表中存在 `attachedBy = "ai"` 的记录
+- 日志中有 `Inferring tag for bookmark ... used X tokens and inferred: [...]`
+- 日志中有 `triggerSearchReindex` 记录（`tagging.ts:596`）
+
+---
+
+### 5.3 `taggingStatus = "success"` 但**没有标签产物**的路径
+
+共 **5 条路径**，全部满足「`runOpenAI()` 正常返回 → `onComplete` 标记 success」但「`connectTags()` 未执行或未写入任何标签」。
+
+---
+
+#### 路径 A：`inferenceClient` 未配置
+
+**触发条件：**
+```typescript
+// inferenceWorker.ts:86-92
+const inferenceClient = InferenceClientFactory.build();
+if (!inferenceClient) {
+  logger.debug(`[inference][${jobId}] No inference client configured, nothing to do now`);
+  return;  // 直接返回，不抛异常
+}
+```
+- `InferenceClientFactory.build()` 返回 `null`（未配置 API Key 或模型）
+- `runOpenAI()` 在第 91 行直接 `return`
+- **不会调用 `runTagging()`**
+- 任务标记为成功
+
+**可观察证据：**
+- 日志（debug 级别）：`No inference client configured, nothing to do now`
+- `tagsOnBookmarks` 表中没有新记录
+- 没有 `Starting an inference job` 日志（该日志在 `runTagging()` 第 555 行）
+
+---
+
+#### 路径 B：全局自动标签开关关闭
+
+**触发条件：**
+```typescript
+// tagging.ts:510-514
+if (!serverConfig.inference.enableAutoTagging) {
+  logger.debug(`[inference][${jobId}] Skipping tagging job ... because it's disabled in the config.`);
+  return;
+}
+```
+- `serverConfig.inference.enableAutoTagging = false`
+- `runTagging()` 在第 514 行直接 `return`
+- 不调用 `connectTags()`
+
+**可观察证据：**
+- 日志（debug 级别）：`Skipping tagging job ... because it's disabled in the config.`
+- 有 `Starting an inference job` 日志吗？**没有**，因为第 555 行的日志在检查之后
+- `tagsOnBookmarks` 表中没有新记录
+
+---
+
+#### 路径 C：用户自动标签开关关闭
+
+**触发条件：**
+```typescript
+// tagging.ts:535-539
+if (userSettings?.autoTaggingEnabled === false) {
+  logger.debug(`[inference][${jobId}] Skipping tagging job ... because user has disabled auto-tagging.`);
+  return;
+}
+```
+- 用户在设置中关闭了自动标签
+- `runTagging()` 在第 539 行直接 `return`
+- 不调用 `connectTags()`
+
+**可观察证据：**
+- 日志（debug 级别）：`Skipping tagging job ... because user has disabled auto-tagging.`
+- 有 `Starting an inference job` 日志吗？**有**，在第 555 行
+- `tagsOnBookmarks` 表中没有新记录
+
+---
+
+#### 路径 D：`inferTags()` 返回 null（内容不足）
+
+**触发条件：** `inferTags()` 返回 `null`，由以下子路径触发：
+
+| 子路径 | 触发场景 | 代码位置 |
+|--------|---------|---------|
+| D-1 | GIF 图片 | `tagging.ts:152-157` |
+| D-2 | Link 无标题且无内容 | `tagging.ts:99-105` |
+| D-3 | `buildPrompt()` 返回 null | `tagging.ts:278-279` |
+
+```typescript
+// tagging.ts:569-574
+if (tags === null) {
+  logger.info(`[inference][${jobId}] Skipping tagging for bookmark "${bookmark.id}" due to missing content.`);
+  return;
+}
+```
+- `runTagging()` 在第 574 行直接 `return`
+- 不调用 `connectTags()`
+
+**可观察证据：**
+- 日志（info 级别）：`Skipping tagging for bookmark ... due to missing content.`
+- 有 `Starting an inference job` 日志
+- `tagsOnBookmarks` 表中没有新记录
+- 对于 GIF：日志中还有 `Skipping inference ... because it's a GIF.`（info 级别）
+
+---
+
+#### 路径 E：AI 返回空数组 `tags = []`
+
+**触发条件：**
+- `inferTags()` 返回非 null
+- AI 返回的 JSON 符合 schema 但 `tags` 是空数组 `[]`
+- `openAIResponseSchema = z.object({ tags: z.array(z.string()) })` 允许空数组
+
+```typescript
+// tagging.ts:397-398
+async function connectTags(bookmarkId, inferredTags, userId) {
+  if (inferredTags.length == 0) {
+    return;  // 空数组直接返回，不执行任何操作
+  }
+  // ... 后续标签关联逻辑
+}
+```
+- `connectTags()` 检测到空数组，直接 `return`
+- 不执行标签匹配、创建、关联
+- 但 `runTagging()` 正常完成，不抛异常
+- 后续 webhook 和搜索索引仍会触发吗？**会**，在 `tagging.ts:585-596`
+
+**可观察证据：**
+- 日志中有 `Inferring tag for bookmark ... used X tokens and inferred: []`
+- `tagsOnBookmarks` 表中没有新记录（但旧的 AI 标签也不会被删除，因为删除逻辑在 `connectTags()` 第 451-459 行）
+- 有 `triggerSearchReindex` 日志
+- 注意：这条路径的特殊之处在于**消耗了 token** 但没有产生任何标签
+
+---
+
+### 5.4 各路径对比汇总
+
+| 路径 | taggingStatus | 有标签? | 消耗 token? | 日志级别 | 关键日志关键词 |
+|------|--------------|---------|------------|---------|---------------|
+| 正常成功 | success | ✅ | ✅ | info | `Inferring tag ... and inferred: [...]` |
+| A. inferenceClient 未配置 | success | ❌ | ❌ | debug | `No inference client configured` |
+| B. 全局开关关闭 | success | ❌ | ❌ | debug | `disabled in the config` |
+| C. 用户开关关闭 | success | ❌ | ❌ | debug | `user has disabled auto-tagging` |
+| D. 内容不足（GIF/空） | success | ❌ | ❌（D-1）/ ✅（D-2/3） | info | `due to missing content` |
+| E. AI 返回空数组 | success | ❌ | ✅ | info | `and inferred: []` |
+
+---
+
+## 六、AI 任务入队后的处理流程
+
+### 6.1 图片类型：打标签绕过 OCR 结果
 
 当图片 OCR 失败但仍入队 tag 任务时，`inferenceWorker` 的处理路径：
 
@@ -235,9 +448,9 @@ return inferenceClient.inferFromImage(
 - OCR → `bookmarkAssets.content` → 用于全文搜索
 - AI 打标签 → 直接读图片 → 视觉模型 → 生成标签
 
-即使 OCR 失败，只要图片文件存在，AI 打标签仍然可以工作。
+即使 OCR 失败，只要图片文件存在且非 GIF，AI 打标签仍然可以工作（路径 D-1 除外）。
 
-### 5.2 PDF 类型：打标签依赖提取的文本
+### 6.2 PDF 类型：打标签依赖提取的文本
 
 ```typescript
 // tagging.ts:237-262
@@ -253,7 +466,7 @@ async function inferTagsFromPDF(...) {
 
 PDF 打标签使用提取的文本。但 PDF 文本提取失败会抛异常，所以不会走到 AI 入队步骤。
 
-### 5.3 资产类型的 summarize 任务：会被静默跳过
+### 6.3 资产类型的 summarize 任务：会被静默跳过
 
 ```typescript
 // summarize.ts:20-45
@@ -287,11 +500,13 @@ if (bookmarkData.type === BookmarkTypes.LINK && bookmarkData.link) {
 - 任务被标记为成功完成
 - `onComplete` 回调仍然会调用 `attemptMarkStatus(job.data, "success")`
 
+这也是一条 "success 但无产物" 的路径：`summarizationStatus = "success"` 但 `summary = null`。
+
 ---
 
-## 六、完整状态流转
+## 七、完整状态流转
 
-### 6.1 初始状态
+### 7.1 初始状态
 
 创建资产类型书签时（`packages/trpc/routers/bookmarks.ts:242-258` + `packages/db/schema.ts:205-210`）：
 
@@ -302,7 +517,7 @@ if (bookmarkData.type === BookmarkTypes.LINK && bookmarkData.link) {
 
 **资产类型书签的 `summarizationStatus` 初始为 `null`，不是 `"pending"`。**
 
-### 6.2 图片 OCR 成功路径（anythingChanged = true）
+### 7.2 图片 OCR 成功路径（anythingChanged = true）
 
 ```
 创建书签
@@ -330,7 +545,7 @@ inferenceWorker (summarize)
   bookmarkAssets.content="..." ✅ （有提取文本）
 ```
 
-### 6.3 图片 OCR 静默失败路径（anythingChanged = false）
+### 7.3 图片 OCR 静默失败路径（anythingChanged = false）
 
 ```
 创建书签
@@ -344,23 +559,23 @@ OCR 失败 → anythingChanged=false
 !isFixMode=true → 仍入队 tag + summarize + 搜索索引  ⚠️
   ↓
 inferenceWorker (tag)
-  ├─ inferTagsFromImage() → 视觉模型打标签（绕过 OCR）
-  ├─ 保存标签
-  └─ onComplete → taggingStatus="success" ✅ （通常成功）
+  ├─ 非 GIF → inferTagsFromImage() → 视觉模型打标签（绕过 OCR）
+  │    ├─ 正常 → 保存标签 → taggingStatus="success" ✅
+  │    └─ AI 返回 [] → 无标签 → taggingStatus="success" ⚠️ （路径 E）
+  ├─ GIF → 返回 null → 无标签 → taggingStatus="success" ⚠️ （路径 D-1）
+  └─ inferenceClient=null → 无标签 → taggingStatus="success" ⚠️ （路径 A）
   ↓
 inferenceWorker (summarize)
   ├─ 检测非 LINK → 跳过
   └─ onComplete → summarizationStatus="success"  ⚠️  虚假成功！
   ↓
 最终状态：
-  taggingStatus="success" ✅ （有真实标签）
+  taggingStatus="success" （可能有标签，也可能没有，取决于具体路径）
   summarizationStatus="success" ⚠️  （但 summary=null）
   bookmarkAssets.content=null ⚠️ （OCR 失败，无提取文本）
 ```
 
-**之前的错误结论：** 认为 OCR 失败后 taggingStatus 会卡在 pending。实际情况是：**taggingStatus 会变为 success，因为 inferTagsFromImage() 绕过了 OCR 结果。**
-
-### 6.4 PDF 文本提取成功路径
+### 7.4 PDF 文本提取成功路径
 
 ```
 创建书签
@@ -385,7 +600,7 @@ inferenceWorker (summarize)
   └─ onComplete → summarizationStatus="success"  ⚠️  虚假成功！
 ```
 
-### 6.5 PDF 文本提取失败路径
+### 7.5 PDF 文本提取失败路径
 
 ```
 创建书签
@@ -412,11 +627,11 @@ PDF 文本为空 → throw Error
 
 ---
 
-## 七、状态卡顿的根源分析
+## 八、状态卡顿的根源分析
 
 "状态卡顿"不是指停留在 `pending`，而是指**状态与实际内容不一致**，或**状态机无法正常推进**。以下是几种典型场景：
 
-### 7.1 场景 1：summarizationStatus 虚假成功
+### 8.1 场景 1：summarizationStatus 虚假成功
 
 **表现：** `summarizationStatus = "success"` 但 `summary = null`
 
@@ -430,45 +645,30 @@ PDF 文本为空 → throw Error
 
 **排查难点：** 状态显示成功，容易误导排查者认为"已经处理过了"，但实际上什么都没做。
 
-### 7.2 场景 2：inferenceClient 未配置
+**可观察证据：**
+- 日志（warn 级别）：`Bookmark ... (type: asset) is not a LINK or TEXT type ... Skipping summary.`
 
-**表现：** `taggingStatus = "success"` 但没有任何标签
+---
 
-**原因：**
-```typescript
-// inferenceWorker.ts:86-92
-const inferenceClient = InferenceClientFactory.build();
-if (!inferenceClient) {
-  logger.debug(
-    `[inference][${jobId}] No inference client configured, nothing to do now`,
-  );
-  return;  // 直接返回，不抛异常
-}
-```
-- `inferenceClient` 为 null 时直接返回
-- 任务标记为成功
-- `onComplete` 标记 `taggingStatus = "success"`
-- 但 `runTagging()` 从未执行，没有标签
+### 8.2 场景 2：taggingStatus 虚假成功（5 条子路径）
 
-### 7.3 场景 3：GIF 图片被跳过打标签
+**表现：** `taggingStatus = "success"` 但 `tagsOnBookmarks` 表中没有新的 AI 标签
 
-**表现：** `taggingStatus = "success"` 但没有任何标签
+**对应第五章的 5 条路径：**
 
-**原因：**
-```typescript
-// tagging.ts:152-157
-if (metadata.contentType === ASSET_TYPES.IMAGE_GIF) {
-  logger.info(
-    `[inference][${jobId}] Skipping inference for bookmark with id "${bookmark.id}" because it's a GIF.`,
-  );
-  return null;  // 返回 null，不抛异常
-}
-```
-- GIF 图片返回 null
-- `runTagging()` 收到 null → 不调用 `connectTags()` → 没有标签
-- 但任务成功完成 → `taggingStatus = "success"`
+| 路径 | 排查关键词 | 日志级别 |
+|------|-----------|---------|
+| A. inferenceClient 未配置 | `No inference client configured` | debug |
+| B. 全局开关关闭 | `disabled in the config` | debug |
+| C. 用户开关关闭 | `user has disabled auto-tagging` | debug |
+| D. 内容不足 | `due to missing content` / `because it's a GIF` | info |
+| E. AI 返回空数组 | `and inferred: []` | info |
 
-### 7.4 场景 4：AI 返回的标签不符合 schema
+**排查难点：** 状态显示成功，但实际上没有标签产物。如果不查数据库，仅看状态字段会被误导。
+
+---
+
+### 8.3 场景 3：AI 返回的标签不符合 schema
 
 **表现：** 任务失败重试，最终标记为 `failure`
 
@@ -491,7 +691,12 @@ let tags = openAIResponseSchema.parse(
 
 这是唯一会标记为 `failure` 的场景。
 
-### 7.5 场景 5：预处理 Worker 永久失败
+**可观察证据：**
+- 日志中有 `The model ignored our prompt and didn't respond with the expected JSON`
+
+---
+
+### 8.4 场景 4：预处理 Worker 永久失败
 
 **表现：** `taggingStatus = null`，`summarizationStatus = null`
 
@@ -500,20 +705,40 @@ let tags = openAIResponseSchema.parse(
 - `onError` 回调将 `taggingStatus` 从 `"pending"` 改为 `null`
 - 状态回到"未开始"，不会入队 AI 任务
 
+**可观察证据：**
+- assetPreprocessingWorker 错误日志中有 `PDF text is empty` 或其他异常
+
 ---
 
-## 八、关键差异总结
+### 8.5 场景 5：真正的 pending 卡顿
 
-### 8.1 两个 Worker 的失败处理对比
+**表现：** `taggingStatus = "pending"` 长时间（超过 10 分钟）不动
+
+**这才是真正的"卡顿"，可能原因：**
+1. `AssetPreprocessingQueue` 队列积压，Worker 处理不过来
+2. `OpenAIQueue` 队列积压
+3. inferenceWorker 进程挂了
+4. Worker 内部死锁或无限等待
+
+**可观察证据：**
+- 检查队列长度：`getQueueClient().getQueue(OpenAIQueue).getJobCounts()`
+- 检查 Worker 进程是否存活
+- 查看是否有 `Starting an inference job` 日志但没有 `Completed successfully`
+
+---
+
+## 九、关键差异总结
+
+### 9.1 两个 Worker 的失败处理对比
 
 | 维度 | 资产预处理 Worker | AI 推理 Worker |
 |------|------------------|----------------|
 | 永久失败标记 | `null`（清空状态） | `"failure"`（标记失败） |
-| 静默失败处理 | OCR 返回 null 时任务正常完成，仍入队 AI | 多种场景下任务标记为成功但实际无内容 |
+| 静默失败处理 | OCR 返回 null 时任务正常完成，仍入队 AI | 5 条路径下任务标记为 success 但实际无内容 |
 | 重试次数 | 2 次 | 3 次 |
 | summarizationStatus 初始值 | `null`（资产类型不参与自动摘要） | `null`（入队后会被改为 "success"，虚假） |
 
-### 8.2 图片 vs PDF 的处理路径对比
+### 9.2 图片 vs PDF 的处理路径对比
 
 | 维度 | 图片 | PDF |
 |------|------|-----|
@@ -521,40 +746,63 @@ let tags = openAIResponseSchema.parse(
 | OCR 失败是否入队 AI | ✅ 仍入队 | ❌ 不会执行到入队 |
 | AI 打标签是否依赖 OCR | ❌ 绕过，直接读图片 | ✅ 依赖提取的文本 |
 | 是否生成截图 | ❌ | ✅ |
-| 空内容是否导致永久失败 | ❌（tag 任务通常成功） | ✅ |
+| 空内容是否导致永久失败 | ❌（tag 任务通常 success） | ✅ |
+
+### 9.3 taggingStatus vs summarizationStatus 的状态对比
+
+| 维度 | taggingStatus | summarizationStatus |
+|------|--------------|---------------------|
+| 资产类型初始值 | `"pending"` | `null` |
+| success 但无产物路径 | 5 条 | 1 条（非 LINK 跳过） |
+| 永久失败标记 | `"failure"` | `"failure"` |
+| 无开关时状态 | 可能 success（路径 A/B/C） | 可能 success（虚假） |
 
 ---
 
-## 九、排查指南
+## 十、排查指南
 
 当遇到状态显示异常时，按以下步骤排查：
 
-1. **检查 `summarizationStatus = "success"` 但 `summary = null`**
-   - 这是正常现象！资产类型目前不支持自动摘要
-   - 无需修复，是设计如此（但状态显示有误导性）
+### 10.1 检查 `summarizationStatus = "success"` 但 `summary = null`
 
-2. **检查 `taggingStatus = "success"` 但没有标签**
-   - 查看 inferenceWorker 日志，搜索 "Skipping" 关键词
-   - 可能原因：GIF 图片、`inferenceClient` 未配置、规则引擎过滤了所有标签
+- 这是正常现象！资产类型目前不支持自动摘要
+- 无需修复，是设计如此（但状态显示有误导性）
+- 可观察：warn 日志中有 `Skipping summary`
 
-3. **检查 `taggingStatus = "pending"` 长时间不动**
-   - 检查 AssetPreprocessingQueue 是否有积压
-   - 检查 inferenceWorker 是否正常运行
-   - 这才是真正的"卡顿"，通常是队列或 Worker 问题
+### 10.2 检查 `taggingStatus = "success"` 但没有标签
 
-4. **检查 `taggingStatus = null`**
-   - 意味着预处理任务永久失败
-   - 查看 assetPreprocessingWorker 的错误日志
-   - 常见原因：PDF 文本为空、OCR 配置错误
+按优先级排查：
+1. **先查数据库**：`SELECT * FROM tagsOnBookmarks WHERE bookmarkId = ? AND attachedBy = 'ai'`
+2. **再查日志**，搜索以下关键词（按出现频率排序）：
+   - `due to missing content` → 路径 D（info 级别）
+   - `because it's a GIF` → 路径 D-1（info 级别）
+   - `and inferred: []` → 路径 E（info 级别）
+   - `disabled in the config` → 路径 B（debug 级别）
+   - `user has disabled auto-tagging` → 路径 C（debug 级别）
+   - `No inference client configured` → 路径 A（debug 级别）
 
-5. **检查 `taggingStatus = "failure"`**
-   - 意味着 AI 推理任务永久失败
-   - 查看 inferenceWorker 的错误日志
-   - 常见原因：AI 返回格式不符合 schema、API 调用失败
+### 10.3 检查 `taggingStatus = "pending"` 长时间不动
+
+- 检查队列是否有积压
+- 检查 inferenceWorker 是否正常运行
+- 检查是否有异常日志
+- 这才是真正的"卡顿"，通常是队列或 Worker 问题
+
+### 10.4 检查 `taggingStatus = null`
+
+- 意味着预处理任务永久失败
+- 查看 assetPreprocessingWorker 的错误日志
+- 常见原因：PDF 文本为空、OCR 配置错误
+
+### 10.5 检查 `taggingStatus = "failure"`
+
+- 意味着 AI 推理任务永久失败
+- 查看 inferenceWorker 的错误日志
+- 常见原因：AI 返回格式不符合 schema、API 调用失败
 
 ---
 
-## 十、代码文件索引
+## 十一、代码文件索引
 
 | 文件路径 | 关键功能 |
 |----------|---------|
@@ -573,11 +821,17 @@ let tags = openAIResponseSchema.parse(
 | `apps/workers/workers/assetPreprocessingWorker.ts:372-482` | run() 主函数 + AI 入队条件 |
 | `apps/workers/workers/assetPreprocessingWorker.ts:463` | `!isFixMode \|\| anythingChanged` 关键条件 |
 | `apps/workers/workers/inference/inferenceWorker.ts:21-41` | AI 推理状态标记（attemptMarkStatus） |
-| `apps/workers/workers/inference/inferenceWorker.ts:86-92` | inferenceClient 未配置时静默跳过 |
+| `apps/workers/workers/inference/inferenceWorker.ts:54-58` | onComplete → success |
+| `apps/workers/workers/inference/inferenceWorker.ts:66-68` | onError → failure（重试耗尽） |
+| `apps/workers/workers/inference/inferenceWorker.ts:86-92` | inferenceClient 未配置时静默跳过（路径 A） |
 | `apps/workers/workers/inference/tagging.ts:133-173` | inferTagsFromImage（绕过 OCR，直接读图片） |
-| `apps/workers/workers/inference/tagging.ts:152-157` | GIF 图片跳过打标签 |
+| `apps/workers/workers/inference/tagging.ts:152-157` | GIF 图片跳过打标签（路径 D-1） |
 | `apps/workers/workers/inference/tagging.ts:237-262` | inferTagsFromPDF（依赖提取的文本） |
 | `apps/workers/workers/inference/tagging.ts:325-351` | 资产类型 tagging 分派逻辑 |
+| `apps/workers/workers/inference/tagging.ts:397-398` | connectTags 空数组返回（路径 E） |
+| `apps/workers/workers/inference/tagging.ts:510-514` | 全局开关关闭（路径 B） |
+| `apps/workers/workers/inference/tagging.ts:535-539` | 用户开关关闭（路径 C） |
+| `apps/workers/workers/inference/tagging.ts:569-574` | inferTags 返回 null（路径 D） |
 | `apps/workers/workers/inference/summarize.ts:20-45` | fetchBookmarkDetailsForSummary（不查询 asset） |
 | `apps/workers/workers/inference/summarize.ts:97-126` | 非 LINK 类型跳过摘要 |
 | `packages/shared-server/src/queues.ts:236-249` | AssetPreprocessingQueue 定义 |
