@@ -87,6 +87,10 @@ browser === undefined ?
 **globalBlocker（广告拦截器）**
 - 初始化条件：`serverConfig.crawler.enableAdblocker == true`
 - 加载方式：`PlaywrightBlocker.fromPrebuiltFull(fetchWithProxy, { cachePath: os.tmpdir()/karakeep_adblocker.bin })`
+- **引导期依赖**：`fromPrebuiltFull` 的第一个参数传入 `fetchWithProxy` 作为 HTTP 客户端，用于下载 EasylistFull 等远端广告规则列表。这意味着：
+  - 广告规则下载本身也经过完整安全链路（代理选择 + SSRF 校验 + manual redirect 逐跳校验）
+  - fetchWithProxy 不依赖 globalBlocker，globalBlocker 依赖 fetchWithProxy 完成初始化
+  - 初始化期间下载请求不会被 adblocker 自身拦截（此时 globalBlocker 尚未就绪）
 - 失败降级：加载失败不抛出异常，仅打 error 日志，不启用拦截功能
 - 注入路径：[crawlPage()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L738-L741) 创建 Page 后调用 `globalBlocker.enableBlockingInPage(nextPage)`
 
@@ -143,9 +147,10 @@ if (contentType === ASSET_TYPES.APPLICATION_PDF) {
 
 [getContentType()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L1621-L1670) 实现：
 
-- 发起 GET 请求（`fetchWithProxy` + 代理 + 5 秒超时）
+- **发起完整 GET 请求**（不是 HEAD）：`fetchWithProxy(url, { method: "GET", signal: timeout(5s)+abortSignal }, runProxy)`
 - 读取 `Content-Type` 响应头，剥离 charset 等参数后标准化
 - 失败时返回 `null`，后续按 HTML 路径处理
+- **注意**：由于使用完整 GET（响应体也会被传输），5 秒超时内无法完成则整体中断
 
 探测失败的 fallback：`contentType === null` 时跳过 PDF/图片分支，进入 `crawlAndParseUrl()` 走浏览器爬取路径。
 
@@ -207,10 +212,16 @@ browser.newContext({ proxy: proxyConfig, ... })
 
 ### 4.4 noProxy 绕过逻辑
 
-[matchesNoProxy()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L229-L238) 支持三种模式匹配：
-- 精确匹配：`example.com`
-- 域后缀匹配：`.example.com` 匹配所有子域
-- 通配：`.` 匹配所有域名
+[matchesNoProxy()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L229-L238) 调用 `hostnameMatchesAnyPattern`，支持三种模式匹配：
+
+| 匹配规则 | pattern 示例 | 匹配 hostname |
+|---------|-------------|---------------|
+| 精确匹配 | `example.com` | `example.com` |
+| 显式后缀匹配（pattern 以 `.` 开头） | `.example.com` | `www.example.com`、`sub.example.com` 等所有子域 |
+| **隐式后缀匹配**（pattern 不以 `.` 开头） | `example.com` | `www.example.com`、`sub.example.com` 等所有子域（等价于 `.example.com`） |
+| 通配 | `.` | 所有域名 |
+
+隐式后缀匹配的实现：[hostnameMatchesPattern L115](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L115) `hostname.endsWith("." + pattern)`，即 pattern 不加点前缀时自动隐式地也匹配子域。注意精确匹配和隐式后缀匹配会同时生效。
 
 ### 4.5 重要结论：代理不会"切换"
 
@@ -471,11 +482,11 @@ createRunner(queue, funcs, {
 7. DNS 解析 + 缓存 → 逐条检查 resolved 地址 isAddressForbidden()
 ```
 
-**IP 黑名单（13 项）** — [DISALLOWED_IP_RANGES](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L13-L30)：
+**IP 黑名单（14 项）** — [DISALLOWED_IP_RANGES](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L13-L30)：
 
 | 类别 | range() 值 | 说明 |
 |------|-----------|------|
-| **IPv4** | | |
+| **IPv4（8 项）** | | |
 | | `unspecified` | 0.0.0.0/8 |
 | | `broadcast` | 255.255.255.255/32 |
 | | `multicast` | 224.0.0.0/4 |
@@ -484,7 +495,7 @@ createRunner(queue, funcs, {
 | | `private` | 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 |
 | | `reserved` | 其他 IETF 保留地址 |
 | | `carrierGradeNat` | 100.64.0.0/10 |
-| **IPv6** | | |
+| **IPv6（6 项）** | | |
 | | `uniqueLocal` | fc00::/7 |
 | | `6to4` | 2002::/16（RFC 3056 过渡机制） |
 | | `teredo` | 2001::/32（RFC 4380 隧道） |
@@ -508,7 +519,7 @@ return DISALLOWED_IP_RANGES.has(parsed.range());
 **白名单旁路** — [isHostnameAllowedForInternalAccess()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L127-L135)：
 
 - 配置 `CRAWLER_ALLOWED_INTERNAL_HOSTNAMES`（字符串数组）
-- 匹配规则与 `noProxy` 一致：精确匹配 / 域后缀匹配 / `.` 通配
+- 匹配规则与 `noProxy` 一致：精确匹配 / 显式后缀匹配（`.example.com`）/ 隐式后缀匹配（`example.com` 也匹配子域）/ `.` 通配
 - **优先级最高**：在 IP 检查和 DNS 解析之前执行，命中后直接返回 `{ ok: true }`
 - 用途：允许爬取内部服务（如 wiki.company.internal）而不触发 SSRF 拦截
 
@@ -646,14 +657,15 @@ while (true) {
 3. **两类重试**：普通错误消耗重试次数 + 退避递增；限速错误不消耗次数 + 按指定延迟重试
 4. **403/429/5xx Fallback**：重试耗尽后不抛弃已抓取内容，继续解析并写入数据库，仅记录错误状态码
 5. **Restate 两层重试**：SDK 级 retryPolicy（未捕获异常）与 handler 内 while 自循环（绝大多数场景）并存，runner 层禁用重试
-6. **可用性探测前置**：globalBrowser 判定（browserless 降级）和 getContentType MIME 嗅探（处理路径分支）均在实际爬取前完成
-7. **多层 SSRF 防护**：13 项 IP 黑名单（IPv4 8 项 + IPv6 5 项）+ IPv4-mapped IPv6 反绕过 + 白名单旁路（`CRAWLER_ALLOWED_INTERNAL_HOSTNAMES`）+ DNS `allSettled` 并行容错，在 fetch/manual redirect、CDP 重定向、子资源请求四层均被执行
+6. **可用性探测前置**：globalBrowser 判定（browserless 降级）和 getContentType 完整 GET 请求 Content-Type 嗅探（不是 HEAD）均在实际爬取前完成
+7. **多层 SSRF 防护**：14 项 IP 黑名单（IPv4 8 项 + IPv6 6 项）+ IPv4-mapped IPv6 反绕过 + 白名单旁路（`CRAWLER_ALLOWED_INTERNAL_HOSTNAMES`）+ DNS `allSettled` 并行容错，在 fetch/manual redirect、CDP 重定向、子资源请求四层均被执行
 8. **重定向逐跳安全校验**：fetchWithProxy 每次重定向都重新 `validateUrl()` + 重新 `getProxyAgent()` 选择代理，防止开放重定向 SSRF；方法切换遵循 HTTP 语义（303→GET，301/302 非 GET/HEAD→GET，307/308 不变）
-9. **超时无处不在**：所有异步操作都有 `raceWith` + 超时 + 中断信号保护，防止任何操作无限挂起
-10. **泄漏兜底**：Context Reaper 定期扫描回收超龄上下文，page/context 关闭本身也有超时保护
-11. **队列后端可插拔**：liteque（SQLite）和 restate 两种后端，QueueRetryAfterError 在适配层统一转换为后端原生的延迟重试语义
-12. **与浏览器共生的全局状态**：globalBlocker（广告拦截）和 globalCookies（共享 Cookie）初始化一次后复用所有爬取任务，与浏览器实例同生命周期
-13. **CDP 代理认证链路完整闭环**：`Fetch.enable` 开启认证拦截 → `Fetch.authRequired` 事件判定来源 → 提供 `ProvideCredentials` 携带代理用户名密码 → `Fetch.continueWithAuth` 提交决策
-14. **Semaphore 四条释放路径**：RPC 错误先 release 再 onError；业务错误/成功先 onError/onCompleted 再 release；rate_limit release 后 sleep 不计数；各路径严格遵循 inFlight 计数一致性约定
-15. **Lease 超时自动回收**：semaphore 租约超时设为任务超时的 1.5 倍，每次 `acquire/release/tick` 时自动扫描并释放过期租约，防止任务异常中断导致的永久占用
-16. **Shutdown 早退分支**：launchBrowser 连接失败/断线重连、Context Reaper 定时器均监听 `exitAbortController.signal`，在优雅退出时立即停止重试/调度，避免 shutdown 挂起
+9. **noProxy 四层匹配**：精确匹配 + 显式后缀（`.example.com`）+ 隐式后缀（`example.com` 自动匹配子域）+ 通配（`.`），白名单旁路复用同一匹配函数
+10. **超时无处不在**：所有异步操作都有 `raceWith` + 超时 + 中断信号保护，防止任何操作无限挂起
+11. **泄漏兜底**：Context Reaper 定期扫描回收超龄上下文，page/context 关闭本身也有超时保护
+12. **队列后端可插拔**：liteque（SQLite）和 restate 两种后端，QueueRetryAfterError 在适配层统一转换为后端原生的延迟重试语义
+13. **与浏览器共生的全局状态**：globalBlocker（广告拦截）和 globalCookies（共享 Cookie）初始化一次后复用所有爬取任务，与浏览器实例同生命周期；globalBlocker 初始化时将 `fetchWithProxy` 传入作为 HTTP 客户端下载远端广告规则，引导期下载请求本身也经过完整安全链路（代理+SSRF+逐跳重定向校验）但不被自身拦截
+14. **CDP 代理认证链路完整闭环**：`Fetch.enable` 开启认证拦截 → `Fetch.authRequired` 事件判定来源 → 提供 `ProvideCredentials` 携带代理用户名密码 → `Fetch.continueWithAuth` 提交决策
+15. **Semaphore 四条释放路径**：RPC 错误先 release 再 onError；业务错误/成功先 onError/onCompleted 再 release；rate_limit release 后 sleep 不计数；各路径严格遵循 inFlight 计数一致性约定
+16. **Lease 超时自动回收**：semaphore 租约超时设为任务超时的 1.5 倍，每次 `acquire/release/tick` 时自动扫描并释放过期租约，防止任务异常中断导致的永久占用
+17. **Shutdown 早退分支**：launchBrowser 连接失败/断线重连、Context Reaper 定时器均监听 `exitAbortController.signal`，在优雅退出时立即停止重试/调度，避免 shutdown 挂起
