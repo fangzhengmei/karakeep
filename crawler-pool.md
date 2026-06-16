@@ -455,16 +455,110 @@ createRunner(queue, funcs, {
 
 ## 八、安全防护
 
-### 8.1 URL 安全校验
+### 8.1 URL 安全校验（SSRF 防护核心）
 
-[validateUrl()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L137-L223) 在多个位置被调用：
+[validateUrl()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L137-L223) 在四个位置被调用（fetch、浏览器导航、CDP 重定向、子资源请求），逐层拦截 SSRF 攻击。
 
-- 协议白名单：只允许 http/https
-- IP 黑名单：拒绝回环/私有/保留地址（防止 SSRF）
-- DNS 解析 + 缓存（LRU 1000 条，5 分钟 TTL）
-- **代理上下文跳过 DNS**：如果请求走代理，DNS 由代理端解析，本地不做
+**校验流程**：
 
-### 8.2 CDP 重定向守卫
+```
+1. URL 语法解析 → 失败则拒绝
+2. 协议白名单 → 仅允许 http: / https:
+3. hostname 非空检查
+4. 白名单旁路 → CRAWLER_ALLOWED_INTERNAL_HOSTNAMES 匹配则直接放行
+5. IP 字面量检查 → isAddressForbidden()
+6. 代理上下文 → runningInProxyContext == true 时跳过 DNS
+7. DNS 解析 + 缓存 → 逐条检查 resolved 地址 isAddressForbidden()
+```
+
+**IP 黑名单（13 项）** — [DISALLOWED_IP_RANGES](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L13-L30)：
+
+| 类别 | range() 值 | 说明 |
+|------|-----------|------|
+| **IPv4** | | |
+| | `unspecified` | 0.0.0.0/8 |
+| | `broadcast` | 255.255.255.255/32 |
+| | `multicast` | 224.0.0.0/4 |
+| | `linkLocal` | 169.254.0.0/16 |
+| | `loopback` | 127.0.0.0/8 |
+| | `private` | 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 |
+| | `reserved` | 其他 IETF 保留地址 |
+| | `carrierGradeNat` | 100.64.0.0/10 |
+| **IPv6** | | |
+| | `uniqueLocal` | fc00::/7 |
+| | `6to4` | 2002::/16（RFC 3056 过渡机制） |
+| | `teredo` | 2001::/32（RFC 4380 隧道） |
+| | `benchmarking` | 2001:2::/48（RFC 5180） |
+| | `deprecated` | 已弃用地址（RFC 3879） |
+| | `discard` | 100::/64（RFC 6666 丢弃前缀） |
+
+**IPv4-mapped IPv6 处理** — [isAddressForbidden()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L75-L88)：
+
+```ts
+const parsed = ipaddr.parse(address);
+if (parsed.kind() === "ipv6" && (parsed as IPv6).isIPv4MappedAddress()) {
+  const mapped = (parsed as IPv6).toIPv4Address();  // ::ffff:127.0.0.1 → 127.0.0.1
+  return DISALLOWED_IP_RANGES.has(mapped.range());  // 用 IPv4 range 判定
+}
+return DISALLOWED_IP_RANGES.has(parsed.range());
+```
+
+防止攻击者用 `::ffff:127.0.0.1` 等 IPv4-mapped 地址绕过 IPv4 黑名单。
+
+**白名单旁路** — [isHostnameAllowedForInternalAccess()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L127-L135)：
+
+- 配置 `CRAWLER_ALLOWED_INTERNAL_HOSTNAMES`（字符串数组）
+- 匹配规则与 `noProxy` 一致：精确匹配 / 域后缀匹配 / `.` 通配
+- **优先级最高**：在 IP 检查和 DNS 解析之前执行，命中后直接返回 `{ ok: true }`
+- 用途：允许爬取内部服务（如 wiki.company.internal）而不触发 SSRF 拦截
+
+**DNS 解析 + 并行容错** — [resolveHostAddresses()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L38-L73)：
+
+```ts
+const results = await Promise.allSettled([
+  resolver.resolve4(hostname),  // A 记录
+  resolver.resolve6(hostname),  // AAAA 记录
+]);
+```
+
+- `Promise.allSettled` 并行查询 A + AAAA 记录，任一成功即收集地址
+- 全部失败才抛出聚合错误信息
+- DNS 缓存：LRU 1000 条，5 分钟 TTL
+- 超时：`CRAWLER_IP_VALIDATION_DNS_RESOLVER_TIMEOUT_SEC`
+
+**代理上下文跳过 DNS**：`runningInProxyContext == true` 时，DNS 由代理端解析，本地不做 DNS 查询，避免解析结果与代理端不一致。
+
+### 8.2 HTTP 重定向处理（fetchWithProxy manual redirect）
+
+[fetchWithProxy()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L418-L486) 使用 `redirect: "manual"` 手动处理重定向，每跳都重新执行安全校验：
+
+```
+while (true) {
+  1. getProxyAgent(currentUrl) ← 每跳重新选择代理（按 URL 协议 + noProxy）
+  2. validateUrl(currentUrl, !!agent) ← 每跳重新校验（含 DNS 解析）
+  3. fetch(currentUrl, { redirect: "manual" })
+  4. 非 3xx → return response
+  5. 3xx → 解析 Location → 方法切换规则 → continue
+}
+```
+
+**每跳重新校验**：重定向目标可能指向内网地址（如 `http://169.254.169.254/latest/meta-data/`），因此每次跳转都必须重新执行 `validateUrl()`，包括 DNS 解析和 IP 黑名单检查。
+
+**每跳重新选择代理**：`getProxyAgent(currentUrl)` 根据当前 URL 的协议（http/https）和 `noProxy` 列表决定是否使用代理及使用哪个代理，跨协议重定向时代理可能切换。
+
+**方法切换规则** — [L472-L481](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L472-L481)：
+
+| 状态码 | 方法变化 | Body 变化 |
+|--------|---------|----------|
+| **303** | 任何方法 → **GET** | 清除 body + 删除 content-length |
+| **301/302** | GET/HEAD → 不变 | 不变 |
+| **301/302** | POST/PUT 等 → **GET** | 清除 body + 删除 content-length |
+| **307/308** | 不变 | 不变（保留原始方法和 body） |
+
+- 默认最大重定向次数：5 次（`maxRedirects`）
+- 超出限制 → throw `Too many redirects`
+
+### 8.3 CDP 重定向守卫
 
 在 [crawlPage()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L677-L724) 中：
 
@@ -473,7 +567,9 @@ createRunner(queue, funcs, {
 - 不合法 → `Fetch.failRequest`（阻止重定向）
 - 合法 → `Fetch.continueRequest`（放行）
 
-### 8.3 子资源请求拦截
+> 注意：CDP 层的重定向拦截是浏览器内部的，与 fetchWithProxy 的 HTTP 层重定向处理互补。浏览器导航走 CDP，纯 HTTP 请求走 fetchWithProxy manual redirect。
+
+### 8.4 子资源请求拦截
 
 [route("**/*")](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L752-L796)：
 
@@ -481,7 +577,7 @@ createRunner(queue, funcs, {
 - 对每个 http(s) 子请求执行 `validateUrl()`
 - 不合法 → `route.abort("blockedbyclient")`
 
-### 8.4 超时与中断保护
+### 8.5 超时与中断保护
 
 所有关键操作都使用 `raceWith()` + `timeoutRace()` + `abortRace()`：
 
@@ -551,12 +647,13 @@ createRunner(queue, funcs, {
 4. **403/429/5xx Fallback**：重试耗尽后不抛弃已抓取内容，继续解析并写入数据库，仅记录错误状态码
 5. **Restate 两层重试**：SDK 级 retryPolicy（未捕获异常）与 handler 内 while 自循环（绝大多数场景）并存，runner 层禁用重试
 6. **可用性探测前置**：globalBrowser 判定（browserless 降级）和 getContentType MIME 嗅探（处理路径分支）均在实际爬取前完成
-7. **多层安全防护**：URL 校验（DNS + IP 黑名单）在 fetch、浏览器导航、CDP 重定向、子资源请求四层均被执行
-8. **超时无处不在**：所有异步操作都有 `raceWith` + 超时 + 中断信号保护，防止任何操作无限挂起
-9. **泄漏兜底**：Context Reaper 定期扫描回收超龄上下文，page/context 关闭本身也有超时保护
-10. **队列后端可插拔**：liteque（SQLite）和 restate 两种后端，QueueRetryAfterError 在适配层统一转换为后端原生的延迟重试语义
-11. **与浏览器共生的全局状态**：globalBlocker（广告拦截）和 globalCookies（共享 Cookie）初始化一次后复用所有爬取任务，与浏览器实例同生命周期
-12. **CDP 代理认证链路完整闭环**：`Fetch.enable` 开启认证拦截 → `Fetch.authRequired` 事件判定来源 → 提供 `ProvideCredentials` 携带代理用户名密码 → `Fetch.continueWithAuth` 提交决策
-13. **Semaphore 四条释放路径**：RPC 错误先 release 再 onError；业务错误/成功先 onError/onCompleted 再 release；rate_limit release 后 sleep 不计数；各路径严格遵循 inFlight 计数一致性约定
-14. **Lease 超时自动回收**：semaphore 租约超时设为任务超时的 1.5 倍，每次 `acquire/release/tick` 时自动扫描并释放过期租约，防止任务异常中断导致的永久占用
-15. **Shutdown 早退分支**：launchBrowser 连接失败/断线重连、Context Reaper 定时器均监听 `exitAbortController.signal`，在优雅退出时立即停止重试/调度，避免 shutdown 挂起
+7. **多层 SSRF 防护**：13 项 IP 黑名单（IPv4 8 项 + IPv6 5 项）+ IPv4-mapped IPv6 反绕过 + 白名单旁路（`CRAWLER_ALLOWED_INTERNAL_HOSTNAMES`）+ DNS `allSettled` 并行容错，在 fetch/manual redirect、CDP 重定向、子资源请求四层均被执行
+8. **重定向逐跳安全校验**：fetchWithProxy 每次重定向都重新 `validateUrl()` + 重新 `getProxyAgent()` 选择代理，防止开放重定向 SSRF；方法切换遵循 HTTP 语义（303→GET，301/302 非 GET/HEAD→GET，307/308 不变）
+9. **超时无处不在**：所有异步操作都有 `raceWith` + 超时 + 中断信号保护，防止任何操作无限挂起
+10. **泄漏兜底**：Context Reaper 定期扫描回收超龄上下文，page/context 关闭本身也有超时保护
+11. **队列后端可插拔**：liteque（SQLite）和 restate 两种后端，QueueRetryAfterError 在适配层统一转换为后端原生的延迟重试语义
+12. **与浏览器共生的全局状态**：globalBlocker（广告拦截）和 globalCookies（共享 Cookie）初始化一次后复用所有爬取任务，与浏览器实例同生命周期
+13. **CDP 代理认证链路完整闭环**：`Fetch.enable` 开启认证拦截 → `Fetch.authRequired` 事件判定来源 → 提供 `ProvideCredentials` 携带代理用户名密码 → `Fetch.continueWithAuth` 提交决策
+14. **Semaphore 四条释放路径**：RPC 错误先 release 再 onError；业务错误/成功先 onError/onCompleted 再 release；rate_limit release 后 sleep 不计数；各路径严格遵循 inFlight 计数一致性约定
+15. **Lease 超时自动回收**：semaphore 租约超时设为任务超时的 1.5 倍，每次 `acquire/release/tick` 时自动扫描并释放过期租约，防止任务异常中断导致的永久占用
+16. **Shutdown 早退分支**：launchBrowser 连接失败/断线重连、Context Reaper 定时器均监听 `exitAbortController.signal`，在优雅退出时立即停止重试/调度，避免 shutdown 挂起
