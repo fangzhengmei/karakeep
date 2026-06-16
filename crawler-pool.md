@@ -78,9 +78,60 @@ browser === undefined ?
 
 ---
 
-## 三、代理切换机制
+## 三、可用性探测
 
-### 3.1 代理配置结构
+### 3.1 globalBrowser 可用性判定
+
+[crawlPage()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L574-L592) 中获取浏览器实例后立即判断：
+
+```ts
+browser = serverConfig.crawler.browserConnectOnDemand
+  ? startBrowserInstance()  // 按需连接：每次都新建
+  : globalBrowser;          // 单实例模式：取全局
+
+if (!browser) {
+  return browserlessCrawlPage(...);  // 浏览器不可用 → 降级为纯 HTTP
+}
+```
+
+降级发生的触发条件：
+1. `globalBrowser` 未初始化（启动时连接失败或按需模式下启动失败）
+2. 用户级 `browserCrawlingEnabled === false`（先于浏览器可用性判断）
+
+降级后行为：调用 [browserlessCrawlPage()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L491-L530)，使用 `fetchWithProxy` 发起纯 HTTP GET 请求，不经过 Playwright，无法生成截图和 PDF。
+
+### 3.2 getContentType MIME 嗅探
+
+[runCrawler()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L2254-L2285) 入口处先探测内容类型再分支处理：
+
+```ts
+const contentType = precrawledArchiveAssetId
+  ? ASSET_TYPES.TEXT_HTML                          // 已预爬取，直接假定 HTML
+  : await getContentType(url, jobId, abortSignal, runProxy);
+
+// 根据 Content-Type 决定处理路径
+if (contentType === ASSET_TYPES.APPLICATION_PDF) {
+  handleAsAssetBookmark(url, "pdf", ...);          // 直接下载，不经过浏览器
+} else if (IMAGE_ASSET_TYPES.has(contentType) && ...) {
+  handleAsAssetBookmark(url, "image", ...);        // 直接下载，不经过浏览器
+} else {
+  crawlAndParseUrl(...);                           // HTML 页面：走浏览器爬取
+}
+```
+
+[getContentType()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L1621-L1670) 实现：
+
+- 发起 GET 请求（`fetchWithProxy` + 代理 + 5 秒超时）
+- 读取 `Content-Type` 响应头，剥离 charset 等参数后标准化
+- 失败时返回 `null`，后续按 HTML 路径处理
+
+探测失败的 fallback：`contentType === null` 时跳过 PDF/图片分支，进入 `crawlAndParseUrl()` 走浏览器爬取路径。
+
+---
+
+## 四、代理切换机制
+
+### 4.1 代理配置结构
 
 [RunProxyConfig](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L244-L248)：
 
@@ -92,7 +143,7 @@ interface RunProxyConfig {
 }
 ```
 
-### 3.2 "Run 级"代理选择：一次爬取任务只选一次
+### 4.2 "Run 级"代理选择：一次爬取任务只选一次
 
 [selectRunProxies()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L254-L261) 在 `runCrawler()` 入口处调用一次：
 
@@ -104,7 +155,7 @@ const runProxy = selectRunProxies();  // 随机选一个代理，整个 run 复�
 - 从 `serverConfig.proxy.httpsProxy`（数组）中随机选一个
 - **关键设计**：代理在整个爬取 run 期间固定不变，不会中途切换
 
-### 3.3 代理注入的两个路径
+### 4.3 代理注入的两个路径
 
 **路径 A：Playwright 浏览器爬取**
 
@@ -123,22 +174,22 @@ browser.newContext({ proxy: proxyConfig, ... })
 - 每次请求根据 URL 协议选 http 或 https 代理
 - 检查 `noProxy` 列表决定是否绕过
 
-### 3.4 noProxy 绕过逻辑
+### 4.4 noProxy 绕过逻辑
 
 [matchesNoProxy()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L229-L238) 支持三种模式匹配：
 - 精确匹配：`example.com`
 - 域后缀匹配：`.example.com` 匹配所有子域
 - 通配：`.` 匹配所有域名
 
-### 3.5 重要结论：代理不会"切换"
+### 4.5 重要结论：代理不会"切换"
 
 代理在 run 开始时随机选定，后续不再变更。如果某次爬取因代理问题失败，**重试时**会重新调用 `selectRunProxies()` 随机选择新的代理（因为重试是新的 run）。
 
 ---
 
-## 四、重试与退避机制
+## 五、重试与退避机制
 
-### 4.1 两条重试路径
+### 5.1 两条重试路径
 
 ```
               ┌───────────────────────────────┐
@@ -155,7 +206,7 @@ browser.newContext({ proxy: proxyConfig, ... })
   退避由队列实现决定               延迟 delayMs 后重新入队
 ```
 
-### 4.2 普通错误重试
+### 5.2 普通错误重试
 
 **触发条件** — [shouldRetryCrawlStatusCode()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/crawlerWorker.ts#L137-L142)：
 
@@ -169,12 +220,38 @@ browser.newContext({ proxy: proxyConfig, ... })
 
 **退避策略**因队列后端而异：
 
-| 后端 | 退避策略 | 代码位置 |
-|------|---------|---------|
-| **liteque** | 由 liteque 库内部决定（指数退避） | [queue-liteque/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-liteque/src/index.ts) |
-| **restate** | 指数退避 + full jitter：`delayMs = rand(0, min(5000×2^runNumber, 60000))` | [dispatcher.ts#L169-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L169-L173) |
+| 后端 | 场景 | 退避策略 | 代码位置 |
+|------|------|---------|---------|
+| **liteque** | 所有错误 | 由 liteque 库内部决定（指数退避） | [queue-liteque/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-liteque/src/index.ts) |
+| **restate** | RPC 级错误（runner 服务不可达） | 指数退避 + full jitter：`delayMs = rand(0, min(5000×2^runNumber, 60000))` | [dispatcher.ts#L169-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L169-L173) |
+| **restate** | 业务级错误（runner 返回 `{type:"error"}`） | 恒定 1 秒：`ctx.sleep(1000)` | [dispatcher.ts#L203-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L203-L206) |
 
-### 4.3 限速重试（QueueRetryAfterError）
+### 5.3 403/429/5xx 重试耗尽的 Fallback
+
+[crawlAndParseUrl()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L1932-L1941) 中：
+
+```ts
+if (shouldRetryCrawlStatusCode(statusCode)) {
+  if (numRetriesLeft > 0) {
+    throw new Error(`Received status code ${statusCode}. Will retry ...`);
+  }
+  // numRetriesLeft == 0：不抛异常，继续往下走
+  logger.info(`Received status code ${statusCode} on latest retry. Proceeding ...`);
+}
+
+// 无论状态码如何，继续解析和落库
+const { metadata, readableContent } = await runParseSubprocess(htmlContent, ...);
+await db.update(bookmarkLinks).set({
+  title: meta.title,
+  description: meta.description,
+  crawlStatusCode: statusCode,  // 状态码被记录
+  // ...
+});
+```
+
+**关键行为**：HTTP 403/429/5xx 耗尽重试后，不会让任务整体失败，而是把已获取到的（可能是错误页）HTML 照常解析并写入数据库，同时把错误状态码记入 `crawlStatusCode` 字段。这样用户至少能看到爬取尝试过。
+
+### 5.4 限速重试（QueueRetryAfterError）
 
 [QueueRetryAfterError](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/shared/queueing.ts#L10-L18) 是一种特殊的重试信号：
 
@@ -206,7 +283,7 @@ allowed ?
 | **liteque** | 包装层 catch → 转为 liteque 的 `RetryAfterError(delayMs)` | 延迟后重试，不计数 |
 | **restate** | runner 层 catch → 返回 `{ type: "rate_limit", delayMs }` → dispatcher 层 `ctx.sleep(delayMs)` 后重试，不递增 runNumber | 同上 |
 
-### 4.4 重试耗尽时的处理
+### 5.5 重试耗尽时的处理
 
 [CrawlerWorker.build() 的 onError 回调](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L400-L453)：
 
@@ -214,11 +291,82 @@ allowed ?
 - 更新 `bookmarkLinks.crawlStatus = "failure"`
 - 清理 pending 状态的 tagging/summarization/embedding 任务
 
+> 注意：这是**最后兜底**的失败处理。403/429/5xx 重试耗尽不会走到这里，而是在 crawlAndParseUrl 内部 fallback 解析。只有发生未捕获异常（如网络断开、浏览器崩溃等）且重试耗尽才会触发 onError。
+
 ---
 
-## 五、队列调度与并发控制
+## 六、Restate 两层重试机制
 
-### 5.1 Worker 创建
+使用 restate 作为队列后端时，存在两层重试叠加：
+
+### 6.1 第一层：Restate-SDK 级 retryPolicy
+
+[dispatcher.ts#L46-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L46-L54) 为 dispatcher service 配置的 SDK 级重试：
+
+```ts
+retryPolicy: {
+  maxAttempts: NUM_RETRIES,     // 5
+  initialInterval: { seconds: 5 },
+  maxInterval: { minutes: 1 },
+},
+```
+
+- **触发时机**：dispatcher handler 本身抛出未捕获异常时（如 `restate.CancelledError` 被 re-throw）
+- **退避策略**：指数退避，初始 5 秒，最大 1 分钟
+- **实际很少触发**：绝大多数错误都在 while 循环内被 tryCatch 捕获
+
+### 6.2 第二层：Dispatcher Handler 内 while 自循环
+
+[dispatcher.ts#L93](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L93)：
+
+```ts
+let runNumber = 0;
+while (runNumber <= NUM_RETRIES) {  // runNumber 从 0 到 5，共 6 次
+  // 1. 获取信号量租约
+  // 2. 调用 runner.run()
+  // 3. 根据返回结果分支处理：
+  //    ├─ RPC error → 指数退避 + runNumber++ → continue
+  //    ├─ rate_limit → sleep(delayMs) + 不递增 → continue
+  //    ├─ error → sleep(1000) + runNumber++ → continue
+  //    └─ success → break
+}
+```
+
+| 结果类型 | 处理方式 | runNumber 变化 | 退避 |
+|---------|---------|--------------|------|
+| RPC 级错误 | `runner.run()` 抛异常 | `++` | `rand(0, min(5000×2^n, 60000))` |
+| rate_limit | 返回 `{type:"rate_limit"}` | 不变 | `delayMs`（由 crawler 指定） |
+| 业务级错误 | 返回 `{type:"error"}` | `++` | `1000 ms`（恒定） |
+| 成功 | 返回 `{type:"success"}` | - | - |
+
+### 6.3 Runner 层：禁用重试
+
+[runner.ts#L52-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/runner.ts#L52-L55) 显式配置：
+
+```ts
+retryPolicy: { maxAttempts: 1 },  // No retries at runner level
+```
+
+所有重试逻辑统一由 dispatcher 控制，避免分散。
+
+### 6.4 两层重试的触发边界
+
+```
+dispatcher handler 执行
+  ↓
+tryCatch(runner.run(jobData))
+  ↓
+  ├─ 未捕获异常 → throw → 触发第一层（SDK retryPolicy 指数退避）
+  └─ 已捕获 → 返回结果 → 进入第二层（while 自循环按类型分支）
+```
+
+> 只有 `restate.CancelledError` 会被 re-throw 到 SDK 层触发第一层重试，其余所有错误都在第二层 while 循环内消化。
+
+---
+
+## 七、队列调度与并发控制
+
+### 7.1 Worker 创建
 
 [CrawlerWorker.build()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L370-L464)：
 
@@ -233,7 +381,7 @@ createRunner(queue, funcs, {
 - `concurrency`：同时运行的最大任务数（对应 `CRAWLER_NUM_WORKERS`）
 - `timeoutSecs`：单任务超时（对应 `CRAWLER_JOB_TIMEOUT_SEC`）
 
-### 5.2 两个优先级队列
+### 7.2 两个优先级队列
 
 | 队列 | 用途 | numRetries |
 |------|------|-----------|
@@ -242,7 +390,7 @@ createRunner(queue, funcs, {
 
 分离队列防止低优先级任务阻塞正常爬取的并发度。
 
-### 5.3 Restate 后端的并发控制
+### 7.3 Restate 后端的并发控制
 
 [RestateSemaphore](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L83-L88) 在 dispatcher 层实现：
 
@@ -252,9 +400,9 @@ createRunner(queue, funcs, {
 
 ---
 
-## 六、可用性探测与安全防护
+## 八、安全防护
 
-### 6.1 URL 安全校验
+### 8.1 URL 安全校验
 
 [validateUrl()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/network.ts#L137-L223) 在多个位置被调用：
 
@@ -263,7 +411,7 @@ createRunner(queue, funcs, {
 - DNS 解析 + 缓存（LRU 1000 条，5 分钟 TTL）
 - **代理上下文跳过 DNS**：如果请求走代理，DNS 由代理端解析，本地不做
 
-### 6.2 CDP 重定向守卫
+### 8.2 CDP 重定向守卫
 
 在 [crawlPage()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L677-L724) 中：
 
@@ -272,7 +420,7 @@ createRunner(queue, funcs, {
 - 不合法 → `Fetch.failRequest`（阻止重定向）
 - 合法 → `Fetch.continueRequest`（放行）
 
-### 6.3 子资源请求拦截
+### 8.3 子资源请求拦截
 
 [route("**/*")](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L752-L796)：
 
@@ -280,7 +428,7 @@ createRunner(queue, funcs, {
 - 对每个 http(s) 子请求执行 `validateUrl()`
 - 不合法 → `route.abort("blockedbyclient")`
 
-### 6.4 超时与中断保护
+### 8.4 超时与中断保护
 
 所有关键操作都使用 `raceWith()` + `timeoutRace()` + `abortRace()`：
 
@@ -298,7 +446,7 @@ createRunner(queue, funcs, {
 
 ---
 
-## 七、协同流程总结
+## 九、协同流程总结
 
 一个完整的爬取任务生命周期：
 
@@ -308,34 +456,38 @@ createRunner(queue, funcs, {
    ├─ checkDomainRateLimit()
    │    └─ 命中限速 → throw QueueRetryAfterError → 延迟重试（不计次数）
    ├─ selectRunProxies()        ← 随机选代理，整个 run 复用
-   ├─ getContentType()          ← fetchWithProxy + 代理 + 5s 超时
+   ├─ getContentType()          ← MIME 嗅探 + 代理 + 5s 超时
    ├─ 根据 content-type 分支：
    │    ├─ PDF/图片 → handleAsAssetBookmark()（直接下载，不经过浏览器）
    │    └─ HTML → crawlAndParseUrl()
    │         ├─ crawlPage()
    │         │    ├─ 获取 browser 实例（全局 or 按需）
-   │         │    ├─ browser 不可用 → browserlessCrawlPage()
+   │         │    ├─ browser 不可用 → browserlessCrawlPage()  ← 可用性探测
    │         │    ├─ 创建 BrowserContext（注入代理配置）
    │         │    ├─ CDP 安装重定向守卫 + 子资源安全校验
    │         │    ├─ 导航 + 等待加载（带超时/中断）
    │         │    ├─ 抓取 HTML + 截图 + PDF（并行）
    │         │    └─ finally: 关闭 page/context/browser（带超时保护）
    │         ├─ shouldRetryCrawlStatusCode()?
-   │         │    └─ 403/429/5xx + 有重试余量 → throw Error → 队列重试
+   │         │    ├─ 403/429/5xx + 有重试余量 → throw Error → 队列重试
+   │         │    └─ 403/429/5xx + 重试耗尽 → 继续 parse + 落库（Fallback）
    │         └─ 解析 + 存储 + 入队下游任务
    └─ 完成 → onComplete 回调
-3. 异常时 → onError 回调
+3. 未捕获异常 → onError 回调
    └─ numRetriesLeft == 0 → 标记永久失败
 ```
 
 ---
 
-## 八、关键设计要点
+## 十、关键设计要点
 
 1. **浏览器不是池**：单实例全局共享，每个任务创建独立的 BrowserContext 做隔离；按需模式下每次任务创建/销毁完整浏览器实例
 2. **代理不中途切换**：一次 run 内代理固定；重试时（新 run）才重新随机选择
 3. **两类重试**：普通错误消耗重试次数 + 退避递增；限速错误不消耗次数 + 按指定延迟重试
-4. **多层安全防护**：URL 校验（DNS + IP 黑名单）在 fetch、浏览器导航、CDP 重定向、子资源请求四层均被执行
-5. **超时无处不在**：所有异步操作都有 `raceWith` + 超时 + 中断信号保护，防止任何操作无限挂起
-6. **泄漏兜底**：Context Reaper 定期扫描回收超龄上下文，page/context 关闭本身也有超时保护
-7. **队列后端可插拔**：liteque（SQLite）和 restate 两种后端，QueueRetryAfterError 在适配层统一转换为后端原生的延迟重试语义
+4. **403/429/5xx Fallback**：重试耗尽后不抛弃已抓取内容，继续解析并写入数据库，仅记录错误状态码
+5. **Restate 两层重试**：SDK 级 retryPolicy（未捕获异常）与 handler 内 while 自循环（绝大多数场景）并存，runner 层禁用重试
+6. **可用性探测前置**：globalBrowser 判定（browserless 降级）和 getContentType MIME 嗅探（处理路径分支）均在实际爬取前完成
+7. **多层安全防护**：URL 校验（DNS + IP 黑名单）在 fetch、浏览器导航、CDP 重定向、子资源请求四层均被执行
+8. **超时无处不在**：所有异步操作都有 `raceWith` + 超时 + 中断信号保护，防止任何操作无限挂起
+9. **泄漏兜底**：Context Reaper 定期扫描回收超龄上下文，page/context 关闭本身也有超时保护
+10. **队列后端可插拔**：liteque（SQLite）和 restate 两种后端，QueueRetryAfterError 在适配层统一转换为后端原生的延迟重试语义
