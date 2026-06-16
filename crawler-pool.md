@@ -30,6 +30,9 @@ Karakeep **没有**实现一个浏览器实例池（browser pool），而是采�
 - 连接失败 → 5 秒后递归重试 `setTimeout(() => launchBrowser(), 5000)`
 - 断线重连：`globalBrowser.on("disconnected", () => launchBrowser())`
 - 用 `browserMutex`（async-mutex）保护并发访问
+- **shutdown 早退**：
+  - 连接失败重试前检查 `exitAbortController.signal.aborted` → 为 true 则 log "won't retry" 后 return，不再重试
+  - 断线重连回调前检查 `exitAbortController.signal.aborted` → 为 true 则 log "won't restart it" 后 return，不再重连
 
 ```ts
 let globalBrowser: Browser | undefined;   // 唯一全局实例
@@ -75,6 +78,25 @@ browser === undefined ?
 - 超过 `jobTimeoutSec + 30s + 5min` 的上下文被标记为过期
 - 尝试 `context.close()`，10 秒超时
 - 关闭成功 → 从 Map 删除；关闭失败 → 保留让下次再试
+- shutdown 早退：`exitAbortController.signal` abort 时 `clearInterval(intervalId)`，停止调度
+
+### 2.6 与浏览器共生的全局状态：globalBlocker 与 globalCookies
+
+两者均在 [CrawlerWorker.ensureInitialized()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L336-L365) 中初始化，与浏览器实例同生命周期。
+
+**globalBlocker（广告拦截器）**
+- 初始化条件：`serverConfig.crawler.enableAdblocker == true`
+- 加载方式：`PlaywrightBlocker.fromPrebuiltFull(fetchWithProxy, { cachePath: os.tmpdir()/karakeep_adblocker.bin })`
+- 失败降级：加载失败不抛出异常，仅打 error 日志，不启用拦截功能
+- 注入路径：[crawlPage()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L738-L741) 创建 Page 后调用 `globalBlocker.enableBlockingInPage(nextPage)`
+
+**globalCookies（共享 Cookie）**
+- 初始化：`loadCookiesFromFile()` 从 `CRAWLER_BROWSER_COOKIE_PATH` 读取 JSON 文件，经 `cookiesSchema`（zod）验证后赋值给 `globalCookies`
+- 失败行为：读取/解析失败 → throw Error，初始化流程终止
+- 注入路径：[crawlPage()](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/apps/workers/workers/crawlerWorker.ts#L619-L624) 创建 BrowserContext 后、创建 Page 前调用 `context.addCookies(globalCookies)`
+- 空值跳过：`globalCookies.length == 0` 时不注入
+
+> **生命周期对齐**：两者均为模块级全局变量，初始化一次后复用所有爬取任务。按需模式下浏览器每次销毁重建，但 globalBlocker/globalCookies 不重建。
 
 ---
 
@@ -165,7 +187,16 @@ const runProxy = selectRunProxies();  // 随机选一个代理，整个 run 复�
 browser.newContext({ proxy: proxyConfig, ... })
 ```
 
-浏览器内所有请求（包括子资源）都走这个代理。CDP 的 `Fetch.authRequired` 事件处理代理认证。
+浏览器内所有请求（包括子资源）都走这个代理。代理认证通过 CDP 的 `Fetch.authRequired` 事件处理。
+
+**CDP Fetch.authRequired 代理认证链路**
+1. `context.newCDPSession(page)` 为 Page 创建 CDP 会话
+2. `cdpSession.send("Fetch.enable", { handleAuthRequests: true, patterns: [{ urlPattern: "*" }] })` 启用请求拦截，开启认证处理
+3. 监听 `cdpSession.on("Fetch.authRequired")` 事件：
+   - `event.authChallenge.source === "Proxy"` 且 `proxyConfig` 含 username/password → 响应 `ProvideCredentials`，携带 `username` 和 `password`
+   - 其他情况（非代理认证或无认证信息）→ 响应 `Default`，让浏览器自行处理
+4. `cdpSession.send("Fetch.continueWithAuth", { requestId, authChallengeResponse })` 提交认证决策
+5. 错误吞掉：`send()` 的 `catch()` 为空，避免请求已取消导致的异常冒泡
 
 **路径 B：HTTP 请求（browserless 模式 / content-type 探测 / 文件下载）**
 
@@ -322,13 +353,15 @@ retryPolicy: {
 ```ts
 let runNumber = 0;
 while (runNumber <= NUM_RETRIES) {  // runNumber 从 0 到 5，共 6 次
-  // 1. 获取信号量租约
-  // 2. 调用 runner.run()
-  // 3. 根据返回结果分支处理：
-  //    ├─ RPC error → 指数退避 + runNumber++ → continue
-  //    ├─ rate_limit → sleep(delayMs) + 不递增 → continue
-  //    ├─ error → sleep(1000) + runNumber++ → continue
-  //    └─ success → break
+  // 1. semaphore.acquire() 获取信号量租约 → 返回 leaseId
+  //    ├─ idempotencyKey 已存在 → 跳过（leaseId === false）
+  //    └─ 取消/失败 → 内部 release 后抛错
+  // 2. 调用 runner.run(jobData)
+  // 3. 根据返回结果分支处理（每条分支都 release）：
+  //    ├─ RPC error → release → 指数退避 + runNumber++ → continue
+  //    ├─ rate_limit → release → sleep(delayMs) + 不递增 → continue
+  //    ├─ error → onError → release → sleep(1000) + runNumber++ → continue
+  //    └─ success → onCompleted → release → break
 }
 ```
 
@@ -338,6 +371,7 @@ while (runNumber <= NUM_RETRIES) {  // runNumber 从 0 到 5，共 6 次
 | rate_limit | 返回 `{type:"rate_limit"}` | 不变 | `delayMs`（由 crawler 指定） |
 | 业务级错误 | 返回 `{type:"error"}` | `++` | `1000 ms`（恒定） |
 | 成功 | 返回 `{type:"success"}` | - | - |
+| 幂等跳过 | `acquire()` 返回 `false` | - | 直接 return |
 
 ### 6.3 Runner 层：禁用重试
 
@@ -392,11 +426,30 @@ createRunner(queue, funcs, {
 
 ### 7.3 Restate 后端的并发控制
 
-[RestateSemaphore](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L83-L88) 在 dispatcher 层实现：
+[RestateSemaphore](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/semaphore.ts#L537-L582) 在 dispatcher 层实现分布式信号量：
 
+**LeaseId 生成与超时机制**
+- `leaseId` = `ctx.awakeable().id`，是每次 `acquire()` 调用时 restate 生成的唯一标识
+- 租约超时：`leaseDurationMs = Math.ceil(opts.timeoutSecs * 1.5 * 1000)`，即任务超时的 1.5 倍
+- 超时回收：`pruneExpiredLeases()` 在每次 `acquire/release/tick` 时扫描 `metadata.leases`，删除 `expiry <= now` 的过期租约，释放被异常中断任务占用的槽位
+- 服务端状态：`metadata.leases[leaseId] = now + leaseDurationMs` 记录每个租约的过期时间
+
+**四条释放分支**（在 dispatcher while 循环内）：
+
+| 分支 | 触发条件 | 代码位置 | 释放时机 | 后续行为 |
+|------|---------|---------|---------|---------|
+| **1. RPC 级错误** | `runner.run()` 抛出异常（服务不可达等） | [dispatcher.ts#L146](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L146) | **release 先于 onError** | 指数退避 + `runNumber++` → continue |
+| **2. rate_limit** | runner 返回 `{type:"rate_limit"}`（QueueRetryAfterError） | [dispatcher.ts#L184](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L184) | release → ctx.sleep(delayMs) | 不递增 runNumber → continue |
+| **3. 业务级错误** | runner 返回 `{type:"error"}`（普通异常） | [dispatcher.ts#L201](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L201) | **onError 先于 release**（保证 inFlight 一致） | sleep(1000) + `runNumber++` → continue |
+| **4. 成功** | runner 返回 `{type:"success"}` | [dispatcher.ts#L220](file:///d:/fz/0601-2/solo-dogfeeding/code/2-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L220) | **onCompleted 先于 release**（保证 inFlight 一致） | break → 退出循环 |
+
+> **一致性约定**：分支 3/4 先通知 runner 回调（onError/onCompleted 会更新 inFlight 计数），再释放信号量；分支 1 因为 runner 本身不可达，只能先释放再尝试通知。
+
+**其他特性**：
 - 信号量容量 = `opts.concurrency`
-- 每次 run 先 `acquire`，完成后 `release`
-- 支持 priority 排队和 groupId 隔离
+- 支持 priority 排队（数字越小优先级越高）和 groupId 隔离
+- 支持 idempotencyKey 防重复入队
+- `queueSize()` 可查询 pending/running 任务数
 
 ---
 
@@ -452,9 +505,13 @@ createRunner(queue, funcs, {
 
 ```
 1. 队列出队任务
-2. runCrawler() 入口
+2. Dispatcher while 循环（restate 后端）
+   ├─ semaphore.acquire() → 返回 leaseId（idempotent 已存在则跳过）
+   ├─ runner.run() 调用
+   └─ 按结果类型 release 租约，分支重试或继续
+3. runCrawler() 入口
    ├─ checkDomainRateLimit()
-   │    └─ 命中限速 → throw QueueRetryAfterError → 延迟重试（不计次数）
+   │    └─ 命中限速 → throw QueueRetryAfterError → delayMs 后重试（不计次数）
    ├─ selectRunProxies()        ← 随机选代理，整个 run 复用
    ├─ getContentType()          ← MIME 嗅探 + 代理 + 5s 超时
    ├─ 根据 content-type 分支：
@@ -464,6 +521,10 @@ createRunner(queue, funcs, {
    │         │    ├─ 获取 browser 实例（全局 or 按需）
    │         │    ├─ browser 不可用 → browserlessCrawlPage()  ← 可用性探测
    │         │    ├─ 创建 BrowserContext（注入代理配置）
+   │         │    ├─ context.addCookies(globalCookies)       ← 注入共享 Cookie
+   │         │    ├─ 创建 CDP 会话 → 开启 Fetch 拦截（含认证处理）
+   │         │    ├─ globalBlocker.enableBlockingInPage(page) ← 注入广告拦截
+   │         │    ├─ CDP Fetch.authRequired → ProvideCredentials 代理认证
    │         │    ├─ CDP 安装重定向守卫 + 子资源安全校验
    │         │    ├─ 导航 + 等待加载（带超时/中断）
    │         │    ├─ 抓取 HTML + 截图 + PDF（并行）
@@ -473,8 +534,11 @@ createRunner(queue, funcs, {
    │         │    └─ 403/429/5xx + 重试耗尽 → 继续 parse + 落库（Fallback）
    │         └─ 解析 + 存储 + 入队下游任务
    └─ 完成 → onComplete 回调
-3. 未捕获异常 → onError 回调
+4. 未捕获异常 → onError 回调
    └─ numRetriesLeft == 0 → 标记永久失败
+5. Shutdown 时 exitAbortController.abort()
+   ├─ launchBrowser 连接失败/断线 → 不再重试
+   └─ Context Reaper 定时器 → 被 clearInterval 停止
 ```
 
 ---
@@ -491,3 +555,8 @@ createRunner(queue, funcs, {
 8. **超时无处不在**：所有异步操作都有 `raceWith` + 超时 + 中断信号保护，防止任何操作无限挂起
 9. **泄漏兜底**：Context Reaper 定期扫描回收超龄上下文，page/context 关闭本身也有超时保护
 10. **队列后端可插拔**：liteque（SQLite）和 restate 两种后端，QueueRetryAfterError 在适配层统一转换为后端原生的延迟重试语义
+11. **与浏览器共生的全局状态**：globalBlocker（广告拦截）和 globalCookies（共享 Cookie）初始化一次后复用所有爬取任务，与浏览器实例同生命周期
+12. **CDP 代理认证链路完整闭环**：`Fetch.enable` 开启认证拦截 → `Fetch.authRequired` 事件判定来源 → 提供 `ProvideCredentials` 携带代理用户名密码 → `Fetch.continueWithAuth` 提交决策
+13. **Semaphore 四条释放路径**：RPC 错误先 release 再 onError；业务错误/成功先 onError/onCompleted 再 release；rate_limit release 后 sleep 不计数；各路径严格遵循 inFlight 计数一致性约定
+14. **Lease 超时自动回收**：semaphore 租约超时设为任务超时的 1.5 倍，每次 `acquire/release/tick` 时自动扫描并释放过期租约，防止任务异常中断导致的永久占用
+15. **Shutdown 早退分支**：launchBrowser 连接失败/断线重连、Context Reaper 定时器均监听 `exitAbortController.signal`，在优雅退出时立即停止重试/调度，避免 shutdown 挂起
