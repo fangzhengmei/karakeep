@@ -30,7 +30,7 @@
 
 ### 2.1 QueryClient 的构建与配置
 
-入口在 [trpc-provider.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/providers/trpc-provider.tsx)，由移动端 [providers.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/lib/providers.tsx) 注入。
+入口在 [trpc-provider.tsx](packages/shared-react/providers/trpc-provider.tsx)，由移动端 [providers.tsx](apps/mobile/lib/providers.tsx) 注入。
 
 ```ts
 // trpc-provider.tsx
@@ -49,7 +49,7 @@ function makeQueryClient() {
 
 - `staleTime: 60_000`：查询结果在 1 分钟内不会触发后台 refetch（被动刷新由 mutation 失效和聚焦事件驱动）。
 - **未配置 `gcTime` 之外的持久化**：App 被杀进程后缓存清空，下次冷启动重新从服务端拉取。
-- 浏览器侧用单例 `browserQueryClient` 避免 Suspense 时重建；移动端通过 [Providers](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/lib/providers.tsx#L22-L29) 复用同一 client。
+- 浏览器侧用单例 `browserQueryClient` 避免 Suspense 时重建；移动端通过 [Providers](apps/mobile/lib/providers.tsx#L22-L29) 复用同一 client。
 
 ### 2.2 写入操作断网后的重试行为（核准点 ✅）
 
@@ -62,12 +62,12 @@ TanStack Query v5 的默认值 **对 query 和 mutation 是不一样的**：
 | `useQuery` | **3** 次（指数退避） |
 | `useMutation` | **0** 次（不重试） |
 
-本项目 [trpc-provider.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/providers/trpc-provider.tsx) **没有**在 `defaultOptions` 中覆盖 `mutations.retry`；shared-react/hooks 下所有 `useMutation` 调用也都**没有**传 `retry` 参数。因此：
+本项目 [trpc-provider.tsx](packages/shared-react/providers/trpc-provider.tsx) **没有**在 `defaultOptions` 中覆盖 `mutations.retry`；shared-react/hooks 下所有 `useMutation` 调用也都**没有**传 `retry` 参数。因此：
 
 - **书签的创建 / 更新 / 删除 / 打标签、列表增删、高亮增删改等所有写入操作，断网时立即失败，不会有任何内存重试。**
-- 仅有的网络层容错是 [trpc-provider.tsx#getTRPCClient](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/providers/trpc-provider.tsx#L48-L81) 的 **30 秒超时硬中断**（`AbortController`），这不是重试，只是防止请求永久挂起。
+- 仅有的网络层容错是 [trpc-provider.tsx#getTRPCClient](packages/shared-react/providers/trpc-provider.tsx#L48-L81) 的 **30 秒超时硬中断**（`AbortController`），这不是重试，只是防止请求永久挂起。
 - 仓库里显式覆盖 `retry` 的地方只有：
-  - [HighlightCard.tsx:72](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/components/highlights/HighlightCard.tsx#L72) —— `retry: false`，但它是 `useQuery`（查询单个书签），不是 mutation。
+  - [HighlightCard.tsx:72](apps/mobile/components/highlights/HighlightCard.tsx#L72) —— `retry: false`，但它是 `useQuery`（查询单个书签），不是 mutation。
   - Web 端的 `SidebarVersion.tsx`（`retry: 1`）和 `ValidAccountCheck.tsx`（自定义 predicate），同样是 query。
 
 **后果**：断网期间用户执行的任何写入（收藏、归档、改标题、打标签等）在 30s 超时后直接失败，无重试、无 outbox 落盘、无重放——用户操作丢失，仅由 UI Toast 提示"Something went wrong"。
@@ -99,10 +99,10 @@ httpBatchLink({
 
 | 内容 | 存储 | 代码 |
 | --- | --- | --- |
-| 搜索历史 | AsyncStorage | [search-history.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/search-history.ts) |
-| 应用/连接设置 | SecureStore | [settings.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/lib/settings.ts) |
+| 搜索历史 | AsyncStorage | [search-history.ts](packages/shared-react/hooks/search-history.ts) |
+| 应用/连接设置 | SecureStore | [settings.ts](apps/mobile/lib/settings.ts) |
 
-搜索查询本身则用 React Query 的 `keepPreviousData` 做占位（[useBookmarkSearchState.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/lib/useBookmarkSearchState.ts#L32-L44)），`gcTime: 0` 即用即弃，避免缓存膨胀。
+搜索查询本身则用 React Query 的 `keepPreviousData` 做占位（[useBookmarkSearchState.ts](apps/mobile/lib/useBookmarkSearchState.ts#L32-L44)），`gcTime: 0` 即用即弃，避免缓存膨胀。
 
 > ⚠️ 常见误解：这里 **没有** `@tanstack/query-async-storage-persister`。因此"离线打开 App 还能看到上次书签"依赖的是进程未被回收时的内存缓存，而非磁盘缓存。
 
@@ -114,9 +114,9 @@ httpBatchLink({
 
 ### 3.1 写入后失效（主动同步主线）
 
-所有写操作封装在 [bookmarks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/bookmarks.ts)、[lists.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/lists.ts)、[highlights.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/highlights.ts)。模式统一：**mutation 成功 → 失效相关 query → React Query 后台 refetch 服务端权威数据**。
+所有写操作封装在 [bookmarks.ts](packages/shared-react/hooks/bookmarks.ts)、[lists.ts](packages/shared-react/hooks/lists.ts)、[highlights.ts](packages/shared-react/hooks/highlights.ts)。模式统一：**mutation 成功 → 失效相关 query → React Query 后台 refetch 服务端权威数据**。
 
-以更新书签为例（[useUpdateBookmark](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/bookmarks.ts#L103-L130)）：
+以更新书签为例（[useUpdateBookmark](packages/shared-react/hooks/bookmarks.ts#L103-L130)）：
 
 ```ts
 return useMutation(api.bookmarks.updateBookmark.mutationOptions({
@@ -134,12 +134,12 @@ return useMutation(api.bookmarks.updateBookmark.mutationOptions({
 特征：
 
 - **无 `onMutate` 乐观更新**（除了阅读器设置，见 §4.3）。UI 等 mutation 返回后再刷新。
-- **无 `onError` 回滚**。失败时由调用方自行 toast 提示（如 [ActionBar.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/components/bookmarks/card/ActionBar.tsx#L40-L46) 的 `onError`）。
-- `removeQueries` 用于删除型操作，避免残留旧 key（见 [useDeleteBookmark](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/bookmarks.ts#L93-L95)）。
+- **无 `onError` 回滚**。失败时由调用方自行 toast 提示（如 [ActionBar.tsx](apps/mobile/components/bookmarks/card/ActionBar.tsx#L40-L46) 的 `onError`）。
+- `removeQueries` 用于删除型操作，避免残留旧 key（见 [useDeleteBookmark](packages/shared-react/hooks/bookmarks.ts#L93-L95)）。
 
 ### 3.2 失效去抖（最接近"队列"的机制）
 
-[query-invalidation.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/query-invalidation.ts) 实现了一个**去抖 + 最大等待**的失效合并器，这是整个链路里唯一带"排队"语义的组件：
+[query-invalidation.ts](packages/shared-react/hooks/query-invalidation.ts) 实现了一个**去抖 + 最大等待**的失效合并器，这是整个链路里唯一带"排队"语义的组件：
 
 ```ts
 const DEFAULT_INVALIDATION_DEBOUNCE_MS = 250;   // 250ms 去抖
@@ -155,7 +155,7 @@ export function scheduleInvalidateQueries(queryClient, filters, debounceMs = 250
 
 ### 3.3 轮询同步（服务端异步任务的进度拉取）
 
-书签创建后，服务端会异步爬取/打标签/摘要。客户端用轮询拉取进度，见 [useAutoRefreshingBookmarkQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/bookmarks.ts#L12-L27) 配合 [getBookmarkRefreshInterval](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared/utils/bookmarkUtils.ts#L56-L83)：
+书签创建后，服务端会异步爬取/打标签/摘要。客户端用轮询拉取进度，见 [useAutoRefreshingBookmarkQuery](packages/shared-react/hooks/bookmarks.ts#L12-L27) 配合 [getBookmarkRefreshInterval](packages/shared/utils/bookmarkUtils.ts#L56-L83)：
 
 | 创建后时长 | 轮询间隔 |
 | --- | --- |
@@ -164,12 +164,12 @@ export function scheduleInvalidateQueries(queryClient, filters, debounceMs = 250
 | 10min–6h | 60s |
 | >6h 或已不再 loading | 停止 |
 
-"是否还在 loading"由 [isBookmarkStillLoading](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared/utils/bookmarkUtils.ts#L48-L54) 判断（爬取 / 打标签 / 摘要任一 pending）。这是**服务端推不动、客户端拉**的同步模式。
+"是否还在 loading"由 [isBookmarkStillLoading](packages/shared/utils/bookmarkUtils.ts#L48-L54) 判断（爬取 / 打标签 / 摘要任一 pending）。这是**服务端推不动、客户端拉**的同步模式。
 
 ### 3.4 前台聚焦 + 下拉刷新
 
-- **前台聚焦重取**：[dashboard/_layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/app/dashboard/_layout.tsx#L11-L14) 监听 `AppState`，调用 `focusManager.setFocused(status === "active")`，React Query 据此对 stale query 自动 refetch——这是回到 App 时数据"自动同步"的原因。
-- **下拉刷新**：[UpdatingBookmarkList.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/components/bookmarks/UpdatingBookmarkList.tsx#L55-L57) 的 `onRefresh` 直接 `invalidateQueries` 列表与详情，强制重取。
+- **前台聚焦重取**：[dashboard/_layout.tsx](apps/mobile/app/dashboard/_layout.tsx#L11-L14) 监听 `AppState`，调用 `focusManager.setFocused(status === "active")`，React Query 据此对 stale query 自动 refetch——这是回到 App 时数据"自动同步"的原因。
+- **下拉刷新**：[UpdatingBookmarkList.tsx](apps/mobile/components/bookmarks/UpdatingBookmarkList.tsx#L55-L57) 的 `onRefresh` 直接 `invalidateQueries` 列表与详情，强制重取。
 
 ### 3.5 小结：同步链路全景
 
@@ -206,7 +206,7 @@ UI 自动重渲染（stale-while-revalidate）
 
 > **校正：此前"整字段覆盖写入"的说法不准确。**
 
-服务端 [updateBookmark mutation](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/routers/bookmarks.ts#L466-L652) 采用的是 **按字段条件 UPDATE（partial patch）**，不是整条记录覆盖。其请求 schema [zUpdateBookmarksRequestSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared/types/bookmarks.ts#L227-L251) 中除 `bookmarkId` 外所有字段都是 `optional()` / `nullish()`：
+服务端 [updateBookmark mutation](packages/trpc/routers/bookmarks.ts#L466-L652) 采用的是 **按字段条件 UPDATE（partial patch）**，不是整条记录覆盖。其请求 schema [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) 中除 `bookmarkId` 外所有字段都是 `optional()` / `nullish()`：
 
 ```ts
 // bookmarks.ts#L554-L594 —— 服务端按字段条件更新
@@ -246,7 +246,7 @@ link / text / asset 各自的专属字段也有同样的 `if (input.xxx)` 保护
 
 ### 4.2 列表合并 `lists.merge`（这是"合并两个清单"，不是同步冲突）
 
-[useMergeLists](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/lists.ts#L59-L82) → 服务端 [lists.ts#merge](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/routers/lists.ts#L103-L116) → [ManualList.mergeInto](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/models/lists.ts#L1109-L1142)：
+[useMergeLists](packages/shared-react/hooks/lists.ts#L59-L82) → 服务端 [lists.ts#merge](packages/trpc/routers/lists.ts#L103-L116) → [ManualList.mergeInto](packages/trpc/models/lists.ts#L1109-L1142)：
 
 ```ts
 const bookmarkIds = await this.getBookmarkIds();
@@ -264,13 +264,13 @@ await this.ctx.db.transaction(async (tx) => {
 要点：
 
 - 把源清单的所有书签"搬"进目标清单，`onConflictDoNothing` 做幂等去重——这是全代码库里**唯一真正意义上的"合并"**，但语义是"清单间成员合并"。
-- 只能合并进 `manual` 清单，`SmartList.mergeInto` 直接抛 `BAD_REQUEST`（[lists.ts:979-987](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/models/lists.ts#L979-L987)）。
+- 只能合并进 `manual` 清单，`SmartList.mergeInto` 直接抛 `BAD_REQUEST`（[lists.ts:979-987](packages/trpc/models/lists.ts#L979-L987)）。
 - 在事务内执行，可选删除源清单，保证原子性。
 - 成功后客户端 invalidate 清单树、目标清单书签列表、stats。
 
 ### 4.3 阅读器设置：分层优先级 + pending 防抖（最接近"冲突合并"的模式）
 
-[reader-settings.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/reader-settings.tsx) 是移动端唯一带有"乐观 + 服务端确认 + 回滚清理"语义的代码，可作为理解"合并策略"的最佳范例：
+[reader-settings.tsx](packages/shared-react/hooks/reader-settings.tsx) 是移动端唯一带有"乐观 + 服务端确认 + 回滚清理"语义的代码，可作为理解"合并策略"的最佳范例：
 
 **有效值优先级（高 → 低）：**
 
@@ -278,29 +278,33 @@ await this.ctx.db.transaction(async (tx) => {
 sessionOverrides → localOverrides → pendingServerSave → serverSettings → READER_DEFAULTS
 ```
 
-见 [useReaderSettings#settings](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/reader-settings.tsx#L110-L132)。
+见 [useReaderSettings#settings](packages/shared-react/hooks/reader-settings.tsx#L110-L132)。
 
 **同步与防抖机制：**
 
 - `updateLocal`：立即写本地（每设备）并展示，不等服务端。
 - `saveAsDefault`：设 `pendingServerSave`（乐观值，防止服务端回包前的闪烁）→ 发 `updateSettings` mutation。
-- **服务端确认**：[useEffect](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/reader-settings.tsx#L66-L79) 监听 `serverSettings`，当服务端值与 `pendingServerSave` 匹配（lineHeight 容忍 1e-6 浮点误差）时清空 pending。
-- **失败回滚**：`saveServerSettings` 的 `onError` 把 `pendingServerSave` 置空，避免展示未真正持久化的值（[L99-L102](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/reader-settings.tsx#L99-L102)）。
+- **服务端确认**：[useEffect](packages/shared-react/hooks/reader-settings.tsx#L66-L79) 监听 `serverSettings`，当服务端值与 `pendingServerSave` 匹配（lineHeight 容忍 1e-6 浮点误差）时清空 pending。
+- **失败回滚**：`saveServerSettings` 的 `onError` 把 `pendingServerSave` 置空，避免展示未真正持久化的值（[L99-L102](packages/shared-react/hooks/reader-settings.tsx#L99-L102)）。
 - `onSettled` 一律 `refetchQueries(users.settings)` 拉取服务端最新值对齐。
 
 这是一种 **本地优先 + 服务端最终权威 + 乐观挂起 + 失败回退** 的轻量一致性策略，但**仅作用于阅读器设置**，书签本体未采用。
 
 ---
 
-## 5. 仓库内链接可移植性（核准点 ✅）
+## 5. 仓库内引用方式与可移植性（核准点 ✅）
 
-本文件使用 `file:///d:/absolute/path` 形式的绝对 URI 引用代码，可移植性要点：
+本文件所有代码引用均采用 **仓库相对路径**（相对于仓库根目录），不再绑定某台机器的绝对路径。这样无论谁、在哪台机器上克隆本仓库，都能直接对照路径复核代码。
 
-- **路径分隔符统一用正斜杠 `/`**，即使在 Windows 环境下。这符合 Markdown / file URI 的通用规范，在任何平台的 IDE 和 Markdown 渲染器中都能正确解析；Windows 原生反斜杠 `\` 在 URI 中是非法字符。
-- **绝对路径绑定当前工作目录**（`d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/`）。将仓库克隆到另一台机器或另一路径后，这些链接会失效。若需仓库级可移植链接，可改写为相对路径（如 `packages/shared-react/providers/trpc-provider.tsx`），但会牺牲 IDE 中的跳转能力。
-- **行号锚点使用 `#L<start>-L<end>` 格式**（两端都带 `L` 前缀），这是 LSP / IDE 通用的锚点规范。
+引用格式约定：
 
-本文件所有代码引用均已按上述三条规则书写。
+- 路径形如 `packages/...` 或 `apps/...`，是相对于仓库根目录的相对路径；不包含盘符、不含本机绝对前缀。
+- 路径分隔符统一用正斜杠 `/`，跨平台一致；Windows 原生反斜杠 `\` 在 Markdown 链接中属非法字符，已避免使用。
+- 行号锚点统一使用 `#L<start>-L<end>` 格式（起止两端都带 `L` 前缀），与 LSP / VS Code 跳转规范一致，便于在 IDE 中定位行范围。
+
+**换机器也能复核**：因为这些链接不含本机路径，把仓库 clone 到任意机器（Windows / macOS / Linux）、任意工作目录后，相对路径与锚点依然成立，可直接用编辑器"按住 Ctrl/Cmd 点击"或"打开文件 + 跳转行号"的方式逐条核对文中的结论。
+
+> 说明：相对路径链接在部分纯 Markdown 预览器（如 GitHub Web 渲染）中可能不会被识别为可跳转 URI，但路径与锚点文本本身足以定位文件与行范围，不影响人工复核。
 
 ---
 
@@ -308,18 +312,18 @@ sessionOverrides → localOverrides → pendingServerSave → serverSettings →
 
 | 关注点 | 应该读的文件 | 一句话 |
 | --- | --- | --- |
-| 缓存初始化 / staleTime | [trpc-provider.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/providers/trpc-provider.tsx) | 内存缓存，60s 新鲜期，无持久化 |
-| mutation 重试行为（默认 0 次） | [trpc-provider.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/providers/trpc-provider.tsx) + TanStack Query v5 默认值 | 写入断网立即失败，不重试 |
-| mutation → 失效 | [bookmarks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/bookmarks.ts) | 写后 invalidate，无乐观/无回滚 |
-| 失效去抖"队列" | [query-invalidation.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/query-invalidation.ts) | 250ms/3s 合并失效，唯一的"排队" |
-| 轮询同步 | [bookmarks.ts#useAutoRefreshingBookmarkQuery](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/bookmarks.ts#L12-L27) + [bookmarkUtils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared/utils/bookmarkUtils.ts#L56-L83) | 1s/10s/60s 递减拉取 |
-| 前台重取 | [dashboard/_layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/app/dashboard/_layout.tsx#L11-L14) | AppState → focusManager |
-| 服务端部分更新逻辑 | [bookmarks.ts (router)#updateBookmark](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/routers/bookmarks.ts#L466-L652) | 按字段条件 UPDATE，不同字段互不覆盖 |
-| 请求 schema（字段 optional） | [zUpdateBookmarksRequestSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared/types/bookmarks.ts#L227-L251) | 除 bookmarkId 外全字段可选 |
-| 标签增删边界 | [bookmarks.ts (router)#updateTags](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/routers/bookmarks.ts#L975-L1174) | `onConflictDoNothing` 幂等 attach |
-| 列表合并 | [lists.ts (router)](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/routers/lists.ts#L103-L116) + [lists.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/trpc/models/lists.ts#L1109-L1142) | `onConflictDoNothing` 成员合并 |
-| 乐观 + 回滚（仅阅读器） | [reader-settings.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/packages/shared-react/hooks/reader-settings.tsx) | 分层优先级 + pending 防抖 |
-| 资源/连接设置落盘 | [settings.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/21-karakeep/apps/mobile/lib/settings.ts) | SecureStore，非书签缓存 |
+| 缓存初始化 / staleTime | [trpc-provider.tsx](packages/shared-react/providers/trpc-provider.tsx) | 内存缓存，60s 新鲜期，无持久化 |
+| mutation 重试行为（默认 0 次） | [trpc-provider.tsx](packages/shared-react/providers/trpc-provider.tsx) + TanStack Query v5 默认值 | 写入断网立即失败，不重试 |
+| mutation → 失效 | [bookmarks.ts](packages/shared-react/hooks/bookmarks.ts) | 写后 invalidate，无乐观/无回滚 |
+| 失效去抖"队列" | [query-invalidation.ts](packages/shared-react/hooks/query-invalidation.ts) | 250ms/3s 合并失效，唯一的"排队" |
+| 轮询同步 | [useAutoRefreshingBookmarkQuery](packages/shared-react/hooks/bookmarks.ts#L12-L27) + [bookmarkUtils.ts](packages/shared/utils/bookmarkUtils.ts#L56-L83) | 1s/10s/60s 递减拉取 |
+| 前台重取 | [dashboard/_layout.tsx](apps/mobile/app/dashboard/_layout.tsx#L11-L14) | AppState → focusManager |
+| 服务端部分更新逻辑 | [updateBookmark](packages/trpc/routers/bookmarks.ts#L466-L652) | 按字段条件 UPDATE，不同字段互不覆盖 |
+| 请求 schema（字段 optional） | [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) | 除 bookmarkId 外全字段可选 |
+| 标签增删边界 | [updateTags](packages/trpc/routers/bookmarks.ts#L975-L1174) | `onConflictDoNothing` 幂等 attach |
+| 列表合并 | [lists.merge](packages/trpc/routers/lists.ts#L103-L116) + [mergeInto](packages/trpc/models/lists.ts#L1109-L1142) | `onConflictDoNothing` 成员合并 |
+| 乐观 + 回滚（仅阅读器） | [reader-settings.tsx](packages/shared-react/hooks/reader-settings.tsx) | 分层优先级 + pending 防抖 |
+| 资源/连接设置落盘 | [settings.ts](apps/mobile/lib/settings.ts) | SecureStore，非书签缓存 |
 
 ---
 
@@ -329,4 +333,4 @@ sessionOverrides → localOverrides → pendingServerSave → serverSettings →
 2. **书签按字段部分 UPDATE，不是整行覆盖**：多端编辑**不同字段**时修改都保留（不冲突）；编辑**同一字段**时 last-write-wins。无 CAS / 版本号保护。
 3. **"合并"唯一真实存在**于清单成员迁移（`mergeInto` 用 `onConflictDoNothing` 去重）和阅读器设置的分层优先级。
 4. 阅读器设置的 `pendingServerSave` 模式是可复用的"乐观 + 确认 + 回滚"范式，若未来要给书签加乐观更新，可参考其结构（`onMutate` 写缓存 → `onError` 回滚 → `onSettled` 重取）。
-5. **链接可移植性**：本文档所有 `file://` URI 均使用正斜杠和 `#Lx-Ly` 锚点，符合通用规范；但路径是当前机器绝对路径，跨机器迁移时需改写为相对路径。
+5. **链接可移植性**：本文档所有代码引用均改为仓库相对路径 + `#Lx-Ly` 锚点，不含本机绝对路径，换机器 / 换工作目录克隆仓库后仍可逐条复核。
