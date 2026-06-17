@@ -204,7 +204,7 @@ UI 自动重渲染（stale-while-revalidate）
 
 ### 4.1 书签本身：服务端权威 + 字段级部分更新（核准点 ✅）
 
-> **校正：此前只笼统地说了"按字段条件 UPDATE"，未区分三类字段的守卫差异与并发语义，这是关键遗漏。**
+> **校正（第三轮）：逐字段复核 schema 与服务端守卫后，修正了数量口径——请求字段总数 15（含 `bookmarkId`）/ 可变 14；按 Zod 修饰分 `.optional()` 5 个 + `.nullish()` 9 个；按服务端守卫分 `!== undefined` 12 个 + falsy 跳过 2 个（`url`/`text`）。重点修正 `text` 对 `null` 和空字符串的跳过语义：两者都通过 Zod 校验却被服务端 falsy 守卫静默跳过。**
 
 服务端 [updateBookmark mutation](packages/trpc/routers/bookmarks.ts#L466-L652) 采用的是 **按字段条件 UPDATE（partial patch）**，不是整条记录覆盖。其请求 schema [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) 中除 `bookmarkId` 外的所有字段，按 "可省略 / 可置空 / 空值会被跳过" 三种语义严格区分，服务端对每一类字段的守卫条件并不相同——正是这些差异决定了多端编辑冲突边界。
 
@@ -234,18 +234,19 @@ if (Object.keys(commonUpdateData).length > 1 || somethingChanged) {
 | **可置空字段** | `.nullish()` = `.optional().nullable()` | 跳过，不改列 | 通过校验，其后续行为取决于服务端守卫 | 通过校验，其后续行为取决于服务端守卫 |
 | **空值被跳过的字段** | —（语义由服务端守卫决定，不由 Zod 决定） | — | — | 服务端用 `if (input.x)` 守卫，空串被当成 falsy 跳过；但 `null` 仍会生效 |
 
-逐字段对照（共 17 个字段，分 4 类）：
+逐字段对照（**共 15 个字段**，含 `bookmarkId`；其中 14 个为用户可变 patch 字段，分 4 类）：
 
-##### ① 可省略但不可置空（`optional()`，非 nullable）——4 个字段
+##### ① 可省略但不可置空（`optional()`，非 nullable）——5 个字段
 
 | 字段 | Schema 修饰 | Server 守卫 | `null` 请求 | `""` 请求 |
 | --- | --- | --- | --- | --- |
 | `archived` | `z.boolean().optional()` | `!== undefined` | Zod 直接拒绝（boolean 不接受 null） | N/A（boolean 无空串） |
 | `favourited` | `z.boolean().optional()` | `!== undefined` | Zod 直接拒绝 | N/A |
 | `note` | `z.string().optional()` | `!== undefined` | **Zod 直接拒绝**（`optional()` 不可传 null） | ✅ 写入空字符串（会清空 note）——注意与 summary 的差异 |
+| `createdAt` | `z.coerce.date().optional()` | `!== undefined` | Zod 直接拒绝（`optional()` 不可传 null） | Zod coerce 失败被拒 |
 | `url` | `z.string().url().optional()` | `if (input.url)`（falsy 跳过 + trim） | Zod 直接拒绝 | Zod 直接拒绝（`""` 不满足 `.url()`） |
 
-##### ② 可省略也可置空（`nullish()`）+ 服务端用 `!== undefined` 守卫 ——11 个字段（**主流模式**）
+##### ② 可省略也可置空（`nullish()`）+ 服务端用 `!== undefined` 守卫 ——8 个字段（**主流模式**）
 
 这类字段是设计意图最明确的一类：三态"不传 / 传 null / 传值"，分别对应"不改 / 置空 / 覆盖"。
 
@@ -258,18 +259,24 @@ if (Object.keys(commonUpdateData).length > 1 || somethingChanged) {
 | `publisher` | `z.string().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
 | `datePublished` | `z.coerce.date().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | Zod 会尝试 coerce，空串通常失败被拒 |
 | `dateModified` | `z.coerce.date().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | 同上 |
-| `text` | `z.string().nullish()` | `if (input.text)`（**falsy 跳过**） | 跳过 | **被跳过（不置空）** | **被跳过（不置空）** |
 | `assetContent` | `z.string().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
 
-**注意 `text` 的异质性**：11 个 nullish 字段中唯一不用 `!== undefined` 作守卫、而用 `if (input.text)` 作守卫的就是它（[bookmarks.ts#L517-L533](packages/trpc/routers/bookmarks.ts#L517-L533)）。因此：
-- 传 `null` 或 `""` 不会清空正文，而是整个被跳过、无任何报错。
-- 这是全代码库里**唯一能导致"用户以为自己清空了但实际上没清掉"**的字段边界差异。
+##### ③ 可置空但空值会被跳过（`nullish()` + `if (input.x)` falsy 守卫）——1 个字段（仅 `text`）
 
-##### ③ 可省略但不可置空（`optional()`，非 nullable）+ `z.coerce.date()` ——1 个字段
+> **这是全链路最关键的字段边界差异，也是本次校正的重点。**
 
-| 字段 | Schema 修饰 | Server 守卫 | `null` 请求 | 空串 / 非法 |
-| --- | --- | --- | --- | --- |
-| `createdAt` | `z.coerce.date().optional()` | `!== undefined` | Zod 直接拒绝（`optional()` 不可传 null） | Zod coerce 失败被拒 |
+[`text`](packages/trpc/routers/bookmarks.ts#L517-L533) 的 Zod 修饰是 `z.string().nullish()`，与服务端守卫 `if (input.text)` **组合后产生的行为**——它是 9 个 nullish 字段中唯一一个"传 `null` 不能置空"的字段：
+
+| 请求值 | Zod 校验 | 服务端 `if (input.text)` | 最终结果 |
+| --- | --- | --- | --- |
+| 不带 `text` | 通过（undefined） | `if (undefined)` → false | **跳过**，不改正文 |
+| `text: null` | **通过**（nullish 允许 null） | `if (null)` → false | **静默跳过**，正文**未被清空** |
+| `text: ""` | **通过**（空串是合法 string） | `if ("")` → false | **静默跳过**，正文**未被清空** |
+| `text: "内容"` | 通过 | `if ("内容")` → true | ✅ 写入新正文 |
+
+**关键结论：** 其余 8 个 nullish 字段传 `null` 会真正写入 NULL（清空）；而 `text` 传 `null` 或 `""` 都会通过 Zod 校验（因为 nullish 允许两者），但随后被服务端的 falsy 守卫静默跳过——不报错、不写入、正文保持原值。这是唯一能导致"用户以为自己清空了正文但实际上没清掉"的隐式失败点。
+
+> 补充：`url`（类别 ①）也用了 `if (input.url)` falsy 守卫，但它的 Zod 是 `z.string().url().optional()`，`null` 和 `""` 都会被 Zod 拦截，所以 falsy 守卫对 `url` 实际无影响——与 `text` 的"Zod 放行但服务端跳过"本质不同。
 
 ##### ④ 隐式常量字段（不由用户请求决定）——1 个字段
 
@@ -307,7 +314,7 @@ if (Object.keys(commonUpdateData).length > 1 || somethingChanged) {
 | A 改 `title: "X"`，B 改 `title: "Y"`（同字段，都传值） | **last-write-wins**，后提交覆盖先提交 | 同列被两次 UPDATE，无版本号 / CAS 保护 |
 | A 传 `description: null`（置空），B 传 `description: "新描述"` | **last-write-wins** | 两者都过 `!== undefined` 守卫，都进入 UPDATE |
 | A 传 `note: ""`（清空），B 传 `note: "新笔记"` | **last-write-wins** | note 是 `optional()` + `!== undefined`，空串也通过守卫 |
-| A 传 `text: "更长的正文"`，B 传 `text: null` 或 `text: ""`（想清空） | **A 保留，B 被静默跳过** | `text` 是 11 个 nullish 字段中唯一用 `if (input.text)` 守卫的，falsy 值直接跳过 |
+| A 传 `text: "更长的正文"`，B 传 `text: null` 或 `text: ""`（想清空） | **A 保留，B 被静默跳过** | `text` 是 9 个 nullish 字段中唯一用 `if (input.text)` 守卫的，`null`/`""` 虽通过 Zod 但被 falsy 守卫跳过 |
 | A 只改 `archived`，B 的请求完全不带 `summary` | A 保留，B 不影响 summary | summary 是 nullish + `!== undefined`，省略即跳过 |
 | A 改 `note`，B 同时 detach tag `T` | **两个修改都保留** | 独立 mutation + 独立表（`bookmarks` vs `tagsOnBookmarks`） |
 | A 改 `title`，B 同时改 link 的 `description` | **两个修改都保留** | 独立表（`bookmarks` vs `bookmarkLinks`） |
@@ -396,7 +403,7 @@ sessionOverrides → localOverrides → pendingServerSave → serverSettings →
 | 前台重取 | [dashboard/_layout.tsx](apps/mobile/app/dashboard/_layout.tsx#L11-L14) | AppState → focusManager |
 | 服务端字段级守卫（共 4 类） | [updateBookmark](packages/trpc/routers/bookmarks.ts#L466-L652) | 分 `optional()` / `nullish()` / `falsy跳过` / 隐式 `modifiedAt` 四类守卫 |
 | 请求 schema（逐字段修饰差异） | [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) | 含 `.optional()` 与 `.nullish()` 两类修饰，语义完全不同 |
-| `text` 字段异质性守卫（`if (input.text)`） | [bookmarks.ts#L517-L533](packages/trpc/routers/bookmarks.ts#L517-L533) | 11 个 nullish 字段中唯一 falsy 跳过的，传 `null`/`""` 不清空 |
+| `text` 字段异质性守卫（`if (input.text)`） | [bookmarks.ts#L517-L533](packages/trpc/routers/bookmarks.ts#L517-L533) | 9 个 nullish 字段中唯一 falsy 跳过的，传 `null`/`""` 通过 Zod 但不清空 |
 | 标签增删边界 | [updateTags](packages/trpc/routers/bookmarks.ts#L975-L1174) | `onConflictDoNothing` 幂等 attach |
 | 列表合并 | [lists.merge](packages/trpc/routers/lists.ts#L103-L116) + [mergeInto](packages/trpc/models/lists.ts#L1109-L1142) | `onConflictDoNothing` 成员合并 |
 | 乐观 + 回滚（仅阅读器） | [reader-settings.tsx](packages/shared-react/hooks/reader-settings.tsx) | 分层优先级 + pending 防抖 |
@@ -407,7 +414,7 @@ sessionOverrides → localOverrides → pendingServerSave → serverSettings →
 ## 7. 结论与设计提示
 
 1. **没有离线 outbox，mutation 断网立即失败（retry=0）**：断网期间写操作 30s 超时后直接丢失，无重试、无持久化、无重放。若需真正的离线同步，需要新增 mutation 持久化层（如 outbox 表 + 自定义 mutation 队列 + 重放调度），并配套乐观更新 + onError 回滚。
-2. **书签按字段部分 UPDATE，不是整行覆盖，但字段语义分 4 类**：`optional()` 不可传 null、`nullish()+!==undefined` 可传 null 置空（主流 10 个字段）、`nullish()+if(text)` 把 falsy 当跳过（仅 `text` 字段，易踩坑）、`modifiedAt` 隐式刷新。多端编辑**不同字段**时修改都保留（不冲突）；同一字段**双方都过守卫**时 last-write-wins；一方传值、另一方被 falsy 跳过（如 text 传 null）时，传值的一方保留而跳过方无报错。全程无 CAS / 版本号保护。
+2. **书签按字段部分 UPDATE，不是整行覆盖，字段语义分 4 类（共 15 字段 / 14 个可变）**：`optional()` 不可传 null（5 个）、`nullish()+!==undefined` 可传 null 置空（主流 8 个）、`nullish()+if(text)` 把 falsy 当跳过（仅 `text` 1 个，易踩坑）、`modifiedAt` 隐式刷新。多端编辑**不同字段**时修改都保留（不冲突）；同一字段**双方都过守卫**时 last-write-wins；一方传值、另一方被 falsy 跳过（如 text 传 `null`/`""`）时，传值的一方保留而跳过方无报错。全程无 CAS / 版本号保护。
 3. **"合并"唯一真实存在**于清单成员迁移（`mergeInto` 用 `onConflictDoNothing` 去重）和阅读器设置的分层优先级。
 4. 阅读器设置的 `pendingServerSave` 模式是可复用的"乐观 + 确认 + 回滚"范式，若未来要给书签加乐观更新，可参考其结构（`onMutate` 写缓存 → `onError` 回滚 → `onSettled` 重取）。
 5. **链接可移植性**：本文档所有代码引用均改为仓库相对路径 + `#Lx-Ly` 锚点，不含本机绝对路径，换机器 / 换工作目录克隆仓库后仍可逐条复核。
