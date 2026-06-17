@@ -204,9 +204,9 @@ UI 自动重渲染（stale-while-revalidate）
 
 ### 4.1 书签本身：服务端权威 + 字段级部分更新（核准点 ✅）
 
-> **校正：此前"整字段覆盖写入"的说法不准确。**
+> **校正：此前只笼统地说了"按字段条件 UPDATE"，未区分三类字段的守卫差异与并发语义，这是关键遗漏。**
 
-服务端 [updateBookmark mutation](packages/trpc/routers/bookmarks.ts#L466-L652) 采用的是 **按字段条件 UPDATE（partial patch）**，不是整条记录覆盖。其请求 schema [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) 中除 `bookmarkId` 外所有字段都是 `optional()` / `nullish()`：
+服务端 [updateBookmark mutation](packages/trpc/routers/bookmarks.ts#L466-L652) 采用的是 **按字段条件 UPDATE（partial patch）**，不是整条记录覆盖。其请求 schema [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) 中除 `bookmarkId` 外的所有字段，按 "可省略 / 可置空 / 空值会被跳过" 三种语义严格区分，服务端对每一类字段的守卫条件并不相同——正是这些差异决定了多端编辑冲突边界。
 
 ```ts
 // bookmarks.ts#L554-L594 —— 服务端按字段条件更新
@@ -224,25 +224,101 @@ if (Object.keys(commonUpdateData).length > 1 || somethingChanged) {
 }
 ```
 
-link / text / asset 各自的专属字段也有同样的 `if (input.xxx)` 保护。
+#### 4.1.1 三类字段的语义差异（Schema × Server 逐字段核对）
 
-**多端并发编辑覆盖边界：**
+先区分三个术语：
 
-| 场景 | 结果 | 依据 |
+| 术语 | 在 Zod 中的修饰符 | 请求里不出现 | 请求里传 `null` | 请求里传空字符串 `""` |
+| --- | --- | --- | --- | --- |
+| **可省略字段** | `.optional()` | 跳过，不改列 | **被 Zod 校验拒绝，根本到不了服务端** | 通过校验，其后续行为取决于服务端守卫 |
+| **可置空字段** | `.nullish()` = `.optional().nullable()` | 跳过，不改列 | 通过校验，其后续行为取决于服务端守卫 | 通过校验，其后续行为取决于服务端守卫 |
+| **空值被跳过的字段** | —（语义由服务端守卫决定，不由 Zod 决定） | — | — | 服务端用 `if (input.x)` 守卫，空串被当成 falsy 跳过；但 `null` 仍会生效 |
+
+逐字段对照（共 17 个字段，分 4 类）：
+
+##### ① 可省略但不可置空（`optional()`，非 nullable）——4 个字段
+
+| 字段 | Schema 修饰 | Server 守卫 | `null` 请求 | `""` 请求 |
+| --- | --- | --- | --- | --- |
+| `archived` | `z.boolean().optional()` | `!== undefined` | Zod 直接拒绝（boolean 不接受 null） | N/A（boolean 无空串） |
+| `favourited` | `z.boolean().optional()` | `!== undefined` | Zod 直接拒绝 | N/A |
+| `note` | `z.string().optional()` | `!== undefined` | **Zod 直接拒绝**（`optional()` 不可传 null） | ✅ 写入空字符串（会清空 note）——注意与 summary 的差异 |
+| `url` | `z.string().url().optional()` | `if (input.url)`（falsy 跳过 + trim） | Zod 直接拒绝 | Zod 直接拒绝（`""` 不满足 `.url()`） |
+
+##### ② 可省略也可置空（`nullish()`）+ 服务端用 `!== undefined` 守卫 ——11 个字段（**主流模式**）
+
+这类字段是设计意图最明确的一类：三态"不传 / 传 null / 传值"，分别对应"不改 / 置空 / 覆盖"。
+
+| 字段 | Schema 修饰 | Server 守卫 | 不传 | 传 `null` | 传 `""` |
+| --- | --- | --- | --- | --- | --- |
+| `summary` | `z.string().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
+| `title` | `z.string().max(N).nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
+| `description` | `z.string().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
+| `author` | `z.string().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
+| `publisher` | `z.string().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
+| `datePublished` | `z.coerce.date().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | Zod 会尝试 coerce，空串通常失败被拒 |
+| `dateModified` | `z.coerce.date().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | 同上 |
+| `text` | `z.string().nullish()` | `if (input.text)`（**falsy 跳过**） | 跳过 | **被跳过（不置空）** | **被跳过（不置空）** |
+| `assetContent` | `z.string().nullish()` | `!== undefined` | 跳过 | ✅ 置 NULL | ✅ 写入空字符串 |
+
+**注意 `text` 的异质性**：11 个 nullish 字段中唯一不用 `!== undefined` 作守卫、而用 `if (input.text)` 作守卫的就是它（[bookmarks.ts#L517-L533](packages/trpc/routers/bookmarks.ts#L517-L533)）。因此：
+- 传 `null` 或 `""` 不会清空正文，而是整个被跳过、无任何报错。
+- 这是全代码库里**唯一能导致"用户以为自己清空了但实际上没清掉"**的字段边界差异。
+
+##### ③ 可省略但不可置空（`optional()`，非 nullable）+ `z.coerce.date()` ——1 个字段
+
+| 字段 | Schema 修饰 | Server 守卫 | `null` 请求 | 空串 / 非法 |
+| --- | --- | --- | --- | --- |
+| `createdAt` | `z.coerce.date().optional()` | `!== undefined` | Zod 直接拒绝（`optional()` 不可传 null） | Zod coerce 失败被拒 |
+
+##### ④ 隐式常量字段（不由用户请求决定）——1 个字段
+
+| 字段 | 触发条件 | 说明 |
 | --- | --- | --- |
-| A 改 `archived`，B 改 `favourited`（不同字段） | **两个修改都保留**，互不覆盖 | 各自的 `if` 分支独立执行，SQL 只 UPDATE 被包含的列 |
-| A 改 `title: "X"`，B 改 `title: "Y"`（同字段） | **last-write-wins**，后提交事务的一方覆盖先提交的 | 同列被两次 UPDATE，无版本号 / CAS 保护 |
-| A 改 `note`，B 同时 detach tag `T` | **两个修改都保留** | 打标签走 `updateTags`（独立 mutation、独立事务、`tagsOnBookmarks` 表），与 `bookmarks` 表 UPDATE 无冲突 |
-| A 改 `title`，B 同时改同一个 link 的 `description` | **两个修改都保留** | `title` 走 `bookmarks` 表，`description` 走 `bookmarkLinks` 表，两条独立的 UPDATE |
+| `modifiedAt` | **只要本次事务里任一守卫命中**（commonUpdateData 非空，或 link/text/asset 任一子表更新）即刷为 `new Date()` | 不是 CAS 依据，仅作展示排序用；并发时以最后提交事务的时钟写入 |
+
+#### 4.1.2 三类字段语义差异如何影响多端编辑冲突判断
+
+核心结论：**"一个字段能否被并发双方同时修改" 与 "它属于哪一类" 强相关**——因为三态的存在决定了"一端修改、另一端不传"与"两端都修改"的边界。
+
+**场景 1：两端都命中同一字段的守卫条件（双方都传了值，或一方传值另一方传 null 置空）——last-write-wins，无冲突检测**
+
+- 例：A 传 `title: "X"`，B 传 `title: "Y"` → 后提交事务的一方覆盖先提交的一方。
+- 例：A 传 `description: null`（置空），B 传 `description: "一篇好文"` → 后提交事务的一方覆盖先提交的一方。
+- 例：A 传 `note: "旧笔记"`，B 传 `note: ""`（清空） → 后提交的一方覆盖先提交的一方（note 允许用空串清空，因为它是 string + `!== undefined` 守卫）。
+
+**场景 2：一端命中守卫（传值或置空），另一端未命中（字段省略 / 被 falsy 跳过）——命中的一方保留，另一方不影响**
+
+- 例：A 只改 `archived: true`，B 只改 `favourited: true` → 两者都保留（经典不同字段场景）。
+- 例：A 传 `summary: "新摘要"`，B 的请求里完全不带 `summary` 字段 → A 的修改保留，B 不会把 summary 清掉。
+- 例：A 传 `text: "更长的正文"`，B 传 `text: null` / `text: ""` → B 被 falsy 守卫跳过，**A 的修改保留**。这是最容易踩坑的场景：B "以为自己清空了正文"，但实际上 B 的 `text` 字段根本没进 UPDATE 语句。
+
+**场景 3：跨表 / 跨 mutation 编辑——无冲突，独立生效**
+
+- A 改 `note`（`bookmarks` 表，`updateBookmark` mutation），B 同时 detach tag `T`（`tagsOnBookmarks` 表，`updateTags` mutation） → 两者都保留。
+- A 改 `title`（`bookmarks` 表），B 同时改同一个 link 的 `description`（`bookmarkLinks` 表） → 两者都保留。
+- `updateTags` 的语义更简单：attach 用 `onConflictDoNothing` 幂等，detach 直接删行。两端同时 attach 不同 tag 无冲突；两端同时对同一 tag 做 attach + detach 则最后执行的操作生效。
+
+#### 4.1.3 多端并发编辑覆盖边界一览表
+
+| 场景 | 结果 | 关键依据 |
+| --- | --- | --- |
+| A 改 `archived`，B 改 `favourited`（不同字段） | **两个修改都保留** | 各自的 `if` 分支独立执行，SQL 只 UPDATE 被包含的列 |
+| A 改 `title: "X"`，B 改 `title: "Y"`（同字段，都传值） | **last-write-wins**，后提交覆盖先提交 | 同列被两次 UPDATE，无版本号 / CAS 保护 |
+| A 传 `description: null`（置空），B 传 `description: "新描述"` | **last-write-wins** | 两者都过 `!== undefined` 守卫，都进入 UPDATE |
+| A 传 `note: ""`（清空），B 传 `note: "新笔记"` | **last-write-wins** | note 是 `optional()` + `!== undefined`，空串也通过守卫 |
+| A 传 `text: "更长的正文"`，B 传 `text: null` 或 `text: ""`（想清空） | **A 保留，B 被静默跳过** | `text` 是 11 个 nullish 字段中唯一用 `if (input.text)` 守卫的，falsy 值直接跳过 |
+| A 只改 `archived`，B 的请求完全不带 `summary` | A 保留，B 不影响 summary | summary 是 nullish + `!== undefined`，省略即跳过 |
+| A 改 `note`，B 同时 detach tag `T` | **两个修改都保留** | 独立 mutation + 独立表（`bookmarks` vs `tagsOnBookmarks`） |
+| A 改 `title`，B 同时改 link 的 `description` | **两个修改都保留** | 独立表（`bookmarks` vs `bookmarkLinks`） |
 
 **注意事项：**
 
-- 没有乐观锁 / ETag / 版本向量 / `modifiedAt` 比较；并发写同字段时服务端不检测冲突。
+- 没有乐观锁 / ETag / 版本向量 / `modifiedAt` 比较；并发写同字段且双方都过守卫时，服务端不检测冲突。
 - `modifiedAt` 在任何字段更新时都会被刷新为 `new Date()`，它不是 CAS 依据，仅作展示。
 - 写入成功后客户端靠 invalidate → 重取服务端最新版本"对齐"。
 - 客户端层面无字段级三方合并逻辑。
-
-`updateTags` 的边界更简单：attach 用 `onConflictDoNothing` 幂等，detach 直接删行。两端同时 attach 不同 tag 无冲突；两端同时对同一 tag 做 attach + detach 则最后执行的操作生效。
+- `text` 字段的特殊守卫是全链路里唯一的"隐式失败点"（不会抛错，但用户意图没生效），需要在客户端 UI 上避免把"清空正文"当作支持的操作，或改成显式写 `"\n"` 等非 falsy 值。
 
 ### 4.2 列表合并 `lists.merge`（这是"合并两个清单"，不是同步冲突）
 
@@ -318,8 +394,9 @@ sessionOverrides → localOverrides → pendingServerSave → serverSettings →
 | 失效去抖"队列" | [query-invalidation.ts](packages/shared-react/hooks/query-invalidation.ts) | 250ms/3s 合并失效，唯一的"排队" |
 | 轮询同步 | [useAutoRefreshingBookmarkQuery](packages/shared-react/hooks/bookmarks.ts#L12-L27) + [bookmarkUtils.ts](packages/shared/utils/bookmarkUtils.ts#L56-L83) | 1s/10s/60s 递减拉取 |
 | 前台重取 | [dashboard/_layout.tsx](apps/mobile/app/dashboard/_layout.tsx#L11-L14) | AppState → focusManager |
-| 服务端部分更新逻辑 | [updateBookmark](packages/trpc/routers/bookmarks.ts#L466-L652) | 按字段条件 UPDATE，不同字段互不覆盖 |
-| 请求 schema（字段 optional） | [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) | 除 bookmarkId 外全字段可选 |
+| 服务端字段级守卫（共 4 类） | [updateBookmark](packages/trpc/routers/bookmarks.ts#L466-L652) | 分 `optional()` / `nullish()` / `falsy跳过` / 隐式 `modifiedAt` 四类守卫 |
+| 请求 schema（逐字段修饰差异） | [zUpdateBookmarksRequestSchema](packages/shared/types/bookmarks.ts#L227-L251) | 含 `.optional()` 与 `.nullish()` 两类修饰，语义完全不同 |
+| `text` 字段异质性守卫（`if (input.text)`） | [bookmarks.ts#L517-L533](packages/trpc/routers/bookmarks.ts#L517-L533) | 11 个 nullish 字段中唯一 falsy 跳过的，传 `null`/`""` 不清空 |
 | 标签增删边界 | [updateTags](packages/trpc/routers/bookmarks.ts#L975-L1174) | `onConflictDoNothing` 幂等 attach |
 | 列表合并 | [lists.merge](packages/trpc/routers/lists.ts#L103-L116) + [mergeInto](packages/trpc/models/lists.ts#L1109-L1142) | `onConflictDoNothing` 成员合并 |
 | 乐观 + 回滚（仅阅读器） | [reader-settings.tsx](packages/shared-react/hooks/reader-settings.tsx) | 分层优先级 + pending 防抖 |
@@ -330,7 +407,7 @@ sessionOverrides → localOverrides → pendingServerSave → serverSettings →
 ## 7. 结论与设计提示
 
 1. **没有离线 outbox，mutation 断网立即失败（retry=0）**：断网期间写操作 30s 超时后直接丢失，无重试、无持久化、无重放。若需真正的离线同步，需要新增 mutation 持久化层（如 outbox 表 + 自定义 mutation 队列 + 重放调度），并配套乐观更新 + onError 回滚。
-2. **书签按字段部分 UPDATE，不是整行覆盖**：多端编辑**不同字段**时修改都保留（不冲突）；编辑**同一字段**时 last-write-wins。无 CAS / 版本号保护。
+2. **书签按字段部分 UPDATE，不是整行覆盖，但字段语义分 4 类**：`optional()` 不可传 null、`nullish()+!==undefined` 可传 null 置空（主流 10 个字段）、`nullish()+if(text)` 把 falsy 当跳过（仅 `text` 字段，易踩坑）、`modifiedAt` 隐式刷新。多端编辑**不同字段**时修改都保留（不冲突）；同一字段**双方都过守卫**时 last-write-wins；一方传值、另一方被 falsy 跳过（如 text 传 null）时，传值的一方保留而跳过方无报错。全程无 CAS / 版本号保护。
 3. **"合并"唯一真实存在**于清单成员迁移（`mergeInto` 用 `onConflictDoNothing` 去重）和阅读器设置的分层优先级。
 4. 阅读器设置的 `pendingServerSave` 模式是可复用的"乐观 + 确认 + 回滚"范式，若未来要给书签加乐观更新，可参考其结构（`onMutate` 写缓存 → `onError` 回滚 → `onSettled` 重取）。
 5. **链接可移植性**：本文档所有代码引用均改为仓库相对路径 + `#Lx-Ly` 锚点，不含本机绝对路径，换机器 / 换工作目录克隆仓库后仍可逐条复核。
