@@ -559,10 +559,13 @@ const batch = job.runNumber === 0;
 ### 9.4 AI 摘要（Summarization）
 代码位置：[summarize.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/46-karakeep/apps/workers/workers/inference/summarize.ts)
 
-当前仅支持 LINK 类型的摘要生成：
+#### 完整的分支逻辑
+
+代码位置：[summarize.ts#L97-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/46-karakeep/apps/workers/workers/inference/summarize.ts#L97-L126)
 
 ```typescript
 if (bookmarkData.type === BookmarkTypes.LINK && bookmarkData.link) {
+  // LINK 类型：构建待摘要文本，执行摘要
   textToSummarize = `
 Title: ${link.title ?? ""}
 Description: ${link.description ?? ""}
@@ -571,15 +574,55 @@ Publisher: ${link.publisher ?? ""}
 Author: ${link.author ?? ""}
 URL: ${link.url ?? ""}
 `;
+} else {
+  // 非 LINK 类型（IMAGE / PDF 等）：仅记录警告，直接 return
+  logger.warn(
+    `[inference][${jobId}] Bookmark ${bookmarkId} (type: ${bookmarkData.type}) ` +
+    `is not a LINK or TEXT type with content, or content is missing. Skipping summary.`,
+  );
+  return;  // ← 不抛异常，不写回摘要，不触发搜索索引
 }
 ```
 
-**结果回写：**
+#### 非 LINK 类型的完整行为链
+
+尽管资产预处理阶段会为**所有类型**的书签入队摘要任务（包括 IMAGE 和 PDF），但推理阶段的摘要分支对非 LINK 类型的处理如下：
+
+| 步骤 | 行为 |
+|------|------|
+| `runSummarization()` 进入 else 分支 | 记录 `logger.warn` |
+| 函数 `return` | 不抛异常，正常退出 |
+| `onComplete` 回调触发 | 标记 `summarizationStatus: "success"` |
+| 数据库 `bookmarks.summary` | 保持为 `null`（未写入任何摘要） |
+| 搜索索引更新 | **不会触发**（`return` 前没有调用 `triggerSearchReindex`） |
+
+> **⚠️ 关键澄清**：IMAGE/PDF 类型书签的 `summarizationStatus` 最终被标记为 `"success"`，但实际上**没有任何摘要被写入**。这是一个"成功跳过"——任务本身没有出错，但也没有产出。
+
+#### 代码中的扩展预留
+
+[summarize.ts#L36-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/46-karakeep/apps/workers/workers/inference/summarize.ts#L36-L38) 中的注释：
+
+```typescript
+with: {
+  link: { columns: { ... } },
+  // If assets (like PDFs with extracted text) should be summarized, extend here
+},
+```
+
+这表明开发者预留了对资产类型摘要的扩展点，但当前尚未实现。
+
+#### LINK 类型摘要的结果回写
+
 ```typescript
 await db.update(bookmarks).set({
   summary: summaryResult.response,
   modifiedAt: new Date(),
 }).where(eq(bookmarks.id, bookmarkId));
+
+await triggerSearchReindex(bookmarkId, {
+  priority: job.priority,
+  groupId: bookmarkData.userId,
+});
 ```
 
 ## 10. 重跑策略
