@@ -126,25 +126,26 @@ Provider 回调
   │     ├─ 抛错 / return false → 终止，重定向到 error 页
   │     └─ return true → 继续
   │
-  ├─ 5. Adapter 账号查找与绑定 ← NextAuth 内部逻辑，signIn 通过后才执行
+  ├─ 5. callbackHandler 账号查找与绑定 ← NextAuth 内部逻辑 (callback-handler.js)
   │     │
   │     ├─ 5a. getUserByAccount(provider, providerAccountId)
   │     │    │   查 accounts 表复合主键，确认外部账号是否已绑定
   │     │    ├─ 找到账号 → 拿到关联的本地 user → 跳到步骤 6
   │     │    └─ 未找到账号 → 新外部账号，继续 5b
   │     │
-  │     └─ 5b. 新外部账号处理
+  │     └─ 5b. 新外部账号处理（无已登录 session 时）
   │          │
-  │          ├─ [分支 A] allowDangerousEmailAccountLinking = true
-  │          │    │   （NextAuth 内部再查一次 users 表，应用层不知情）
-  │          │    ├─ getUserByEmail(email)
-  │          │    │    ├─ 找到本地用户 → linkAccount() 绑定
-  │          │    │    └─ 未找到 → createUser() + linkAccount()
+  │          ├─ getUserByEmail(email)  ← 无论 allowDangerousEmailAccountLinking 值为何，都会执行
   │          │
-  │          └─ [分支 B] allowDangerousEmailAccountLinking = false (默认)
-  │               │   （NextAuth 不会按 email 查，直接创建新用户）
-  │               └─ createUser() + linkAccount()
-  │                    └─ email 唯一约束冲突 → OAuthAccountNotLinked
+  │          ├─ [A] getUserByEmail 找到本地用户
+  │          │    ├─ allowDangerousEmailAccountLinking = true
+  │          │    │    └─ 复用该用户: user = userByEmail → linkAccount() → 成功
+  │          │    └─ allowDangerousEmailAccountLinking = false (默认)
+  │          │         └─ 抛 AccountNotLinkedError → OAuthAccountNotLinked
+  │          │            （不会尝试 createUser，在 getUserByEmail 发现冲突时就直接报错）
+  │          │
+  │          └─ [B] getUserByEmail 未找到本地用户
+  │               └─ createUser() + linkAccount() → 新用户注册成功
   │
   ├─ 6. 调用 jwt 回调（JWT 策略）
   ├─ 7. 调用 session 回调
@@ -607,7 +608,7 @@ Authorization 头存在且为 Bearer
 
 ---
 
-## 9. 完整时序图（首次 OAuth 注册）
+## 9. 完整时序图（按代码事实，含异常分支）
 
 ```
 用户浏览器                  NextAuth (Web)              OAuth Provider         DB (users+accounts)
@@ -640,40 +641,53 @@ Authorization 头存在且为 Bearer
     │                           │                           │                  │
     │                           │<──────────────────────────│                  │
     │                           │                           │                  │
-    │                           │ 8. 调用 profile()         │                  │
+    │                           │ 8. 调用 provider.profile() │                  │
     │                           │    构造内存 user 对象      │                  │
     │                           │                           │                  │
-    │                           │ 9. 调用 signIn 回调        │                  │
-    │                           │    开发者按 email 查用户   │                  │
+    │                           │ 9. 调用 callbacks.signIn() │                  │
+    │                           │    [L196-L199] 查 users 表 (按 email)       │
     │                           │────────────────────────────────────────────>│
     │                           │<────────────────────────────────────────────│
     │                           │                           │                  │
-    │                           │    新用户 + 禁用注册 → 抛错  ← 终止流程       │
-    │                           │    重定向 /signin?error=  │                  │
-    │<─────────────────────────│                           │                  │
+    │   ┌─────────────────────────────────────────────────┐                  │
+    │   │ 【异常分支 1】新用户 + 禁用注册                    │                  │
+    │   │  !user && disableSignups → true                  │                  │
+    │   │  记 signup 失败日志 + throw Error                 │                  │
+    │   │  重定向 /signin?error=Signups+are+disabled...    │                  │
+    │<─────────────────────────┤                           │                  │
+    │   └─────────────────────────────────────────────────┘                  │
     │                           │                           │                  │
-    │                           │  [ signIn 返回 true 才继续 ]                  │
+    │   ┌─────────────────────────────────────────────────┐                  │
+    │   │ 【正常继续】signIn 返回 true                      │                  │
+    │   │  如果 user 存在，已记录 user.login 日志           │                  │
+    │   └─────────────────────────────────────────────────┘                  │
     │                           │                           │                  │
     │                           │ 10. Adapter: getUserByAccount               │
-    │                           │     按 provider+accountId 查                │
+    │                           │     查 accounts 表 (provider+accountId)    │
     │                           │────────────────────────────────────────────>│
     │                           │<────────────────────────────────────────────│
     │                           │                           │                  │
-    │                           │     找到账号 → 已有用户 → 跳步骤 13          │
-    │                           │     未找到 → 新账号 → 继续步骤 11            │
+    │                           │     找到账号 → 已绑定 → 跳步骤 13            │
+    │                           │     未找到 → 新外部账号 → 继续步骤 11        │
     │                           │                           │                  │
     │                           │ 11. 新账号处理分支         │                  │
     │                           │                           │                  │
-    │                           │  [allowDangerousEmailLinking=true]           │
-    │                           │    ├─ getUserByEmail()                      │
-    │                           │    │    ├─ 找到 → linkAccount()             │
-    │                           │    │    └─ 没找到 → createUser + linkAccount │
+    │   ┌─────────────────────────────────────────────────┐                  │
+    │   │ 【分支 A】allowDangerousEmailLinking=true        │                  │
+    │   │  NextAuth 再查 users 表 (getUserByEmail)         │                  │
+    │   │  ├─ 找到 → linkAccount() 绑定账号                │                  │
+    │   │  └─ 没找到 → createUser + linkAccount            │                  │
+    │   └─────────────────────────────────────────────────┘                  │
     │                           │                           │                  │
-    │                           │  [allowDangerousEmailLinking=false]          │
-    │                           │    └─ createUser() + linkAccount()          │
-    │                           │       └─ email 冲突 → 失败                  │
-    │                           │          重定向 /signin?error=OAuthAccountNotLinked
-    │<─────────────────────────│                           │                  │
+    │   ┌─────────────────────────────────────────────────┐                  │
+    │   │ 【分支 B】allowDangerousEmailLinking=false(默认)  │                  │
+    │   │  NextAuth 不查 users 表，直接 createUser()        │                  │
+    │   │  ├─ 正常 → INSERT users + INSERT accounts        │                  │
+    │   │  └─ email 冲突 → 抛 OAuthAccountNotLinked        │                  │
+    │   │     重定向 /signin?error=OAuthAccountNotLinked   │                  │
+    │<─────────────────────────┤                           │                  │
+    │   │    ⚠ signIn 已记 login 日志，但实际登录失败        │                  │
+    │   └─────────────────────────────────────────────────┘                  │
     │                           │                           │                  │
     │                           │ 12. 账号绑定/创建成功       │                  │
     │                           │                           │                  │
@@ -693,3 +707,9 @@ Authorization 头存在且为 Bearer
     │                           │     从 Cookie 解析 JWT     │                  │
     │                           │     构建 tRPC Context      │                  │
 ```
+
+**时序图关键标注（按代码事实）：**
+- **两次 users 表查询**：步骤 9（signIn 回调，应用层主动查）和步骤 11A（NextAuth 内部，仅当允许邮箱关联时）
+- **三次查询的不同对象**：步骤 9 查 `users`（按 email），步骤 10 查 `accounts`（按 provider+accountId），步骤 11A 再查 `users`（按 email）
+- **日志不一致点**：步骤 9 中如果 email 已存在会记录 `user.login`，但步骤 11B 中可能因 email 冲突而失败
+- **错误回退路径**：两种异常分支都重定向到 `/signin?error=xxx`，触发 OAuthAutoRedirect 的逃生通道
