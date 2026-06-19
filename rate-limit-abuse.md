@@ -683,7 +683,15 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 客户端请求
   │
   ├─ Web 浏览器 (Next.js app)
-  │    └─ GET/POST /api/*
+  │    ├─ GET/POST /api/auth/*  (NextAuth 独立路由)
+  │    │    └─ [route.tsx] authHandler (NextAuth)
+  │    │         ├─ ❌ 不经过 Hono 中间件链
+  │    │         ├─ ❌ 不经过 tRPC 限流
+  │    │         ├─ POST /api/auth/callback/credentials  (密码登录)
+  │    │         ├─ POST /api/auth/signout               (登出)
+  │    │         └─ GET  /api/auth/session               (会话查询)
+  │    │
+  │    └─ GET/POST /api/*  (除 /api/auth/* 外)
   │         └─ [route.ts] createContextFromRequest()
   │              ├─ requestIp.getClientIp() 提取 IP
   │              ├─ API Key / Session 认证
