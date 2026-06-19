@@ -110,7 +110,7 @@ NextAuth 的路由入口 [apps/web/app/api/auth/[...nextauth]/route.tsx](file://
 
 ### 3.1 回调处理总览
 
-OAuth 回调到达后的完整处理顺序：
+OAuth 回调到达后的完整处理顺序（按 NextAuth v4 框架源码 callback-handler.js）：
 
 ```
 Provider 回调
@@ -126,7 +126,7 @@ Provider 回调
   │     ├─ 抛错 / return false → 终止，重定向到 error 页
   │     └─ return true → 继续
   │
-  ├─ 5. callbackHandler 账号查找与绑定 ← NextAuth 内部逻辑 (callback-handler.js)
+  ├─ 5. callbackHandler 账号查找与绑定 ← NextAuth 内部逻辑
   │     │
   │     ├─ 5a. getUserByAccount(provider, providerAccountId)
   │     │    │   查 accounts 表复合主键，确认外部账号是否已绑定
@@ -152,12 +152,13 @@ Provider 回调
   └─ 8. Set-Cookie + 重定向到 callbackUrl
 ```
 
-**关键理解（按代码事实）：**
-- 两次 users 表查询发生在**不同位置**：
+**关键理解（按框架源码事实，全文统一描述）：**
+- `signIn` 回调发生在 callbackHandler 账号查找/绑定**之前**，只决定"这个 email 能不能登录"，不检查"这个外部账号是否已绑定"
+- users 表被查询了**三次**，但查询者和目的各不相同：
   1. `signIn` 回调中（L196-L199）：**应用层主动查询**，用于禁用注册判断、登录日志记录
-  2. NextAuth 内部（仅当 `allowDangerousEmailAccountLinking=true` 时）：框架内部调用 `getUserByEmail`，用于自动按邮箱关联
-- `signIn` 回调发生在 Adapter 账号查找/创建**之前**。它只决定"这个 email 能不能登录"，不检查"这个外部账号是否已绑定"
-- `allowDangerousEmailAccountLinking=false`（默认）时，NextAuth**绝不**按 email 查找已有用户，直接尝试创建新用户，这是触发账号未关联错误的根源
+  2. `callbackHandler` 中 `getUserByEmail`：**NextAuth 框架内部查询，无论 allowDangerousEmailAccountLinking 值为何都会调用**，用于判断 email 是否已被占用
+  3. `callbackHandler` 中 `createUser` 成功后可能触发 DrizzleAdapter 内部查询（返回新创建的用户）
+- `allowDangerousEmailAccountLinking=false`（默认）时，`getUserByEmail` 找到同名用户后**立即抛 `AccountNotLinkedError`**，不会走到 `createUser` 步骤，不会产生 email 唯一约束冲突
 
 ### 3.2 signIn 回调详解
 
@@ -191,9 +192,11 @@ signIn 回调（入参：credUser, credentials, profile）
 - 回调内部**主动查询数据库**来判断用户是否存在，这是应用层自己的逻辑
 - `disableSignups` 的判断粒度是"按 email 是否存在"，不是"按 account 是否存在"
 
-### 3.3 Adapter 账号查找与绑定（NextAuth 内部）
+### 3.3 callbackHandler 账号查找与绑定（NextAuth 框架内部）
 
-signIn 返回 `true` 后，NextAuth 进入内部账号处理流程。项目使用基于 `@auth/drizzle-adapter` 的自定义 Adapter：[apps/web/server/auth.ts#L88-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/43-karakeep/apps/web/server/auth.ts#L88-L112)
+signIn 返回 `true` 后，NextAuth 进入 `callbackHandler`（源码位于 `next-auth/core/lib/callback-handler.js`）。项目使用基于 `@auth/drizzle-adapter` 的自定义 Adapter：[apps/web/server/auth.ts#L88-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/43-karakeep/apps/web/server/auth.ts#L88-L112)
+
+以下是 `callbackHandler` 中 OAuth 分支的**实际执行路径**（按框架源码）：
 
 #### 第一步：按外部账号查找
 
@@ -205,43 +208,64 @@ getUserByAccount(provider, providerAccountId)
      JOIN users ON users.id = accounts.userId
 ```
 
-- **命中** → 这是一个已绑定的外部账号，直接使用关联的本地用户
-- **未命中** → 这是一个新的外部账号，进入下一步处理
+- **命中** → 外部账号已绑定，返回关联的本地 user，结束
+- **未命中** → 新外部账号，进入第二步
 
-#### 第二步：新外部账号处理
-
-根据 `allowDangerousEmailAccountLinking` 配置走不同分支：
+#### 第二步：检查是否有已登录 session
 
 ```
-新外部账号
+if (user) {   // user 来自已有 session（JWT 解码或 DB session 查询）
+  linkAccount({ ...account, userId: user.id })
+  return { session, user, isNewUser: false }
+}
+```
+
+- 如果用户已在当前浏览器登录（有 session），直接绑定新外部账号到当前用户
+- 大多数 OAuth 首次登录场景中，`user === null`（没有 session），进入第三步
+
+#### 第三步：按 email 查找本地用户（关键分支点）
+
+```
+const userByEmail = profile.email ? await getUserByEmail(profile.email) : null
+```
+
+**无论 `allowDangerousEmailAccountLinking` 值为何，`getUserByEmail` 都会被调用。**
+
+```
+userByEmail 存在?
   │
-  ├─ [分支 A] allowDangerousEmailAccountLinking = true
+  ├─ [A] 找到本地用户 (userByEmail !== null)
   │    │
-  │    ├─ 按 email 查找本地用户：getUserByEmail(email)
-  │    │    │
-  │    │    ├─ 找到用户 → 账号绑定
-  │    │    │    └─ linkAccount(userId, accountInfo)
-  │    │    │         INSERT INTO accounts (...)
-  │    │    │
-  │    │    └─ 未找到用户 → 创建用户 + 绑定
-  │    │         ├─ createUser(userInfo)
-  │    │         │    INSERT INTO users (...)
-  │    │         └─ linkAccount(userId, accountInfo)
-  │    │              INSERT INTO accounts (...)
+  │    ├─ allowDangerousEmailAccountLinking = true
+  │    │    └─ user = userByEmail  （复用已有用户，不创建新用户）
   │    │
-  │    └─ 结果：已有账号登录 / 新用户注册 + 绑定
+  │    └─ allowDangerousEmailAccountLinking = false (默认)
+  │         └─ throw new AccountNotLinkedError(
+  │              "Another account already exists with the same e-mail address"
+  │            )
+  │            → 在 callback-handler.js 外层被捕获
+  │            → 重定向到 /signin?error=OAuthAccountNotLinked
   │
-  └─ [分支 B] allowDangerousEmailAccountLinking = false (默认)
-       │
-       ├─ 直接创建新用户 + 绑定
-       │    ├─ createUser(userInfo)
-       │    │    INSERT INTO users (...)
-       │    │    └─ [异常] email 唯一约束冲突 → 抛出错误
-       │    └─ linkAccount(userId, accountInfo)
-       │         INSERT INTO accounts (...)
-       │
-       └─ 结果：正常情况下新用户注册成功
-              如果 email 已存在 → 登录失败（账号未绑定）
+  └─ [B] 未找到本地用户 (userByEmail === null)
+       └─ createUser(userInfo) + linkAccount(...)
+          → INSERT users + INSERT accounts → 新用户注册成功
+```
+
+**框架源码关键行（callback-handler.js）：**
+```javascript
+const userByEmail = profile.email ? await getUserByEmail(profile.email) : null;
+if (userByEmail) {
+  const provider = options.provider;
+  if (provider?.allowDangerousEmailAccountLinking) {
+    user = userByEmail;   // 复用已有用户
+  } else {
+    throw new AccountNotLinkedError(  // 直接抛错，不尝试 createUser
+      "Another account already exists with the same e-mail address"
+    );
+  }
+} else {
+  user = await createUser(newUser);  // email 不存在时才创建
+}
 ```
 
 ### 3.4 自定义 Adapter 的 createUser
@@ -273,6 +297,8 @@ createRaw 事务内：
 ```
 
 > 注意：`profile()` 回调中也做了角色判断（admin / firstUser），但 `createUser` 内部会再次判断。两者一致，都以"第一个用户为 admin"为原则。
+>
+> **关键澄清**：对于默认邮箱关联禁用场景（`allowDangerousEmailAccountLinking=false`），`AccountNotLinkedError` 在 `getUserByEmail` 阶段就已抛出，**不会走到 `createUser`**，因此不会触发上述 DB 层异常。只有在 `getUserByEmail` 未找到用户的正常新用户注册分支中，`createUser` 才会被执行。
 
 ### 3.5 账号关联表（accounts）
 
@@ -299,17 +325,19 @@ OAuth 外部账号与本地用户的映射存储在 `accounts` 表 [packages/db/
 
 `allowDangerousEmailAccountLinking` 是关键的安全开关：
 
-| 配置值 | 行为 | 安全风险 |
+| 配置值 | `getUserByEmail` 找到用户后的行为 | 安全风险 |
 |--------|------|----------|
-| `false`（默认） | 新外部账号总是创建新用户，绝不按 email 自动关联 | 低；但如果用户已有本地账号，用同一 email 的 OAuth 登录会创建重复账号失败 |
-| `true` | 新外部账号先按 email 查找本地用户，找到就自动绑定 | 中高；如果 Provider 没有验证 email，攻击者可能伪造 email 来接管已有账号 |
+| `false`（默认） | 直接抛 `AccountNotLinkedError`，**不尝试** `createUser` | 低；用户看到 `OAuthAccountNotLinked` 错误，原有账号不受影响 |
+| `true` | 复用已有用户（`user = userByEmail`），然后 `linkAccount` | 中高；如果 Provider 没有验证 email，攻击者可能伪造 email 来接管已有账号 |
 
-**默认策略下的异常场景：**
+**默认策略下的异常场景（按框架源码事实）：**
 - 用户先用邮箱注册了本地账号（或其他 Provider）
 - 后来用同一个 email 的新 OAuth Provider 登录
+- `callbackHandler` 中 `getUserByAccount` 未找到外部账号（新账号）
+- `getUserByEmail` 找到了同名本地用户
 - 因为 `allowDangerousEmailAccountLinking = false`
-- NextAuth 不会自动将新 OAuth 账号绑定到已有用户
-- 会尝试创建新用户 → email 唯一约束冲突 → 登录失败
+- **直接抛 `AccountNotLinkedError`**，不会尝试 `createUser`
+- 外层 `callback` 路由捕获错误，重定向到 `/signin?error=OAuthAccountNotLinked`
 - 用户看到错误页面，但原有账号不受影响
 
 ---
@@ -367,7 +395,7 @@ session({ session, token })
 
 ### 5.2 tRPC Context 构建
 
-[apps/web/server/api/client.ts#L10-L64](file:///d:/fz/0601-2/solo-dogfeeding/code/43-karakeep/apps/web/server/api/client.ts)
+[apps/web/server/api/client.ts#L10-L64](file:///d:/fz/0601-2/solo-dogfeeding/code/43-karakeep/apps/web/server/api/client.ts#L10-L64)
 
 ```
 createContextFromRequest(req)
@@ -446,94 +474,131 @@ shouldRedirect = oauthAutoRedirect
 | OAuth 注册被禁用 | `signups_disabled` | `Signups are disabled in server config` |
 | Provider 未返回 email | 无 | `Provider didn't provide an email during signin` |
 
-### 6.3 账号绑定异常（重点）
+### 6.3 账号绑定异常（重点，按框架源码事实，全文统一描述）
 
-这是 OAuth 登录中最容易被忽略的异常分支。
+这是 OAuth 登录中最容易被忽略的异常分支。核心矛盾是：**signIn 回调只检查了 email，没有检查外部账号绑定状态**，导致部分路径出现不一致。
 
-#### 场景 A：新外部账号 + email 已存在 + 禁止邮箱关联
+#### 场景 A：新外部账号 + email 已存在 + 禁止邮箱关联（默认配置）
 
 **触发条件：**
 - `allowDangerousEmailAccountLinking = false`（默认）
-- 该 (provider, providerAccountId) 在 accounts 表中不存在
-- 但 profile.email 在 users 表中已存在（可能是本地账号或其他 Provider）
+- `accounts` 表中不存在 `(provider, providerAccountId)` 记录
+- 但 `users` 表中存在 `email = profile.email` 的记录（可能是本地密码账号，或其他 Provider）
 
-**处理路径：**
+**处理路径（按框架源码 callback-handler.js）：**
 
 ```
-1. signIn 回调
+1. signIn 回调 [auth.ts L191-L252]
    │
-   ├─ 按 email 查询到用户存在
-   ├─ 记录 user.login 日志（注意：此时还没真正登录成功）
-   └─ return true（放行）
+   ├─ [L196-L199] 应用层查 users 表 → email 已存在
+   ├─ [L243-L249] 记录 user.login 日志
+   └─ [L251] return true（放行）
 
-2. NextAuth 内部账号处理
+2. callbackHandler [callback-handler.js]
    │
    ├─ getUserByAccount() → 未找到（新外部账号）
    │
+   ├─ 检查已有 session → null
+   │
+   ├─ getUserByEmail(profile.email)  ← 无论如何都会调用
+   │    → 找到本地用户 (userByEmail !== null)
+   │
    ├─ allowDangerousEmailAccountLinking = false
-   │    └─ 直接 createUser()
+   │    → throw new AccountNotLinkedError(
+   │         "Another account already exists with the same e-mail address"
+   │       )
+   │    → 不尝试 createUser，直接报错
    │
-   ├─ createUser() 执行 INSERT INTO users
-   │    └─ Email 唯一约束冲突（SQLITE_CONSTRAINT_UNIQUE）
-   │
-   └─ 抛出错误 → 登录失败
+   └─ AccountNotLinkedError 向上冒泡
 
-3. 错误回退
+3. callback 路由 [callback.js] 捕获错误
    │
-   ├─ 重定向到 /signin?error=OAuthAccountNotLinked
-   └─ 用户看到错误（但前端未做特殊错误展示）
+   ├─ error.name === "AccountNotLinkedError"
+   │    → return { redirect: `${url}/error?error=OAuthAccountNotLinked` }
+   │
+   └─ 最终重定向到 /signin?error=OAuthAccountNotLinked
+
+4. 前端
+   │
+   ├─ OAuthAutoRedirect 检测到 ?error= → 停止自动重定向
+   └─ 显示登录页（未针对 OAuthAccountNotLinked 做特殊提示）
 ```
 
-**注意：** 在这个场景下，`signIn` 回调已经记录了 `user.login` 事件日志，但实际上登录最终失败了。这是一个日志与实际结果不一致的边缘情况。
+**关键事实（按框架源码，全文统一）：**
+- `getUserByEmail` **无论 `allowDangerousEmailAccountLinking` 为何值都会被调用**
+- `allowDangerousEmailAccountLinking=false` 时，`AccountNotLinkedError` 在 `getUserByEmail` 发现 email 冲突时**立即抛出**，**不会走到 `createUser` 步骤**
+- 因此 `User.createRaw` 不会被调用，不会产生 email 唯一约束冲突
+- 错误码 `OAuthAccountNotLinked` 是 `callback.js` 对 `AccountNotLinkedError.name` 的映射
+- **日志不一致**：signIn 回调已记录 `user.login`，但实际登录失败
 
 #### 场景 B：新外部账号 + 禁用注册
 
 **触发条件：**
 - `DISABLE_SIGNUPS = true`
-- 该 email 在 users 表中不存在
+- `users` 表中不存在此 email
 
 **处理路径：**
 
 ```
-1. signIn 回调
-   │
-   ├─ 按 email 查询 → 用户不存在
-   ├─ disableSignups = true
-   ├─ 记录 user.signup 失败日志 (failure_reason: signups_disabled)
-   └─ throw Error("Signups are disabled in server config")
+1. signIn 回调 [auth.ts]
+   ├─ [L196-L199] 查 users 表 → user 不存在
+   ├─ [L230] !user && disableSignups → true
+   ├─ [L231-L236] 记 signup 失败日志 + throw Error
+   └─ 流程终止在 signIn 阶段
 
 2. 错误回退
-   │
-   └─ 重定向到 /signin?error=...
+   └─ 重定向到 /signin?error=Signups+are+disabled+in+server+config
 ```
 
-**注意：** 这种情况在 signIn 阶段就被拦截了，不会走到 Adapter 的 createUser 步骤。
+**注意：** 这种情况在 signIn 阶段就被拦截，不会执行 `callbackHandler`，也不会走到 `getUserByAccount` 或 `createUser`。
 
 #### 场景 C：新外部账号 + email 已存在 + 允许邮箱关联
 
 **触发条件：**
 - `allowDangerousEmailAccountLinking = true`
-- accounts 表中无此账号，但 users 表中有此 email
+- `accounts` 表中无此账号，但 `users` 表中有此 email
 
-**处理路径：**
+**处理路径（按框架源码 callback-handler.js）：**
 
 ```
 1. signIn 回调 → 查到用户存在 → 记 login 日志 → return true
 
-2. NextAuth 内部账号处理
+2. callbackHandler [callback-handler.js]
    │
    ├─ getUserByAccount() → 未找到
    │
-   ├─ allowDangerousEmailAccountLinking = true
-   │    ├─ getUserByEmail() → 找到用户
-   │    └─ linkAccount() → INSERT INTO accounts
+   ├─ getUserByEmail(profile.email) → 找到本地用户
    │
-   └─ 账号绑定成功
+   ├─ allowDangerousEmailAccountLinking = true
+   │    → user = userByEmail  （复用已有用户，不创建新用户）
+   │
+   └─ linkAccount() → INSERT INTO accounts → 绑定成功
 
 3. jwt / session 回调 → 登录成功
 ```
 
-这是"账号自动绑定"的正常路径。
+这是"账号自动绑定"的正常路径。注意：`getUserByEmail` 在场景 A 和场景 C 中**都会被调用**，区别仅在于找到用户后的处理方式。
+
+#### 场景 D：外部账号已绑定（正常登录）
+
+**触发条件**：`accounts` 表中已存在 `(provider, providerAccountId)` 记录
+
+**处理路径：**
+
+```
+1. signIn 回调
+   ├─ 查 users 表 → user 存在
+   ├─ 记录 user.login 日志
+   └─ return true
+
+2. callbackHandler
+   ├─ getUserByAccount() → 命中 → 拿到关联的本地 user
+   └─ 直接返回，不需要创建/绑定
+
+3. jwt / session 回调 → 登录成功
+```
+
+最常见的正常登录路径，没有任何异常。
 
 ### 6.4 API Key 认证失败回退
 
@@ -557,7 +622,7 @@ Authorization 头存在且为 Bearer
 - **Email 重复**（`SQLITE_CONSTRAINT_UNIQUE`）→ 抛出 TRPCError `BAD_REQUEST` + "Email is already taken"
 - 其他 DB 错误 → 抛出 TRPCError `INTERNAL_SERVER_ERROR` + "Something went wrong"
 
-对于 OAuth 流程中的 `createUser`，如果 email 重复（场景 6.3.1），DrizzleAdapter 捕获错误后由 NextAuth 处理，最终表现为登录失败。
+> 注意：对于 OAuth 流程中的默认邮箱关联禁用场景，`AccountNotLinkedError` 在 `getUserByEmail` 阶段就已抛出，**不会走到 `createUser`**，因此不会触发上述 DB 层异常。只有在 `getUserByEmail` 未找到用户的正常新用户注册分支中，`createUser` 才会被执行。
 
 ### 6.6 Provider 超时 / 不可用
 
@@ -608,7 +673,7 @@ Authorization 头存在且为 Bearer
 
 ---
 
-## 9. 完整时序图（按代码事实，含异常分支）
+## 9. 完整时序图（按框架源码事实，含异常分支，全文统一）
 
 ```
 用户浏览器                  NextAuth (Web)              OAuth Provider         DB (users+accounts)
@@ -662,7 +727,7 @@ Authorization 头存在且为 Bearer
     │   │  如果 user 存在，已记录 user.login 日志           │                  │
     │   └─────────────────────────────────────────────────┘                  │
     │                           │                           │                  │
-    │                           │ 10. Adapter: getUserByAccount               │
+    │                           │ 10. callbackHandler: getUserByAccount       │
     │                           │     查 accounts 表 (provider+accountId)    │
     │                           │────────────────────────────────────────────>│
     │                           │<────────────────────────────────────────────│
@@ -670,23 +735,26 @@ Authorization 头存在且为 Bearer
     │                           │     找到账号 → 已绑定 → 跳步骤 13            │
     │                           │     未找到 → 新外部账号 → 继续步骤 11        │
     │                           │                           │                  │
-    │                           │ 11. 新账号处理分支         │                  │
+    │                           │ 11. callbackHandler: getUserByEmail         │
+    │                           │     查 users 表 (按 email) ← 无论如何都调用  │
+    │                           │────────────────────────────────────────────>│
+    │                           │<────────────────────────────────────────────│
     │                           │                           │                  │
     │   ┌─────────────────────────────────────────────────┐                  │
-    │   │ 【分支 A】allowDangerousEmailLinking=true        │                  │
-    │   │  NextAuth 再查 users 表 (getUserByEmail)         │                  │
-    │   │  ├─ 找到 → linkAccount() 绑定账号                │                  │
-    │   │  └─ 没找到 → createUser + linkAccount            │                  │
+    │   │ 【分支 A】getUserByEmail 找到本地用户             │                  │
+    │   │  allowDangerousEmailLinking=true                 │                  │
+    │   │    → user = userByEmail, linkAccount() → 成功    │                  │
+    │   │  allowDangerousEmailLinking=false(默认)           │                  │
+    │   │    → throw AccountNotLinkedError                  │                  │
+    │   │    → 不尝试 createUser                            │                  │
+    │   │    → 重定向 /signin?error=OAuthAccountNotLinked   │                  │
+    │<─────────────────────────┤                           │                  │
+    │   │    ⚠ signIn 已记 login 日志，但实际登录失败        │                  │
     │   └─────────────────────────────────────────────────┘                  │
     │                           │                           │                  │
     │   ┌─────────────────────────────────────────────────┐                  │
-    │   │ 【分支 B】allowDangerousEmailLinking=false(默认)  │                  │
-    │   │  NextAuth 不查 users 表，直接 createUser()        │                  │
-    │   │  ├─ 正常 → INSERT users + INSERT accounts        │                  │
-    │   │  └─ email 冲突 → 抛 OAuthAccountNotLinked        │                  │
-    │   │     重定向 /signin?error=OAuthAccountNotLinked   │                  │
-    │<─────────────────────────┤                           │                  │
-    │   │    ⚠ signIn 已记 login 日志，但实际登录失败        │                  │
+    │   │ 【分支 B】getUserByEmail 未找到本地用户           │                  │
+    │   │  → createUser() + linkAccount() → 注册成功       │                  │
     │   └─────────────────────────────────────────────────┘                  │
     │                           │                           │                  │
     │                           │ 12. 账号绑定/创建成功       │                  │
@@ -708,8 +776,9 @@ Authorization 头存在且为 Bearer
     │                           │     构建 tRPC Context      │                  │
 ```
 
-**时序图关键标注（按代码事实）：**
-- **两次 users 表查询**：步骤 9（signIn 回调，应用层主动查）和步骤 11A（NextAuth 内部，仅当允许邮箱关联时）
-- **三次查询的不同对象**：步骤 9 查 `users`（按 email），步骤 10 查 `accounts`（按 provider+accountId），步骤 11A 再查 `users`（按 email）
-- **日志不一致点**：步骤 9 中如果 email 已存在会记录 `user.login`，但步骤 11B 中可能因 email 冲突而失败
+**时序图关键标注（按框架源码事实，全文统一）：**
+- **`getUserByEmail` 无论如何都会被调用**（步骤 11），不是仅当 `allowDangerousEmailLinking=true` 时才调用
+- **三次 DB 查询的不同对象**：步骤 9 查 `users`（signIn 回调，按 email），步骤 10 查 `accounts`（按 provider+accountId），步骤 11 再查 `users`（getUserByEmail，按 email）
+- **`AccountNotLinkedError` 在 `getUserByEmail` 发现 email 冲突时立即抛出**，不经过 `createUser`，不会产生 email 唯一约束冲突
+- **日志不一致点**：步骤 9 中如果 email 已存在会记录 `user.login`，但步骤 11 分支 A 中 `allowDangerousEmailLinking=false` 时实际登录失败
 - **错误回退路径**：两种异常分支都重定向到 `/signin?error=xxx`，触发 OAuthAutoRedirect 的逃生通道
