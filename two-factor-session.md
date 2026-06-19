@@ -178,6 +178,146 @@ OAuth 服务商回调 → NextAuth 处理
 - 交换路由：[apiKeys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/apiKeys.ts#L134-L194)
 - Key 生成：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts#L52-L82)
 
+### 3.4 Web JWT 会话 vs API Key 设备凭证 — 边界与差异深度对比
+
+项目存在两种完全独立的认证凭证体系，它们在状态存储、认证链路、权限边界、可撤销性等方面存在本质差异。
+
+#### 3.4.1 Context 构建：两条并行的认证注入链路
+
+所有请求最终都会在 tRPC/Hono Context 中生成 `ctx.user` 和 `ctx.auth`，但来源完全不同：
+
+```
+                          入站 HTTP Request
+                                │
+            ┌───────────────────┴───────────────────┐
+            │                                       │
+  存在 Authorization: Bearer <key>?           走 Cookie 路径
+            │                                       │
+            ▼                                       ▼
+  [client.ts:createContextFromRequest]    [client.ts:createContext]
+   第 16-36 行：解析 Bearer Token           第 41-64 行：getServerAuthSession()
+            │                                       │
+            ▼                                       ▼
+  authenticateApiKey(key, db)               NextAuth 解码 JWT Cookie
+  [auth.ts:107-160]                         [auth.ts:257-270] jwt/session callback
+            │                                       │
+            └───────────────┬───────────────────────┘
+                            ▼
+                   Context {
+                     user: { id, name, email, role },
+                     auth: { type: "apiKey" | "session", ... }
+                   }
+```
+
+**Web 端 Context 注入**（[client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/api/client.ts#L41-L64)）：
+
+```typescript
+export const createContext = async (database?, ip?): Promise<Context> => {
+  const session = await getServerAuthSession(); // 从 NextAuth JWT Cookie 解码
+  return {
+    user: session?.user ?? null,
+    auth: session?.user
+      ? { type: "session" as const }  // ← 只有 type，无额外信息
+      : null,
+    db,
+    req: { ip },
+  };
+};
+```
+
+**API Key Context 注入**（[client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/api/client.ts#L10-L38)）：
+
+```typescript
+export async function createContextFromRequest(req: Request) {
+  const authorizationHeader = req.headers.get("Authorization");
+  if (authorizationHeader?.startsWith("Bearer ")) {
+    const token = authorizationHeader.split(" ")[1];
+    try {
+      const authResult = await authenticateApiKey(token, db);
+      return {
+        user: authResult.user,
+        auth: {
+          type: "apiKey" as const,
+          keyId: authResult.apiKey.keyId,   // ← 附带 keyId
+          scopes: authResult.apiKey.scopes,  // ← 附带权限范围
+        },
+        db,
+        req: { ip },
+      };
+    } catch {
+      // Fallthrough 到 Cookie 认证
+    }
+  }
+  return createContext(db, ip);
+}
+```
+
+> **关键边界①**：API Key 认证优先于 Cookie 认证。如果请求同时携带了合法的 Bearer Token 和 JWT Cookie，系统会使用 API Key 的身份，而忽略 Cookie 中的用户。
+
+#### 3.4.2 RequestAuth 类型与过程级权限隔离
+
+tRPC 层通过 `ctx.auth.type` 进行三级权限隔离（[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/index.ts#L33-L42)）：
+
+```typescript
+export type RequestAuth =
+  | { type: "apiKey"; keyId: string; scopes: ZApiKeyScope[] }
+  | { type: "session" }
+  | null;
+```
+
+基于此派生出三种 Procedure：
+
+| Procedure 类型 | 构造方式 | 允许的 auth.type | 典型用途 |
+|---------------|---------|-----------------|---------|
+| `authedProcedure` | 仅校验 `ctx.user?.id` 存在 | `session` 或 `apiKey` | 通用读写（书签、标签等） |
+| `sessionProcedure` | `authedProcedure.use(rejectApiKeyAuth())` | **仅 `session`**，API Key 返回 403 | 敏感操作：创建/撤销 API Key、改密、删号 |
+| `createScopedAuthedProcedure(resource)` | `authedProcedure` + scope 检查 | `session` 放行 / `apiKey` 需匹配 scope | 分资源的细粒度鉴权（用户、书签、列表等） |
+
+**`rejectApiKeyAuth` 中间件**（[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/index.ts#L163-L175)）：
+
+```typescript
+function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint") {
+  return t.middleware((opts) => {
+    if (opts.ctx.auth?.type === "apiKey") {
+      throw new TRPCError({ code: "FORBIDDEN", message });
+    }
+    return opts.next();
+  });
+}
+```
+
+> **关键边界②**：以下端点只能通过 Web JWT 会话访问，API Key 一概拒绝——
+> - `apiKeys.create / regenerate / revoke / list`（全部使用 `sessionProcedure`）
+> - `users.changePassword` 使用 `usersProcedure`（createScopedAuthedProcedure），但内部还需再次校验密码
+> - `users.deleteAccount` 同理
+>
+> 这意味着：**持有某设备的 API Key 无法横向扩展权限去创建新的 API Key 或修改账号密码**。即使 API Key 泄露，攻击者也无法进一步接管账号。
+
+#### 3.4.3 状态存储与持久性对比
+
+| 维度 | Web JWT 会话 | API Key 设备凭证 |
+|-----|-------------|-----------------|
+| **存储介质** | 浏览器 HttpOnly Cookie（由 NextAuth.js 管理） | 客户端本地存储（扩展：Chrome Storage；CLI：全局配置；移动端：SecureStore） |
+| **服务端存储** | **无**。JWT 本身为自包含签名令牌，不查数据库 | **强存储**。`apiKeys` 表中每行代表一个活跃凭证 |
+| **数据库表** | `sessions` 表存在但未使用（`strategy: "jwt"`） | `apiKeys` 表（含 keyId、keyHash、scopes、lastUsedAt） |
+| **有效期** | JWT 由 NextAuth 控制（默认 30 天 Cookie 过期 + JWT 自身过期） | **永不过期**，仅在用户主动删除/重新生成时失效 |
+| **签发数量** | 每个浏览器一个 Cookie（不追踪多端） | 无上限，每个设备/用途可独立创建一个 Key |
+| **泄露后风险窗口** | JWT 过期前一直有效（无法服务端吊销） | 删除 DB 行后**立即失效**（下次请求查不到） |
+| **使用痕迹** | 不记录（无 lastUsedAt） | `lastUsedAt` 10 分钟节流更新（[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts#L139-L150)） |
+
+#### 3.4.4 各客户端的凭证选型
+
+| 客户端 | 凭证类型 | 代码位置 | 传输方式 |
+|-------|---------|---------|---------|
+| Web 浏览器 | JWT Cookie | [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts#L181-L183) | HttpOnly Cookie（自动携带） |
+| 浏览器扩展 | API Key | [trpc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/browser-extension/src/utils/trpc.ts#L102-L106) | `Authorization: Bearer <apiKey>` |
+| CLI | API Key | [trpc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/cli/src/lib/trpc.ts#L16-L19) | `Authorization: Bearer <apiKey>` |
+| MCP 服务 | API Key | [shared.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/mcp/src/shared.ts#L20-L27) | `Authorization: Bearer <apiKey>` |
+| 移动端 | API Key | [session.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/mobile/lib/session.ts) | `Authorization: Bearer <apiKey>` |
+| Workers（内部） | Impersonated Context | [trpc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/workers/trpc.ts#L10-L13) | 直接构造 `AuthedContext`，不走 HTTP |
+
+> **注意 Workers 的特殊路径**：后台任务通过 `buildImpersonatingAuthedContext(userId)` 直接构造 Context，绕过了 HTTP 层。此时 `ctx.auth` 为 `undefined`（不是 `"session"` 也不是 `"apiKey"`），但由于 `authedProcedure` 只检查 `ctx.user?.id`，所以 Worker 可以正常调用需要认证的端点。不过 Worker 无法调用 `sessionProcedure` 保护的端点（因为 auth 不为 `"session"`），这在设计上是正确的——Worker 不应能创建或撤销 API Key。
+
 ---
 
 ## 四、会话列表与设备管理（基于 API Key）
