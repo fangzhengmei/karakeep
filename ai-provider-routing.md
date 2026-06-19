@@ -374,7 +374,7 @@ return { response, totalTokens: chatCompletion.usage?.total_tokens };
 
 #### Ollama 路径
 
-位置：`packages/shared/inference.ts`（第 394-405 行）
+位置：`packages/shared/inference.ts`（第 378-395 行）
 
 流式逐块累加 `eval_count` 和 `prompt_eval_count`：
 
@@ -447,14 +447,14 @@ addLogFields<"inferenceWorker.run">({
 
 ## 6. 队列入口矩阵
 
-### 6.1 四个场景的队列入口总览
+### 6.1 四个场景的队列入口与 summarize 触发总览
 
-| 触发场景 | 触发位置 | 进入队列路径 |
-|---|---|---|
-| **用户创建链接书签** | `packages/trpc/routers/bookmarks.ts`（第 395-408 行） | `LinkCrawlerQueue` / `LowPriorityCrawlerQueue` → 爬虫完成后按 `enableAutoIndexing` 分支 |
-| **用户创建文本书签** | `packages/trpc/routers/bookmarks.ts`（第 410-441 行） | 直接进入 `EmbeddingsQueue(embed)` 或 `OpenAIQueue(tag)`，同时 `OpenAIQueue(summarize)` |
-| **用户创建资产书签** | `packages/trpc/routers/bookmarks.ts`（第 431-439 行） | `AssetPreprocessingQueue` → 预处理完成后按 `enableAutoIndexing` 分支 |
-| **管理端重跑** | `packages/trpc/routers/admin.ts`（第 277-420 行） | 直接进入对应队列 |
+| 触发场景 | 触发位置 | 进入队列路径 | 是否触发 summarize |
+|---|---|---|---|
+| **用户创建链接书签** | `packages/trpc/routers/bookmarks.ts`（第 395-408 行） | `LinkCrawlerQueue` / `LowPriorityCrawlerQueue` → 爬虫完成后按 `enableAutoIndexing` 分支 | ✅ 是 |
+| **用户创建文本书签** | `packages/trpc/routers/bookmarks.ts`（第 410-428 行） | 直接进入 `EmbeddingsQueue(embed)` 或 `OpenAIQueue(tag)` | ❌ 否 |
+| **用户创建资产书签** | `packages/trpc/routers/bookmarks.ts`（第 431-439 行） | `AssetPreprocessingQueue` → 预处理完成后按 `enableAutoIndexing` 分支 | ✅ 是 |
+| **管理端重跑** | `packages/trpc/routers/admin.ts`（第 277-420 行） | 直接进入对应队列 | 取决于具体操作 |
 
 ### 6.2 场景 1：用户创建链接书签（Crawler 路径）
 
@@ -731,60 +731,49 @@ const similarBookmarkIds =
 
 ## 8. Worker 分层架构
 
-### 8.1 整体流水线
+### 8.1 整体架构（与第 6 章队列流转一致）
+
+本章不再重复第 6 章已详述的队列入口矩阵和流转图，仅补充 Worker 内部的分层职责和关键设计要点。
+
+**核心分层总览**：
 
 ```
-用户创建 bookmark
-     │
-     ▼
-tRPC / API 层
-     │ enqueue
-     ▼
-LinkCrawlerQueue (numRetries=5)
-     │ 抓取完成后触发
-     ▼
-┌──────────────────────────────────────────────────────┐
-│  分支 1: enableAutoIndexing = true                    │
-│    EmbeddingsQueue(embed) ──┐                        │
-│    ├─ 成功 → EmbeddingsQueue(index)  [独立重试域]     │
-│    │       └─ vectorStoreClient.addVectors()         │
-│    ├─ 成功 → OpenAIQueue(tag + embedding)            │
-│    │       └─ 带相似性上下文打标签                    │
-│    └─ 永久失败 → enqueueTaggingFallback()            │
-│            └─ OpenAIQueue(tag)  [不带 embedding]     │
-│                                                       │
-│  分支 2: enableAutoIndexing = false                   │
-│    OpenAIQueue(tag)  [直接触发，不带 embedding]       │
-└──────────────────────────────────────────────────────┘
-     │
-     └─ OpenAIQueue(summarize)  ← 始终独立触发，与 embedding 无关
-          └─ 生成摘要，写入 bookmarks.summary
+┌───────────────────────────────────────────────────────────────┐
+│  API / tRPC 层                                                 │
+│  (创建 bookmark，根据类型 enqueue 到对应队列)                  │
+└─────────────────────────────┬─────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────┐
+│  预处理 Worker 层                                              │
+│  ├─ crawlerWorker.ts         LINK 类型：抓取网页内容          │
+│  └─ assetPreprocessingWorker.ts  ASSET 类型：OCR/文本提取     │
+└─────────────────────────────┬─────────────────────────────────┘
+                              │
+                              ▼
+┌───────────────────────────────────────────────────────────────┐
+│  AI Worker 层                                                  │
+│  ├─ embeddingsWorker.ts      向量生成 + 向量入库（解耦）      │
+│  ├─ inferenceWorker.ts       统一调度 tagging / summarize     │
+│  │  ├─ tagging.ts            打标业务逻辑（含 JSON 兜底）     │
+│  │  └─ summarize.ts          摘要业务逻辑                     │
+│  └─ searchWorker.ts          全文搜索索引（独立队列）         │
+└───────────────────────────────────────────────────────────────┘
 ```
 
-关键点：`summarize` 任务始终由 Crawler 直接触发，不经过 Embedding Worker，与 embedding 开关无关。
+### 8.2 五个 Worker 的职责对比（含 summarize 触发）
 
-### 8.2 触发点代码核对
+| Worker | 处理类型 | 队列配置 | 主要职责 | 是否触发 summarize |
+|---|---|---|---|---|
+| **crawlerWorker** | LINK | `LinkCrawlerQueue`（numRetries=5）<br>`LowPriorityCrawlerQueue` | 抓取网页内容、截图、PDF 存档；<br>完成后根据 `enableAutoIndexing` 分支触发 embedding/tagging + **summarize** | ✅ 是 |
+| **assetPreprocessingWorker** | ASSET | `AssetPreprocessingQueue`（numRetries=5，jobTimeout=300s） | 图像 OCR（LLM → Tesseract 降级）、PDF 文本提取 + 首屏截图；<br>完成后根据 `enableAutoIndexing` 分支触发 embedding/tagging + **summarize** | ✅ 是 |
+| **embeddingsWorker** | ALL（TEXT/LINK/ASSET） | `EmbeddingsQueue`（numRetries=3） | 生成 embedding 向量 → 触发 `EmbeddingsQueue(index)` + `OpenAIQueue(tag)`；<br>永久失败 → `enqueueTaggingFallback()` 降级为无向量 tag | ❌ 否（summarize 由预处理层触发） |
+| **inferenceWorker** | ALL | `OpenAIQueue`（numRetries=3） | 统一调度：`type="tag"` → tagging.ts；`type="summarize"` → summarize.ts | -（被调用者，不是触发者） |
+| **searchWorker** | ALL | `SearchIndexingQueue`（numRetries=5） | 全文搜索索引的增删改，与 AI 队列完全解耦 | ❌ 否 |
 
-Crawler 完成后的触发逻辑：
-
-位置：`apps/workers/workers/crawlerWorker.ts`（第 2312-2338 行）
-
-```typescript
-if (job.data.runInference !== false) {
-  if (serverConfig.embedding.enableAutoIndexing) {
-    // 走 embedding 路径
-    await EmbeddingsQueue.enqueue(
-      { bookmarkId, type: "embed", runTaggingOnComplete: true },
-      enqueueOpts,
-    );
-  } else {
-    // 直接触发 tagging
-    await OpenAIQueue.enqueue({ bookmarkId, type: "tag" }, enqueueOpts);
-  }
-  // summarize 始终独立触发
-  await OpenAIQueue.enqueue({ bookmarkId, type: "summarize" }, enqueueOpts);
-}
-```
+> 注意 1：文本书签（TEXT 类型）创建时**不会触发 summarize**，只触发 embedding/tagging。summarize 只有 LINK 和 ASSET 类型在预处理完成后才会触发。
+>
+> 注意 2：summarize 与 tagging 完全独立，失败不会互相影响。tagging 失败不影响 summarize，反之亦然。
 
 ### 8.3 Inference Worker 调度层
 
@@ -803,7 +792,24 @@ run: withWorkerTracing(
 ),
 ```
 
-### 8.4 Tagging 业务层
+### 8.4 Summarize Worker 业务逻辑
+
+位置：`apps/workers/workers/inference/summarize.ts`
+
+`runSummarize` 执行流程：
+
+```
+1. 全局开关检查 (enableAutoSummarization)
+2. 用户级开关检查 (autoSummarizationEnabled)
+3. 根据内容类型读取内容:
+   ├─ link/text → bookmark.content.content
+   └─ asset:pdf → 从 contentAsset 读取 PDF 文本
+4. 调用 inferenceClient.inferFromText() 生成摘要
+5. 将摘要写入 bookmarks.summary 字段
+6. 触发 Search 重索引
+```
+
+### 8.5 Tagging 业务层
 
 位置：`apps/workers/workers/inference/tagging.ts`（第 619-728 行）
 
@@ -834,7 +840,7 @@ run: withWorkerTracing(
 8. 触发 RuleEngine + Webhook + Search 重索引
 ```
 
-### 8.5 Embeddings Worker 层（重试隔离设计）
+### 8.6 Embeddings Worker 层（重试隔离设计）
 
 位置：`apps/workers/workers/embeddingsWorker.ts`（第 394-498 行）
 
@@ -848,7 +854,7 @@ run: withWorkerTracing(
 
 设计收益：向量入库（通常依赖外部 Meilisearch，可能很慢）即使失败重试，也**绝不会重复触发 tagging**，避免重复消费 Token 和产生重复标签。
 
-### 8.6 插件化的 Queue Provider
+### 8.7 插件化的 Queue Provider
 
 位置：`packages/shared/plugins.ts`
 
@@ -863,6 +869,20 @@ await import("@karakeep/plugins/queue-restate");   // Restate 分布式队列
 ```
 
 `PluginManager.getClient(PluginType.Queue)` 返回最后注册的 provider，实现队列后端可插拔切换。
+
+### 8.8 Summarize 触发关系总结（全场景核对）
+
+| 场景 | 是否触发 summarize | 触发者 | 代码位置 |
+|---|---|---|---|
+| 创建文本书签 | ❌ 否 | - | `packages/trpc/routers/bookmarks.ts` 第 410-428 行 |
+| 链接抓取完成 | ✅ 是 | crawlerWorker | `apps/workers/workers/crawlerWorker.ts` 第 2331-2337 行 |
+| 资产预处理完成 | ✅ 是 | assetPreprocessingWorker | `apps/workers/workers/assetPreprocessingWorker.ts` 第 494-500 行 |
+| 管理端 `reRunInferenceOnAllBookmarks(type="summarize")` | ✅ 是 | admin router | `packages/trpc/routers/admin.ts` 第 412 行 |
+| 管理端 `reRunInferenceOnAllBookmarks(type="tag")` | ❌ 否 | - | - |
+| 管理端 `regenerateAllBookmarkEmbeddings` | ❌ 否 | - | `runTaggingOnComplete: false` 且不 enqueue summarize |
+| 管理端 `recrawlLinks(runInference=true)` | ✅ 是 | crawlerWorker | 间接触发 |
+| 管理端 `reprocessAssetsFixMode` | ✅ 是 | assetPreprocessingWorker | `!isFixMode || anythingChanged` 成立 |
+| 管理端 `reindexAllBookmarks` | ❌ 否 | - | - |
 
 ---
 
