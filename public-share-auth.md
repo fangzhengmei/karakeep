@@ -4,17 +4,26 @@
 
 ---
 
-## 一、两条公开分享通道概览
+## 一、访问通道概览
 
-Karakeep 的公开分享分为 **两套独立通道**，它们使用不同的鉴权模型：
+Karakeep 对同一批列表/书签/资产存在 **五层视角**，每层通过不同的代码路径、不同的鉴权方式呈现不同的数据。下表从最高权限到最低权限排列：
 
-| 通道 | 入口 | 鉴权方式 | 访问粒度 |
-|------|------|----------|----------|
-| 公开列表（Public List） | `GET /public/lists/[listId]` (Next.js 页面) / tRPC `publicBookmarks` | `bookmarkLists.public = true` 布尔标记 | 整个列表只读 |
-| RSS Feed | `GET /api/v1/rss/lists/:listId?token=xxx` | `bookmarkLists.rssToken` 字段匹配 | 整个列表只读 |
-| 公开资产（Public Asset） | `GET /api/public/assets/:assetId?token=xxx` | HMAC-SHA256 签名 Token | 单个资产文件 |
+| 层级 | 身份 | 代码入口 | userRole 枚举值 |
+|------|------|----------|-----------------|
+| ① 管理员调试视图 | `users.role = "admin"` | `GET /trpc/admin.getBookmarkDebugInfo` | N/A（绕过列表权限） |
+| ② 已登录列表所有者 | session / API Key（lists scope） | `List.fromId(ctx, id)` 命中 `bookmarkLists.userId = ctx.user.id` | `"owner"` |
+| ③ 已登录协作者 | 被邀请加入列表 | `List.fromId()` 命中 `listCollaborators` 表 | `"editor"` 或 `"viewer"` |
+| ④ 公开列表网页访问 | 匿名浏览器 | `GET /public/lists/[listId]` → tRPC `publicBookmarks.*` | `"public"`（impersonate 上下文内） |
+| ⑤ 仅 RSS Token 访问 | 匿名 RSS 阅读器 | `GET /api/v1/rss/lists/:listId?token=xxx` | `"public"`（impersonate 上下文内） |
 
-关键区别：公开列表是"谁都能看"，RSS Token 是"有令牌才能看"，公开资产是"有时效签名才能下载"。
+后两层（④⑤）都通过 `List.getPublicList()` 的 `OR(public=true, rssToken=token)` 分支进入，差异只在输出格式（HTML vs RSS XML）以及 RSS 渲染代码自身的 bug。
+
+资产（二进制文件）独立于列表权限体系，提供 **两条下载路由**：
+
+| 路由 | 鉴权方式 | 适配层级 |
+|------|----------|----------|
+| `/api/assets/:id` | `authMiddleware` + `assets.read` scope → `Asset.canUserView()` | ①②③ |
+| `/api/public/assets/:id?token=xxx` | HMAC 签名验证 → DB `assetId + userId` | ④⑤，也被 ① 用于 admin debug 预览 |
 
 ---
 
@@ -38,112 +47,127 @@ export const bookmarkLists = sqliteTable("bookmarkLists", {
 
 ---
 
-## 三、公开列表 — Token 签发与权限
+## 三、五层访问视角的代码顺序对比
 
-### 3.1 开启公开分享
+从高权限到低权限，每层都走独立的代码路径。下面按 tRPC/API 入口 → 中间件 → 模型鉴权 → 数据脱敏的顺序梳理。
 
-**前端**: [PublicListLink.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/apps/web/components/dashboard/lists/PublicListLink.tsx#L34-L44)
+### 3.1 五层入口与中间件校验顺序
 
-前端通过 `Switch` 组件调用 `editList({ listId, public: checked })`，触发 tRPC mutation。
+| # | 视角 | tRPC/HTTP 入口 | 第一层中间件 | 第二层中间件 | 模型层入口 |
+|---|------|----------------|--------------|--------------|------------|
+| ① | Admin 调试视图 | `admin.getBookmarkDebugInfo` | `authedProcedure`（校验 ctx.user 存在） | `createAdminScopedProcedure` → `isAdmin` 校验 `ctx.user.role === "admin"` | `Bookmark.buildDebugInfo()` 内部再校验一次 admin |
+| ② | List Owner | `lists.*` `bookmarks.*` 等 | `createScopedAuthedProcedure("lists"/"bookmarks")`（session 直接放行；API Key 校验 scope） | `ensureListAtLeastViewer` → `List.fromId(ctx, id)` 查 `bookmarkLists.userId = ctx.user.id` | `canUserManage() / canUserEdit() / canUserView()` |
+| ③ | List Collaborator | `lists.*` `bookmarks.*` 等 | 同上 | `ensureListAtLeastViewer` → `List.fromId()` 回退查 `listCollaborators` 表，取 `role` 字段 | `canUserView()` 对 viewer/editor 返回 true |
+| ④ | 公开列表页 | `publicBookmarks.getPublicListMetadata` / `getPublicBookmarksInList` | `publicProcedure`（仅限流，无 auth 校验） | 无 | `List.getPublicList(ctx, id, token=null)` → `WHERE ... OR public=true` |
+| ⑤ | RSS Token 访问 | `GET /api/v1/rss/lists/:id?token=xxx` (Hono) | `unauthedMiddleware`（仅检查 ctx 存在，不校验 user） | 无 | `List.getPublicListContents(ctx, id, token)` → `WHERE ... OR rssToken=token` |
 
-**后端**: [lists.ts router](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/lists.ts#L86-L102)
+关键结论：**层 ④ 和 层 ⑤ 使用完全相同的模型层函数 `getPublicList()` / `getPublicListContents()`**，唯一差异是调用时 `token` 参数：层 ④ 传 `null`（仅 `public=true` 可过），层 ⑤ 传 RSS Token 值（`public=true` **或** `rssToken` 匹配都可过）。
 
-```ts
-edit: listsProcedure
-  .input(zEditBookmarkListSchemaWithValidation)
-  .use(ensureListAtLeastViewer)
-  .use(ensureListAtLeastOwner)        // ← 仅 owner 可操作
-  .mutation(async ({ input, ctx }) => {
-    await ctx.list.update(input);     // 设置 public: true/false
-  })
-```
+### 3.2 List 角色矩阵与代码对应
 
-`List.update()` ([lists.ts L601-L625](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L601-L625)) 通过 `ensureCanManage()` 校验权限后执行 `UPDATE bookmarkLists SET public = ? WHERE id = ? AND userId = ?`。
-
-**权限边界**:
-- 只有列表 `owner`（`userRole === "owner"`）可以开关公开状态。
-- `editor` / `viewer` / `public` 角色均被拒绝（`canUserManage()` 返回 false）。
-
-### 3.2 公开列表内容读取
-
-**tRPC 路由**: [publicBookmarks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/publicBookmarks.ts#L14-L70)
+**Schema**（[types/lists.ts L61](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/lists.ts#L61)）：
 
 ```ts
-getPublicListMetadata: publicProcedure   // ← 无需登录
-  .input(z.object({ listId: z.string() }))
-  .query(async ({ input, ctx }) => {
-    return await List.getPublicListMetadata(ctx, input.listId, /* token */ null);
-  }),
-
-getPublicBookmarksInList: publicProcedure  // ← 无需登录
-  .query(async ({ input, ctx }) => {
-    return await List.getPublicListContents(ctx, input.listId, /* token */ null, { ... });
-  }),
+userRole: z.enum(["owner", "editor", "viewer", "public"]),
 ```
 
-两个端点都使用 `publicProcedure`（仅做限流，不做身份校验），**token 传 null**。
-
-**核心鉴权**: [List.getPublicList()](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L161-L189)
+**模型层判断逻辑**（[lists.ts L397-L428](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L397-L428)）：
 
 ```ts
-private static async getPublicList(ctx: Context, listId: string, token: string | null) {
-  const listdb = await ctx.db.query.bookmarkLists.findFirst({
-    where: and(
-      eq(bookmarkLists.id, listId),
-      or(
-        eq(bookmarkLists.public, true),                              // 条件1: 公开
-        token !== null ? eq(bookmarkLists.rssToken, token) : undefined, // 条件2: RSS token 匹配
-      ),
-    ),
-  });
-  if (!listdb) throw new TRPCError({ code: "NOT_FOUND" });
-  return listdb;
-}
+canUserView():  owner ✔  editor ✔  viewer ✔  public ✔
+canUserEdit():  owner ✔  editor ✔  viewer ✗  public ✗
+canUserManage(): owner ✔  editor ✗  viewer ✗  public ✗
 ```
 
-**鉴权逻辑**: `public = true` **或** `rssToken = token`，两者满足其一即可访问。当 token 为 null 时，只有 `public = true` 的列表可见。
+- **owner**（层 ②）：`List.fromId()` 在 `bookmarkLists.userId === ctx.user.id` 时设置
+- **editor/viewer**（层 ③）：`List.fromId()` 命中 `listCollaborators` 表时取其 `role` 字段
+- **public**（层 ④/⑤）：`getPublicListContents()` 内部显式硬编码 `userRole: "public"` 构造 List 对象（[lists.ts L222-L230](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L222-L230)）
 
-### 3.3 数据脱敏 — asPublicBookmark()
+公开视角（④⑤）下 `List` 对象的 `ensureCanManage()` 会直接抛 `FORBIDDEN`，所以后续代码无法执行任何写入操作。
 
-**文件**: [bookmarks.ts L769-L861](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L769-L861)
+### 3.3 各视角可执行的操作对比
 
-公开书签通过 `asPublicBookmark()` 精心裁剪，**不使用 spread**：
+| 操作 | ① Admin | ② Owner | ③ Editor | ③ Viewer | ④ Public Web | ⑤ RSS Token |
+|------|---------|---------|----------|----------|--------------|-------------|
+| 查看列表元数据（名称/描述/图标） | ✔（debug view） | ✔ | ✔ | ✔ | ✔（限 public=true） | ✔（限 token 匹配 或 public=true） |
+| 查看列表书签 | ✔（debug view） | ✔ | ✔ | ✔ | ✔（走 asPublicBookmark 脱敏） | ✔（同上，但 RSS 渲染代码再过滤一次） |
+| 书签完整内容（htmlContent / 全文） | ✔（HTML 前 1000 字符 preview） | ✔ | ✔ | ✔ | ✗（LINK 只给 url，TEXT 给 text，ASSET 给 assetUrl） | ✗（同上，且 RSS 还会再丢字段） |
+| 添加/移除书签 | — | ✔ | ✔ | ✗ | ✗ | ✗ |
+| 编辑列表属性（改名/图标/描述） | — | ✔ | ✗ | ✗ | ✗ | ✗ |
+| 管理协作者 | — | ✔ | ✗ | ✗ | ✗ | ✗ |
+| 开启/关闭公开（`public` 字段） | — | ✔ | ✗ | ✗ | ✗ | ✗ |
+| 生成/轮换/清除 RSS Token | — | ✔ | ✗ | ✗ | ✗ | ✗ |
+| 删除列表 | — | ✔ | ✗ | ✗ | ✗ | ✗ |
+| 查看协作者列表和邀请 | — | ✔（含 pending 邀请） | ✔（仅已接受） | ✔（仅已接受） | ✗（ownerName 可见，协作者隐藏） | ✗ |
 
-```ts
-return {
-  id: this.bookmark.id,
-  createdAt: this.bookmark.createdAt,
-  modifiedAt: this.bookmark.modifiedAt,
-  title: getBookmarkTitle(this.bookmark),
-  tags: this.bookmark.tags.map((t) => t.name),   // 只暴露标签名，不暴露标签 ID
-  content: getContent(this.bookmark.content),      // 裁剪后的内容
-  bannerImageUrl: getBannerImageUrl(this.bookmark.content),
-};
-```
+**注意事项**：
+- Admin ① 的 debug view 只暴露单个书签（`getBookmarkDebugInfo`），不走 List 角色体系，直接 `SELECT * FROM bookmarks WHERE id = ?`（[admin.ts L708-L787](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/admin.ts#L708-L787)）。因此 **admin 可以查看任何用户的任何书签**，即使该书签所在的列表未公开、admin 也不是协作者。
+- Admin debug view 仍有一层隐私过滤：`PRIVACY_REDACTED_ASSET_TYPES = { USER_UPLOADED, BOOKMARK_ASSET }` 的资产不给签名 URL（[bookmarks.ts L285-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L285-L288)），但 LINK_SCREENSHOT、ASSET_SCREENSHOT、OCR_RESULT 等衍生资产会以 10 分钟过期的签名 URL 返回。
 
-**不同类型的裁剪**:
+### 3.4 各视角书签数据字段输出对比
 
-| 类型 | 暴露字段 | 隐藏字段 |
-|------|----------|----------|
-| LINK | `url` | `title`, `description`, `htmlContent`, `author`, `publisher`, `crawledAt` 等元数据 |
-| TEXT | `text` 完整文本 | `sourceUrl` |
-| ASSET | `assetType`, `assetId`, `assetUrl`(签名), `fileName`, `sourceUrl` | 无额外隐藏 |
+以同一条 LINK 书签为例，各层返回的字段差异：
 
-**关键注意**: LINK 类型在公开视图中只暴露原始 URL，不暴露爬取的 htmlContent、description 等字段。TEXT 类型会暴露完整文本。
+| 字段 | ① Admin debug | ② Owner（ZBookmark） | ④/⑤ Public（ZPublicBookmark） | ⑤ RSS 实际输出 |
+|------|---------------|----------------------|--------------------------------|----------------|
+| id | ✔ | ✔ | ✔ | ✔（作为 guid） |
+| createdAt | ✔ | ✔ | ✔ | ✔（作为 pubDate） |
+| title | ✔ | ✔ | ✔ | ✔ |
+| summary | ✔ | ✔ | —（schema 中无此字段） | — |
+| description | ✗（debug view 无 description 字段） | ✔ | ✗（asPublicBookmark 未写入，schema 声明了但缺失） | ""（永远空字符串） |
+| tags | ✔（含 id, name, attachedBy） | ✔（含 id, name, attachedBy） | ✔（仅 name 字符串数组） | ✔（作为 categories） |
+| content.url | ✔（linkInfo.url） | ✔ | ✔ | ✔ |
+| content.author | — | ✔ | ✗（schema 声明了但未写入 content） | undefined（永远缺失） |
+| htmlContent | ✔（preview 前 1000 字符） | ✔（完整） | ✗ | ✗ |
+| crawlStatus / crawledAt | ✔ | ✔ | ✗ | ✗ |
+| bannerImageUrl | — | — | ✔（带签名） | ✗（RSS 未用 enclosure） |
+| ASSET 资产 URL | ✔（10 分钟过期签名，隐私类型为 null） | ✔（10 分钟过期签名，隐私类型为 null） | ✔（1 小时对齐 + 15 分钟宽限期签名） | ❌（误用 `/api/assets/:id` 需登录的 URL） |
 
-### 3.4 冒充上下文 — buildImpersonatingAuthedContext
+### 3.5 各视角的资产下载路径
 
-**文件**: [impersonate.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/lib/impersonate.ts#L1-L30)
+| 视角 | 调用的下载路由 | 鉴权链 |
+|------|----------------|--------|
+| ① Admin（debug view assets） | `/api/public/assets/:id?token=xxx`（签名 URL，10 分钟过期） | HMAC 验证 → assetId 匹配 → DB `id + userId` 存在性 |
+| ②/③ 已登录用户 | `/api/assets/:id` | `authMiddleware` → `apiKeyScopeMiddleware("assets", "read")` → `Asset.canUserView()`（owner / avatar公开 / bookmark 的协作者可访问） |
+| ④ 公开网页 | `/api/public/assets/:id?token=xxx`（1 小时对齐 + 15 分钟宽限期） | HMAC 验证 → assetId 匹配 → DB 存在性 |
+| ⑤ RSS（理论修复后） | 同 ④ | 同 ④ |
+| ⑤ RSS（当前代码） | `/api/assets/:id`（无 token） | `authMiddleware` 阻断 → **401 失败** |
 
-公开列表读取时需要以列表 owner 身份查询书签：
+**`Asset.canUserView()` 完整逻辑**（[assets.ts L225-L251](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/assets.ts#L225-L251)），按优先级：
+
+1. `asset.userId === ctx.user.id` → 放行（资产 owner）
+2. `assetType === "avatar"` → 放行（头像公开）
+3. `asset.bookmarkId` 存在 → 调用 `BareBookmark.bareFromId()` → `isAllowedToAccessBookmark()` → 查书签是否属于当前用户，或是否在任一用户可 view 的列表中 → 放行/拒绝
+4. 其他情况 → 拒绝
+
+因此，**Viewer 可以下载列表中所有书签关联的资产**（因为 viewer 的 List.canUserView() 返回 true，会传递到 BareBookmark → Asset.canUserView 的判断链路中）。
+
+### 3.6 冒充上下文（impersonating context）的权限边界
+
+层 ④/⑤ 在 `getPublicListContents()` 内部构造：
 
 ```ts
 const authedCtx = await buildImpersonatingAuthedContext(listdb.userId);
+const listObj = List.fromData(authedCtx, {
+  ...listdb,
+  userRole: "public",  // ← 强制 public 角色
+  hasCollaborators: false,
+}, null);
 ```
 
-这创建了一个 **不带 auth 信息**（`auth` 字段缺失）、`req.ip = null` 的 AuthedContext。由于该上下文只在 `List.getPublicListContents()` 内部使用，不返回给外部，安全风险可控。
+**文件**: [impersonate.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/lib/impersonate.ts#L1-L30)
 
-**越权边界**: 如果 impersonating context 被错误传递到其他需要真实身份的操作（如写入），可能导致以 owner 身份执行未授权操作。当前代码中，该上下文只用于 `Bookmark.loadMulti()` 和 `listObj.getBookmarkIds()`，均为只读查询。
+该上下文特征：
+- `ctx.user.id = listdb.userId`（以 owner 身份）
+- `ctx.auth` 字段缺失（非 session、非 API Key）
+- `ctx.req.ip = null`
+
+后续只读操作链路：
+1. `listObj.getBookmarkIds()` — 对 ManualList 查 `bookmarksInLists`，对 SmartList 走搜索 matcher，均不需要写权限
+2. `Bookmark.loadMulti(authedCtx, ids)` — 内部走 `BareBookmark.isAllowedToAccessBookmark()`。由于 `ctx.user.id === bookmarkOwnerId`，**所有书签都会放行**
+3. `bookmark.asPublicBookmark()` — 数据脱敏，输出字段已在 3.4 节列出
+
+**越权防线**：`listObj` 的 `userRole: "public"` 导致 `ensureCanManage()` / `ensureCanEdit()` 在任何写操作被调用时立刻抛 `FORBIDDEN`。同时该上下文函数作用域内创建，不会泄漏到 HTTP handler 的返回值中。
 
 ---
 
@@ -482,17 +506,20 @@ Next.js 页面使用 SSR（服务端渲染），无 `revalidate` 或 `dynamic` �
 | # | 问题 | 严重度 | 说明 |
 |---|------|--------|------|
 | 1 | RSS Token 无过期时间 | **中** | `rssToken` 在数据库中无 `expiresAt` 字段，一旦泄露无法自动失效。只能通过 `regenRssToken` 或 `clearRssToken` 手动撤销。 |
-| 2 | 公开列表无访问审计 | **低** | `publicProcedure` 不记录访问者信息（无 auth），无法追踪谁在何时访问了公开列表。 |
+| 2 | 公开列表无访问审计 | **低** | `publicProcedure` 和 `unauthedMiddleware` 均不记录访问者信息（无 auth），无法追踪谁在何时访问了公开列表或 RSS。 |
 | 3 | 资产签名 URL 浏览器缓存 | **低** | `Cache-Control: private, max-age=31536000, immutable` 意味着浏览器可能长期缓存资产。即使签名过期或列表被设为非公开，已缓存内容不受影响。 |
-| 4 | 公开列表开关无确认步骤 | **低** | 从非公开切换为公开是即时生效的，没有二次确认或"预览即将公开的内容"步骤。 |
-| 5 | `public` 字段与 `rssToken` 独立 | **中** | 清除 RSS Token 不会关闭公开列表；关闭公开列表不会清除 RSS Token。两者是独立的访问通道，可能造成混淆。 |
-| 6 | NEXTAUTH_SECRET 双重用途 | **中** | 签名 Token 与 NextAuth 共用 `NEXTAUTH_SECRET`。如果该密钥被轮换，所有已签发的资产 token 立即失效（包括未过期的），可能导致用户体验中断。 |
-| 7 | **RSS ASSET 链接不可下载** | **高** | RSS Feed 中 ASSET 类书签的 URL 使用 `getAssetUrl()`（`/api/assets/:id`，需登录），**丢弃**了 `asPublicBookmark()` 中已生成的签名 `assetUrl`（`/api/public/assets/:id?token=xxx`）。RSS 订阅者点击链接会被弹到登录页。 |
-| 8 | **RSS description 永远为空** | **中** | `zPublicBookmarkSchema` 声明了 `description` 字段，但 `asPublicBookmark()` 的返回对象中没有该字段。RSS 渲染时 `bookmark.description ?? ""` → 永远空字符串。 |
-| 9 | **RSS LINK author 永远缺失** | **低** | LINK 类型的公开内容 schema 声明了 `author` 字段，但 `getContent(LINK)` 不包含它。RSS 的 `<author>` 元素永远不输出。 |
+| 4 | 公开列表开关无确认步骤 | **低** | 从非公开切换为公开是即时生效的（`lists.edit` mutation → `ensureCanManage` → `UPDATE`），没有二次确认或"预览即将公开的内容"步骤。 |
+| 5 | `public` 字段与 `rssToken` 独立 | **中** | 清除 RSS Token 不会关闭公开列表；关闭公开列表不会清除 RSS Token。两者是独立的访问通道，关闭其中一个不影响另一个。 |
+| 6 | NEXTAUTH_SECRET 双重用途 | **中** | 签名 Token 与 NextAuth 共用 `NEXTAUTH_SECRET`。密钥轮换会使所有已签发的资产 token 立即失效，可能导致用户体验中断。 |
+| 7 | **RSS ASSET 链接不可下载** | **高** | RSS Feed 中 ASSET 类书签的 URL 使用 `getAssetUrl()`（`/api/assets/:id`，需登录），**丢弃**了 `asPublicBookmark()` 中已生成的签名 `assetUrl`（`/api/public/assets/:id?token=xxx`）。RSS 订阅者点击会被弹到登录页。 |
+| 8 | **RSS description 永远为空** | **中** | `zPublicBookmarkSchema` 声明了 `description` 字段，但 `asPublicBookmark()` 的返回对象中没有该字段。RSS 渲染 `bookmark.description ?? ""` → 永远空字符串。 |
+| 9 | **RSS LINK author 永远缺失** | **低** | LINK 类型的公开 content schema 声明了 `author` 字段，但 `getContent(LINK)` 返回 `{type, url}` 不包含 author。RSS 的 `<author>` 元素永远不输出。 |
 | 10 | **RSS channel siteUrl 指向私有 Dashboard** | **中** | `<channel><link>` 指向 `/dashboard/lists/:listId`（需登录），订阅者点击会被弹到登录页。应改为 `/public/lists/:listId`。 |
-| 11 | **RSS TEXT 类型书签被过滤** | **低** | TEXT 书签在 `toRSS()` 中被完全过滤，RSS 客户端无法看到纯文本书签。 |
-| 12 | **RSS 无 enclosure 元素** | **低** | ASSET 类书签和 banner image 未使用 RSS 2.0 `<enclosure>` 或 `<media:thumbnail>` 标准扩展，导致 RSS 阅读器中无法渲染附件和缩略图。 |
+| 11 | **RSS TEXT 类型书签被过滤** | **低** | TEXT 书签在 `toRSS()` 的 `.filter(b => LINK \|\| ASSET)` 中被完全过滤，RSS 客户端无法看到纯文本书签。 |
+| 12 | **RSS 无 enclosure 元素** | **低** | ASSET 类书签和 banner image 未使用 RSS 2.0 `<enclosure>` 或 `<media:thumbnail>` 扩展，RSS 阅读器无法渲染附件和缩略图。 |
+| 13 | **Admin debug view 可跨用户查看任何书签** | **中** | `admin.getBookmarkDebugInfo` 直接 `SELECT * FROM bookmarks WHERE id = ?`，绕过 List 角色体系。任何 admin 都可以查看任何用户的任何书签内容（含 htmlContent 前 1000 字符 preview），即使列表未公开、admin 不是协作者。 |
+| 14 | **Viewer 角色可下载列表中所有书签的关联资产** | **低** | `Asset.canUserView()` 通过 `BareBookmark.bareFromId` → `List.forBookmark` → `List.canUserView()` 级联判断。Viewer 对列表有 view 权限会自动传递到所有关联资产。符合预期，但与"viewer 不可写"的权限模型相比，资产下载算是 viewer 的隐藏能力。 |
+| 15 | **公开视角 impersonating context 以 owner 身份读全量书签** | **低** | `buildImpersonatingAuthedContext(listdb.userId)` 在层 ④/⑤ 内部构造以 owner 身份的 ctx，`Bookmark.loadMulti` 会因为 `ctx.user.id === bookmarkOwnerId` 放行所有书签。依赖后续 `asPublicBookmark()` 做数据脱敏。安全依赖于脱敏函数的完整性——如果有字段被加入 ZBookmark 但忘记在 asPublicBookmark 中裁剪，会直接泄漏。 |
 
 ### 7.2 越权防护验证（E2E 测试覆盖）
 
@@ -509,6 +536,13 @@ E2E 测试覆盖了以下越权场景：
 - 访问非公开列表 → `List not found`
 - 引用不存在的 assetId → 404
 
+**当前 E2E 未覆盖**（需补充）：
+- RSS endpoint 返回 404 对错误 token
+- RSS ASSET URL 是否为签名 URL（当前会失败，因为 bug）
+- Admin debug view 越权访问非 admin 用户书签
+- Viewer 无法 edit/manage 列表
+- Collaborator 无法看到 rssToken（被 `columns: { rssToken: false }` 过滤）
+
 ### 7.3 未覆盖的边界场景
 
 | 场景 | 现状 |
@@ -516,10 +550,12 @@ E2E 测试覆盖了以下越权场景：
 | 列表从公开切为非公开后，已签发的资产 token 是否仍可访问资产？ | **可以**。资产 token 绑定的是 `assetId + userId`，不检查列表公开状态。即使列表变为非公开，只要 token 未过期，资产仍可下载。 |
 | RSS Token 泄露后的窗口期 | **无限大**。除非 owner 手动轮换，泄露的 token 永久有效。 |
 | 并发竞争：owner 正在关闭公开时，公开请求是否仍可通过？ | **可能**。数据库 UPDATE 和 SELECT 之间无事务隔离，存在极短的竞争窗口。 |
-| 删除列表后 RSS Token 是否残留？ | **不残留**。列表删除时 `rssToken` 随行删除（`onDelete: cascade` 作用于 userId 外键，列表整行删除）。 |
+| 删除列表后 RSS Token 是否残留？ | **不残留**。列表删除时 `rssToken` 随行删除（列表整行删除）。 |
 | RSS 中 ASSET 链接失效后，RSS 阅读器缓存的旧 XML 是否仍能访问？ | **链接会失效**，但已缓存的 XML 内容（不含二进制文件）阅读器仍会保留。 |
 | NEXTAUTH_SECRET 轮换后，仍在 RSS 阅读器缓存中的旧签名 assetUrl 会怎样？ | **全部失效**，点击会返回 403。由于 RSS 本身无缓存头，阅读器轮询时会重新拉取 feed，但中间窗口期内的链接会中断。 |
 | RSS 订阅时用的是 `?token=xxx`（RSS Token），但书签内的资产签名 Token 到期时间是 1 小时，会出现什么？ | feed 中每个 item 的资产 URL 在每次轮询时都会**重新签发**（对齐到小时+宽限期），所以 RSS 阅读器每次抓最新的 feed 时链接都是有效的。**但**如果阅读器缓存了 RSS item 的 URL（不重新拉取），1 小时后会失效。 |
+| Admin 账号被攻破后的数据暴露面 | **全部书签**。`admin.getBookmarkDebugInfo` 不需要知道 bookmark 属于哪个列表、是否公开，只需 bookmarkId 即可查看。攻击者如果掌握 admin session 并遍历 bookmarkId，可读取所有用户的书签内容（含 htmlContent preview）。 |
+| Viewer 移除后仍持有书签关联资产的旧签名 URL | **仍可下载**，直到签名过期（最长 1 小时 15 分钟）。资产签名 token 不校验协作者关系，只校验 assetId + userId。 |
 
 ---
 
@@ -599,16 +635,25 @@ RSS 中 ASSET 链接的错误访问路径:
 | 文件 | 职责 |
 |------|------|
 | [schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/db/schema.ts#L475-L498) | `bookmarkLists` 表定义，`public` 和 `rssToken` 字段 |
+| [types/lists.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/lists.ts#L61) | `userRole: z.enum(["owner", "editor", "viewer", "public"])` 定义 |
 | [signedTokens.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/signedTokens.ts) | `createSignedToken` / `verifySignedToken` / `getAlignedExpiry` |
 | [zAssetSignedTokenSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/assets.ts) | 资产签名 token 的 payload schema |
 | [zPublicBookmarkSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/bookmarks.ts#L283-L310) | 公开书签 schema（与实际返回存在字段差异） |
-| [lists.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L161-L189) | `getPublicList()` 核心鉴权逻辑 |
+| [lists.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L85-L159) | `List.fromId()` — owner/collaborator 路由 + 角色判定入口 |
+| [lists.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L161-L253) | `getPublicList()` / `getPublicListContents()` — 公开/RSS 共享入口 |
+| [lists.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L397-L465) | `canUserView/Edit/Manage()` 角色矩阵 |
+| [lists.ts (router)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/lists.ts#L26-L58) | `ensureListAtLeastViewer/Editor/Owner` tRPC 中间件 |
 | [lists.ts (router)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/lists.ts#L204-L231) | RSS Token 签发/撤销/查询端点 |
-| [bookmarks.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L769-L861) | `asPublicBookmark()` 数据脱敏（含缺失字段问题） |
-| [assets.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/assets.ts#L266-L281) | `getPublicSignedAssetUrl()` 签名 URL 生成 |
+| [bookmarks.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L100-L131) | `BareBookmark.bareFromId()` / `isAllowedToAccessBookmark()` — 书签访问控制 |
+| [bookmarks.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L276-L395) | `buildDebugInfo()` — Admin 调试视图输出 |
+| [bookmarks.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L769-L861) | `asPublicBookmark()` — 公开数据脱敏（含缺失字段问题） |
+| [assets.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/assets.ts#L225-L260) | `Asset.canUserView()` / `ensureCanView()` — 已登录用户资产访问控制 |
+| [assets.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/assets.ts#L266-L281) | `getPublicSignedAssetUrl()` — 签名 URL 生成 |
 | [public/assets.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/public/assets.ts) | 公开资产下载端点 + token 校验（匿名） |
 | [assets.ts (route)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/assets.ts) | 已登录资产下载端点（需 authMiddleware） |
 | [api/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/index.ts#L86-L93) | 路由挂载点（/assets 与 /public/assets 并行） |
+| [trpc/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/index.ts#L131-L227) | `authedProcedure` / `createScopedAuthedProcedure` / `createAdminScopedProcedure` 定义 |
+| [admin.ts (router)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/admin.ts#L708-L787) | `admin.getBookmarkDebugInfo` 路由 |
 | [impersonate.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/lib/impersonate.ts) | 冒充 owner 上下文构建 |
 | [publicBookmarks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/publicBookmarks.ts) | tRPC 公开列表端点 |
 | [rss.ts (handler)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts) | RSS Feed HTTP 端点 |
@@ -618,5 +663,6 @@ RSS 中 ASSET 链接的错误访问路径:
 | [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/middlewares/auth.ts) | `unauthedMiddleware` / `authMiddleware` |
 | [PublicListLink.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/apps/web/components/dashboard/lists/PublicListLink.tsx) | 前端公开开关 UI |
 | [public list page.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/apps/web/app/public/lists/[listId]/page.tsx) | 公开列表 SSR 页面 |
+| [PublicBookmarkGrid.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/apps/web/components/public/lists/PublicBookmarkGrid.tsx) | 公开列表前端卡片渲染（LINK/TEXT/ASSET 三种分支） |
 | [config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/config.ts#L266-L271) | `signingSecret()` → `NEXTAUTH_SECRET` |
-| [public.test.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/e2e_tests/tests/api/public.test.ts) | 公开 API E2E 测试（当前未覆盖 RSS） |
+| [public.test.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/e2e_tests/tests/api/public.test.ts) | 公开 API E2E 测试（当前未覆盖 RSS / Admin） |
