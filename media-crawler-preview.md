@@ -102,18 +102,28 @@ Karakeep **不直接实现 oEmbed 协议客户端**，而是通过 `metascraper`
 
 缩略图存在三级来源和两层本地化策略:
 
-### 3.1 缩略图来源优先级 (由高到低)
+### 3.1 卡片缩略图来源优先级 (由高到低)
 
 在前端卡片展示时，[getBookmarkLinkAssetIdOrUrl](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/shared/utils/bookmarkUtils.ts#L4-L14) 定义选择顺序：
 
 ```
-1. imageAssetId (下载到本地的 og:image 横幅图)
+优先级从高到低:
+
+1. imageAssetId (下载到本地的横幅图)
    └─ crawlerWorker.downloadAndStoreImage() → AssetTypes.LINK_BANNER_IMAGE
+   └─ 对应 DB 字段: bookmarkLinks.imageAssetId
+
 2. screenshotAssetId (浏览器截图)
    └─ Playwright screenshot → JPEG 80% 质量 → AssetTypes.LINK_SCREENSHOT
-3. imageUrl (远程 URL，未本地化的 og:image / twitter:image)
-   └─ 直接存储在 bookmarkLinks.imageUrl 字段
+   └─ 对应 DB 字段: bookmarkLinks.screenshotAssetId
+
+3. imageUrl (远程 URL)
+   └─ metascraper-image 提取的 og:image / twitter:image
+   └─ 对应 DB 字段: bookmarkLinks.imageUrl
+   └─ data URI (base64) 会被过滤掉不存储
 ```
+
+**注意**: 视频链接的卡片封面也走这条通用管道，没有独立的视频缩略图机制。详见 §3.4
 
 ### 3.2 横幅图 (Banner Image) 本地化流程
 
@@ -214,60 +224,182 @@ Karakeep **不直接实现 oEmbed 协议客户端**，而是通过 `metascraper`
 
 ## 5. 失败重试机制
 
-重试系统由三层构成: **状态码驱动重试**、**队列级指数退避**、**限流型不计数重试**。
+重试系统采用 **Restate 持久化状态机 + Dispatcher/Runner 双层架构**。核心设计思想是：Runner 只负责执行（零重试），Dispatcher 只负责调度（集中重试逻辑）。
 
-### 5.1 可重试状态码判定
+### 5.1 三层架构与双层重试保障
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Restate Service 层 (外层兜底)                               │
+│  dispatcher.ts#L46-L54 retryPolicy:                         │
+│    maxAttempts: NUM_RETRIES + 1 (含首次尝试)                 │
+│    initialInterval: 5s, maxInterval: 1min                   │
+│    仅在 Dispatcher 进程自身崩溃重启时生效                     │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Dispatcher 业务循环层 (实际重试逻辑)                         │
+│  dispatcher.ts#L92-L222 while(runNumber <= NUM_RETRIES)     │
+│    ├─ 信号量获取 semaphore.acquire()                         │
+│    ├─ RPC 调用 runner.run(jobData)                           │
+│    ├─ 三路分支判断: success / rate_limit / error             │
+│    └─ 信号量释放 semaphore.release()                         │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Runner 执行层 (零重试)                                       │
+│  runner.ts#L53-L55 retryPolicy: { maxAttempts: 1 }          │
+│  runner.ts#L77-L122:                                         │
+│    ├─ tryCatch(funcs.run()) 捕获业务异常                     │
+│    ├─ QueueRetryAfterError → { type: "rate_limit" }          │
+│    ├─ 普通 Error → { type: "error" }                         │
+│    └─ 正常返回 → { type: "success" }                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**双重重试保障说明**:
+- **内层 (while 循环)**: 业务代码实现的显式重试，控制三种分支的不同延迟策略
+- **外层 (Restate retryPolicy)**: 仅当 Dispatcher 所在进程崩溃/重启时，Restate SDK 接管重放，防止极端情况下任务丢失
+- **总尝试次数**: 内层 `NUM_RETRIES + 1` 次（runNumber 从 0 到 `NUM_RETRIES`，条件为 `<=`）
+
+各队列默认重试次数（`numRetries`）:
+
+| 队列 | 重试次数 | 总尝试次数 | 典型场景 |
+|------|---------|-----------|---------|
+| `LinkCrawlerQueue` / `LowPriorityCrawlerQueue` | 5 | 6 次 | 网页易被反爬封禁 |
+| `VideoWorkerQueue` | 5 | 6 次 | 视频下载网络波动大 |
+| `SearchIndexingQueue` | 5 | 6 次 | MeiliSearch 索引可能繁忙 |
+| `OpenAIQueue` / `EmbeddingsQueue` | 3 | 4 次 | API 限流/计费保护 |
+| `AssetPreprocessingQueue` | 2 | 3 次 | OCR 偶发超时 |
+| `FeedQueue` / `RuleEngineQueue` | 1 | 2 次 | 周期性任务，失败下次补 |
+| `AdminMaintenanceQueue` / `BackupQueue` | 1 | 2 次 | 维护任务，人工可重跑 |
+| `WebhookQueue` | 3 | 4 次 | 外部 Webhook 服务不稳定 |
+
+### 5.2 三种重试分支的完整代码链路
+
+Runner 内部用 `tryCatch` 包装 `funcs.run()`，根据异常类型转换为三种结果类型，Dispatcher 再根据类型走三条不同的路径：
+
+```
+业务代码 (funcs.run)
+    │
+    ├─ 正常 return value
+    │     └─ runner.ts#L103 → { type: "success", value }
+    │           └─ dispatcher 分支: success (见 5.2.1)
+    │
+    ├─ throw new QueueRetryAfterError(msg, delayMs)
+    │     └─ runner.ts#L92-L97 → { type: "rate_limit", delayMs }
+    │           └─ dispatcher 分支: rate_limit (见 5.2.2)
+    │
+    └─ throw new Error(...) (包括 403/429/5xx 导致的 throw)
+          └─ runner.ts#L98-L101 → { type: "error", error: serializeError(e) }
+                └─ dispatcher 分支: error (见 5.2.3)
+```
+
+如果 Runner 服务本身不可用（RPC 连接失败），错误在 `tryCatch(runner.run(jobData))` 层被捕获，走 **RPC 错误分支**（见 5.2.4）。
+
+#### 5.2.1 成功分支: success → 退出循环
+
+[dispatcher.ts#L209-L222](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L209-L222):
+
+```
+流程顺序 (信号量一致性保证):
+1. logDebug("Dispatcher completed ...")
+2. runner.onCompleted({ job, result })   ← 先回调 (更新 DB 状态等)
+3. semaphore.release(leaseId)             ← 后释放信号量
+4. break;                                  ← 跳出 while 循环，任务结束
+```
+
+#### 5.2.2 限流不计数分支: rate_limit → 不消耗配额
+
+**触发条件**: 业务代码显式抛出 `QueueRetryAfterError`，由 [runner.ts#L92-L97](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/runner.ts#L92-L97) 转换为 `{ type: "rate_limit", delayMs }`。
+
+**典型场景**:
+- 域名级限流 [crawlerWorker.ts#L2153-L2201](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/workers/workers/crawlerWorker.ts#L2153-L2201): `CRAWLER_DOMAIN_RATE_LIMIT_WINDOW_MS` + `CRAWLER_DOMAIN_RATE_LIMIT_MAX_REQUESTS`，限流时 **+40% 抖动** (`delayMs *= 0.7 + 0.6 * Math.random()`) 防止惊群
+- 外部 API 429 响应（由业务代码显式 throw）
+
+**执行流程** [dispatcher.ts#L179-L187](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L179-L187):
+```
+1. semaphore.release(leaseId)              ← 先释放信号量让其他任务运行
+2. ctx.sleep(result.delayMs, "rate limit retry")  ← 精确睡眠调用方指定的时间
+3. continue;                                ← 回到 while 开头，runNumber 不变
+4. 不调用 onError，不产生 failed 指标
+```
+
+**关键特性**: **不消耗 `numRetries` 配额**，理论上可无限次重试，直到条件满足。
+
+#### 5.2.3 业务错误分支: error → 固定 1 秒延迟，消耗配额
+
+**触发条件**: Runner 执行业务逻辑时抛出普通错误（非 `QueueRetryAfterError`），由 [runner.ts#L98-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/runner.ts#L98-L101) 转换为 `{ type: "error" }`。
+
+**典型场景**:
+- 爬虫 HTTP 403/429/5xx 状态码（`shouldRetryCrawlStatusCode` 判定后 `throw Error`）
+- 数据库事务失败、并发冲突
+- 子进程解析异常（OOM、超时、JSON 解析失败）
+- Playwright 浏览器自动化超时
+
+**执行流程** [dispatcher.ts#L189-L207](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L189-L207):
+```
+1. runner.onError({ job, error })          ← 先调用错误回调 (更新 crawlStatus, 指标 +1)
+2. semaphore.release(leaseId)              ← 再释放信号量
+3. ctx.sleep(1000, "error retry")          ← 固定 1000ms 延迟
+4. runNumber++                              ← 消耗重试配额
+5. continue;                                ← 回到 while 开头
+```
+
+#### 5.2.4 RPC 错误分支: 指数退避 + 全抖动，消耗配额
+
+**触发条件**: Dispatcher 调用 Runner 服务时 RPC 层失败（服务不可达、网络超时、Restate 内部状态异常），即 [dispatcher.ts#L138-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L138-L175) 的 `res.error` 分支。
+
+**典型场景**:
+- Runner 服务进程重启/崩溃导致的连接重置
+- Restate 持久化状态机写盘失败
+- Kubernetes 滚动部署时的短暂不可达
+- 网络分区
+
+**执行流程**:
+```
+1. semaphore.release(leaseId)              ← 先释放信号量
+2. runner.onError({ job, error })          ← 调用错误回调
+3. 计算延迟 (指数退避 + 全抖动):
+   const baseMs = Math.min(5000 * 2 ** runNumber, 60000);
+   // runNumber=0 → 5s, 1→10s, 2→20s, 3→40s, 4+→60s 封顶
+   const delayMs = Math.floor(ctx.rand.random() * baseMs);
+4. ctx.sleep(delayMs, "rpc error retry")   ← 睡眠随机值
+5. runNumber++                              ← 消耗重试配额
+6. continue;                                ← 回到 while 开头
+```
+
+**全抖动 (Full Jitter) 原理**: `[0, baseMs)` 均匀随机，避免大量任务同时失败后在同一时刻再次重试（惊群效应）。
+
+### 5.3 可重试状态码判定
 
 [crawlerWorker.ts#L137-L142](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/workers/workers/crawlerWorker.ts#L137-L142):
 
 ```typescript
 function shouldRetryCrawlStatusCode(statusCode: number | null): boolean {
-  return statusCode === 403       // 可能是临时反爬封禁
+  return statusCode === 403       // 可能是临时反爬封禁 (CDN WAF 误封)
       || statusCode === 429       // Rate Limit
       || statusCode >= 500;       // 服务端错误 (500/502/503/504)
 }
 ```
 
-触发时: 如 `numRetriesLeft > 0`，`throw Error` 交由队列 Dispatcher 重试；**最后一次重试即使失败也继续执行** (降级处理已有部分内容)。
-
-### 5.2 队列级指数退避重试
-
-[queue-restate/dispatcher.ts#L15-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L15-L58) 由 Restate SDK 的持久化状态机驱动:
-
-| 队列 | 默认重试次数 | 初始间隔 | 最大间隔 |
-|------|-------------|---------|---------|
-| `LinkCrawlerQueue` | 5 | 5s | 1min |
-| `LowPriorityCrawlerQueue` | 5 | 5s | 1min |
-| `VideoWorkerQueue` | 5 | 5s | 1min |
-| `SearchIndexingQueue` | 5 | 5s | 1min |
-| `OpenAIQueue` | 3 | 5s | 1min |
-| `EmbeddingsQueue` | 3 | 5s | 1min |
-| `AssetPreprocessingQueue` | 2 | 5s | 1min |
-
-**指数退避 + 全抖动算法** [dispatcher.ts#L169-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/dispatcher.ts#L169-L173):
-```typescript
-const baseMs = Math.min(5000 * 2 ** runNumber, 60000); // 5s → 10s → 20s → 40s → 60s
-const delayMs = Math.floor(ctx.rand.random() * baseMs);   // [0, baseMs) 均匀随机
-```
-
-**Runner 层零重试**: [runner.ts#L53-L55](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/plugins/queue-restate/src/runner.ts#L53-L55) 显式设置 `maxAttempts: 1`，所有重试由 Dispatcher 集中管控，避免重复计数。
-
-### 5.3 Rate-Limit 不计数重试: QueueRetryAfterError
-
-[queueing.ts#L10-L18](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/shared/queueing.ts#L10-L18) 定义特殊异常类 `QueueRetryAfterError`：
-
-- **不消耗** `numRetries` 配额
-- **不触发**指数退避 (使用调用方指定的精确 `delayMs`)
-- 典型场景:
-  - 域名级限流 [crawlerWorker.ts#L2153-L2201](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/workers/workers/crawlerWorker.ts#L2153-L2201): `CRAWLER_DOMAIN_RATE_LIMIT_WINDOW_MS` + `CRAWLER_DOMAIN_RATE_LIMIT_MAX_REQUESTS`，限流时 **+40% 抖动** 防止惊群
-  - 外部 API 429 响应 (由业务代码显式 throw)
+触发时 `throw Error` 抛出，走 **5.2.3 业务错误重试** 分支。
 
 ### 5.4 永久失败状态机
 
-当 `numRetriesLeft == 0` 时，[crawlerWorker.ts#L410-L452](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/workers/workers/crawlerWorker.ts#L410-L452) 在 `onError` 回调中:
-1. `bookmarkLinks.crawlStatus` → `failure`
-2. 级联清空下游 pending 状态: `taggingStatus`/`summarizationStatus`/`embeddingStatus` → `null` (避免无限等待)
-3. Prometheus 指标: `worker_stats_counter{crawler,failed_permanent}` +1
+当 `runNumber > NUM_RETRIES` 且最后一次仍失败时，while 循环自然结束。[crawlerWorker.ts#L400-L452](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/workers/workers/crawlerWorker.ts#L400-L452) 在 `onError` 回调中，通过 `numRetriesLeft == 0` 判断是否为最后一次：
+
+```
+条件: job.numRetriesLeft == 0
+  │
+  ├─ bookmarkLinks.crawlStatus → "failure"
+  ├─ bookmarks.taggingStatus → null (清空 pending，避免无限等待)
+  ├─ bookmarks.summarizationStatus → null
+  ├─ bookmarks.embeddingStatus → null
+  └─ Prometheus: worker_stats_counter{crawler,failed_permanent} +1
+```
 
 ---
 
