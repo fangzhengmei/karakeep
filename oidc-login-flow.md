@@ -117,35 +117,46 @@ Provider 回调
   │
   ├─ 1. 校验 state / PKCE
   ├─ 2. 用 code 交换 access_token + id_token
-  ├─ 3. 调用 provider.profile() 构造用户对象（内存）
+  ├─ 3. 调用 provider.profile() 构造内存 user 对象
   │
   ├─ 4. 调用 callbacks.signIn()  ← 应用层拦截点
+  │     │
+  │     ├─ 4a. 按 email 查询本地 users 表（应用层主动查，代码 L196-L199）
+  │     ├─ 4b. 禁用注册检查、邮箱验证检查等
   │     ├─ 抛错 / return false → 终止，重定向到 error 页
   │     └─ return true → 继续
   │
-  ├─ 5. Adapter 账号查找与绑定 ← NextAuth 内部逻辑
+  ├─ 5. Adapter 账号查找与绑定 ← NextAuth 内部逻辑，signIn 通过后才执行
   │     │
   │     ├─ 5a. getUserByAccount(provider, providerAccountId)
-  │     │    ├─ 找到账号 → 拿到对应 user → 跳到步骤 6
+  │     │    │   查 accounts 表复合主键，确认外部账号是否已绑定
+  │     │    ├─ 找到账号 → 拿到关联的本地 user → 跳到步骤 6
   │     │    └─ 未找到账号 → 新外部账号，继续 5b
   │     │
   │     └─ 5b. 新外部账号处理
   │          │
   │          ├─ [分支 A] allowDangerousEmailAccountLinking = true
+  │          │    │   （NextAuth 内部再查一次 users 表，应用层不知情）
   │          │    ├─ getUserByEmail(email)
   │          │    │    ├─ 找到本地用户 → linkAccount() 绑定
   │          │    │    └─ 未找到 → createUser() + linkAccount()
   │          │
   │          └─ [分支 B] allowDangerousEmailAccountLinking = false (默认)
+  │               │   （NextAuth 不会按 email 查，直接创建新用户）
   │               └─ createUser() + linkAccount()
-  │                    └─ email 唯一约束冲突 → 失败
+  │                    └─ email 唯一约束冲突 → OAuthAccountNotLinked
   │
   ├─ 6. 调用 jwt 回调（JWT 策略）
   ├─ 7. 调用 session 回调
   └─ 8. Set-Cookie + 重定向到 callbackUrl
 ```
 
-**关键理解：** `signIn` 回调发生在 Adapter 账号查找/创建**之前**。它的作用是让应用层决定"这个用户能不能登录"，而账号绑定的具体逻辑（是否按 email 关联）由 NextAuth 在 signIn 通过之后执行。
+**关键理解（按代码事实）：**
+- 两次 users 表查询发生在**不同位置**：
+  1. `signIn` 回调中（L196-L199）：**应用层主动查询**，用于禁用注册判断、登录日志记录
+  2. NextAuth 内部（仅当 `allowDangerousEmailAccountLinking=true` 时）：框架内部调用 `getUserByEmail`，用于自动按邮箱关联
+- `signIn` 回调发生在 Adapter 账号查找/创建**之前**。它只决定"这个 email 能不能登录"，不检查"这个外部账号是否已绑定"
+- `allowDangerousEmailAccountLinking=false`（默认）时，NextAuth**绝不**按 email 查找已有用户，直接尝试创建新用户，这是触发账号未关联错误的根源
 
 ### 3.2 signIn 回调详解
 
