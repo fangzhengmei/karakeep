@@ -444,6 +444,342 @@ DELETE FROM apiKeys WHERE id = ? AND userId = ?
 对应设备下次请求时 authenticateApiKey 失败 → 设备显示"未登录"
 ```
 
+### 5.5 远程撤销实际效果差异 — Web JWT vs API Key
+
+项目对两种凭证的远程吊销能力存在本质差异，这是理解设备会话管理边界的核心。
+
+#### 5.5.1 撤销操作矩阵
+
+| 操作 | 发起方 | 目标凭证 | 是否需要原凭证 | 服务端是否生效 | 客户端是否感知 |
+|-----|--------|---------|--------------|--------------|--------------|
+| Web 本地 Sign Out | Web 浏览器自身 | 自身 JWT Cookie | 否（用户交互即可） | **否**（仅清除本地 Cookie） | 立即可感知（跳转首页） |
+| 删除用户（管理员或自删） | 管理员 / 用户本人 | 该用户所有 JWT + 所有 API Key | 是（管理员会话 / 本人密码） | **是** | JWT：下一次 whoami/settings 查询时被 ValidAccountCheck 拦截；API Key：下次请求立即 401 |
+| 撤销某个 API Key | Web 会话（用户本人） | 指定 API Key | 是（Web JWT 会话） | **是**（DELETE 行） | 下次请求立即 401 → 设备显示未登录 |
+| 修改用户密码 | Web 会话（用户本人） | — | 是（旧密码） | **否**（不影响已签发 JWT，不影响已有 API Key） | 无感知（当前所有会话继续有效） |
+| API Key 重新生成（regenerate） | Web 会话（用户本人） | 指定 API Key | 是（Web JWT 会话） | **是**（UPDATE keyHash） | 旧 Key 下次请求立即 401 |
+
+#### 5.5.2 API Key 撤销的即时失效 — 代码级证据
+
+API Key 的撤销是**同步且即时**的，整条链路没有任何缓存或延迟窗口。以下按代码执行顺序证明：
+
+**步骤 1：撤销操作直接删除数据库行**
+
+[apiKeys.ts](./packages/trpc/routers/apiKeys.ts#L89-L101) 中 `revoke` 过程：
+
+```typescript
+revoke: sessionProcedure
+  .input(z.object({ id: z.string() }))
+  .mutation(async ({ input, ctx }) => {
+    const res = await ctx.db
+      .delete(apiKeys)
+      .where(and(eq(apiKeys.id, input.id), eq(apiKeys.userId, ctx.user.id)));
+    if (res.changes == 0) {
+      throw new TRPCError({ code: "NOT_FOUND" });
+    }
+  }),
+```
+
+关键事实：
+- 使用 `sessionProcedure` 确保只能从 Web 会话发起（防止 API Key 互相撤销）
+- 直接执行 `DELETE FROM apiKeys WHERE id = ? AND userId = ?`
+- 这是一个同步的 Drizzle ORM 操作，事务提交后数据库中立即不存在该行
+
+**步骤 2：后续请求的认证直接查数据库**
+
+被撤销的设备下次发起请求时，经过 [client.ts](./apps/web/server/api/client.ts#L10-L38) 的 `createContextFromRequest()`：
+
+```typescript
+const authorizationHeader = req.headers.get("Authorization");
+if (authorizationHeader && authorizationHeader.startsWith("Bearer ")) {
+  const token = authorizationHeader.split(" ")[1];
+  try {
+    const authResult = await authenticateApiKey(token, db);
+    // ... 返回认证结果
+  } catch {
+    // Fallthrough 到 Cookie 认证
+  }
+}
+```
+
+调用 [auth.ts](./packages/trpc/auth.ts#L107-L160) 中的 `authenticateApiKey()`：
+
+```typescript
+export async function authenticateApiKey(key: string, database) {
+  const { version, keyId, keySecret } = parseApiKey(key);
+  // ↓ 每次认证都直接查数据库，无缓存
+  const apiKey = await database.query.apiKeys.findFirst({
+    where: (k, { eq }) => eq(k.keyId, keyId),
+    with: { user: true },
+  });
+
+  if (!apiKey) {
+    throw new Error("API key not found");  // ← 撤销后立即走这里
+  }
+  // ... 哈希校验
+}
+```
+
+关键事实：
+- `findFirst` 直接查询 SQLite/PostgreSQL，无任何内存缓存
+- 撤销操作（DELETE）和认证查询（SELECT）都走同一个数据库实例
+- 没有"软删除"、"标记失效"等延迟机制——行不存在就是不存在
+
+**步骤 3：认证失败后的 fallthrough 行为**
+
+`authenticateApiKey` 抛出异常后，`createContextFromRequest` 的 catch 块执行 fallthrough：
+
+```typescript
+catch {
+  // Fallthrough to cookie-based auth
+}
+return createContext(db, ip);
+```
+
+`createContext()` 从 Cookie 中读取 JWT。对于扩展/移动设备，请求中不携带 Cookie（跨域），所以 `ctx.user` 为 null。
+
+然后 tRPC 的 [index.ts](./packages/trpc/index.ts#L140-L152) 中 `authedProcedure` 的 `isAuthed` 中间件：
+
+```typescript
+.use(function isAuthed(opts) {
+  if (!opts.ctx.user?.id) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+  return opts.next({ ctx: { user } });
+});
+```
+
+最终返回 HTTP 401。设备侧收到 401 后，通常会清理本地认证状态并跳转登录页。
+
+> **结论**：API Key 从"点击撤销"到"设备请求被拒绝"之间的延迟 = 网络往返时间 + 数据库查询时间（通常 < 50ms）。没有任何异步窗口或缓存不一致。
+
+#### 5.5.3 JWT 撤销的异步延迟窗口 — 代码级证据
+
+**Web JWT 无法被服务端即时吊销**。如果 JWT 被窃取，攻击者在 JWT 自然过期前可以持续使用。
+
+**证据 1：JWT 策略配置 — 无服务端会话表**
+
+[auth.ts](./apps/web/server/auth.ts#L181-L183) 中 NextAuth 明确使用 JWT 策略：
+
+```typescript
+session: {
+  strategy: "jwt",
+},
+```
+
+这意味着：
+- 不使用数据库 `sessions` 表存储会话
+- 所有用户信息编码在 JWT payload 中，由 NextAuth 签名
+- 认证时只验证签名，不查数据库（除非业务逻辑主动查）
+
+虽然 [schema.ts](./packages/db/schema.ts#L127-L136) 中存在 `sessions` 表（DrizzleAdapter 要求），但由于 strategy 是 jwt，该表在 Web 端认证中不会被读写。
+
+**证据 2：Context 构造不查用户表**
+
+[client.ts](./apps/web/server/api/client.ts#L41-L64) 的 `createContext()` 直接从 NextAuth 取 session：
+
+```typescript
+export const createContext = async (database?, ip?) => {
+  const session = await getServerAuthSession();  // ← 仅解码 JWT，不查 DB
+  return {
+    user: session?.user ?? null,
+    auth: session?.user ? { type: "session" } : null,
+    db,
+    req: { ip },
+  };
+};
+```
+
+`getServerAuthSession()` 由 NextAuth 提供，只做 JWT 签名验证和解码，不访问数据库。
+
+**证据 3：authedProcedure 只检查 ctx.user.id 是否存在**
+
+[index.ts](./packages/trpc/index.ts#L140-L152)：
+
+```typescript
+.use(function isAuthed(opts) {
+  const user = opts.ctx.user;
+  if (!user?.id) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+  return opts.next({ ctx: { user } });
+});
+```
+
+只要 JWT 解码出用户 ID，认证就通过。**不验证用户在数据库中是否仍然存在**。
+
+**证据 4：三层防御的延迟性**
+
+项目通过三层防御缓解 JWT 不可吊销的问题，但每一层都有延迟：
+
+```
+攻击者持被窃取的 JWT 发起请求
+    │
+    ├─ [第一层] tRPC authedProcedure
+    │     仅检查 ctx.user?.id 存在 → JWT 解码通过 → ✅ 放行
+    │     [代码位置：packages/trpc/index.ts#L140-L152]
+    │
+    ├─ [第二层] Server Component 布局二次校验
+    │     dashboard/layout.tsx、reader/layout.tsx、settings/layout.tsx
+    │     调用 api.users.settings() → User.fromCtx(ctx) 查数据库
+    │     若用户已被删除 → NOT_FOUND → redirect("/logout")
+    │     [代码位置：apps/web/app/dashboard/layout.tsx#L32-L52]
+    │     [代码位置：packages/trpc/models/users.ts — User.fromCtx]
+    │
+    └─ [第三层] 前端 ValidAccountCheck
+          useQuery(api.users.whoami) → whoami 使用 usersProcedure
+          User.fromCtx(ctx) 查数据库 users 表
+          若用户不存在 → NOT_FOUND → whoami 抛出 UNAUTHORIZED
+          → ValidAccountCheck 捕获 → router.push("/logout")
+          [代码位置：apps/web/components/utils/ValidAccountCheck.tsx#L13-L33]
+```
+
+> **关键边界**：第二、三层防御都依赖 `User.fromCtx(ctx)` 查询数据库。
+> - 如果用户只是执行了"本地 Sign Out"（清除了本地 Cookie，但数据库中 users 行仍存在），则第二、三层防御都不会触发——被窃取的 JWT 仍可正常使用直到过期。
+> - 只有当用户被**删除**（deleteAccount）或在数据库层面被**禁用**（当前无禁用字段）时，异步撤销才会生效。
+>
+> 这就是 `sessions` 表虽然存在但未被使用的安全代价：没有服务端会话白名单/黑名单机制。
+
+**`User.fromCtx` 的关键作用**（[users.ts](./packages/trpc/models/users.ts)）：
+
+```typescript
+static async fromCtx(ctx) {
+  const user = await ctx.db.query.users.findFirst({
+    where: (u, { eq }) => eq(u.id, ctx.user.id),
+  });
+  if (!user) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+  return new User(ctx, user);
+}
+```
+
+所有通过 `usersProcedure` 的端点（`whoami`、`settings`、`changePassword`、`deleteAccount` 等）都会走此方法。它是 JWT 与数据库状态的最终一致性校验点。
+
+#### 5.5.4 改密不吊销会话 — 代码级证据
+
+修改密码后，**所有已签发的 JWT 和所有 API Key 继续有效**。
+
+**证据 1：changePassword 只更新 users 表**
+
+[users.ts](./packages/trpc/models/users.ts#L440-L465) 中 `changePassword` 方法：
+
+```typescript
+async changePassword(currentPassword: string, newPassword: string) {
+  invariant(this.ctx.user.email, "A user always has an email specified");
+
+  // 第一步：验证旧密码
+  try {
+    const user = await validatePassword(
+      this.ctx.user.email,
+      currentPassword,
+      this.ctx.db,
+    );
+    invariant(user.id === this.ctx.user.id);
+  } catch {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+
+  // 第二步：生成新盐 + 新哈希
+  const newSalt = generatePasswordSalt();
+  await this.ctx.db
+    .update(users)
+    .set({
+      password: await hashPassword(newPassword, newSalt),
+      salt: newSalt,
+    })
+    .where(eq(users.id, this.user.id));
+
+  // 注意：这里没有任何以下操作
+  //  - 没有删除 apiKeys 表的记录
+  //  - 没有使 sessions 表失效（本来也没用）
+  //  - 没有 JWT 版本号/盐值更新
+}
+```
+
+**证据 2：JWT 验证不依赖密码**
+
+JWT 的签名密钥是 `NEXTAUTH_SECRET`（环境变量），与用户密码无关。密码修改后，已签发的 JWT 仍然可以正常验证通过。
+
+验证链路：
+1. 请求到达 → `getServerAuthSession()` → JWT 解码 → 得到 user.id
+2. `authedProcedure` 检查 user.id 存在 → 通过
+3. 不涉及密码字段
+
+**证据 3：API Key 认证也不依赖密码**
+
+[auth.ts](./packages/trpc/auth.ts#L107-L160) 中 `authenticateApiKey()` 通过 keyId 和 keyHash 校验，与 users 表的 password 字段完全无关：
+
+```typescript
+const apiKey = await database.query.apiKeys.findFirst({
+  where: (k, { eq }) => eq(k.keyId, keyId),
+  with: { user: true },  // ← user 只是顺便查出来填充 ctx
+});
+// 只校验 keyHash，不校验 user.password
+```
+
+因此，修改密码不会导致任何 API Key 失效。
+
+> **设计权衡**：改密不吊销现有会话是便利性优先的选择（用户不需要在所有设备上重新登录）。但这意味着：如果用户因为"怀疑凭证泄露"而改密，已经获得了 JWT 或 API Key 的攻击者仍然可以继续访问。用户必须**手动**去 API Key 列表逐个撤销可疑的设备 Key。
+
+#### 5.5.5 三者集中对照 — 代码证据 / 触发条件 / 安全影响
+
+将 API Key 撤销（即时失效）、JWT 吊销（延迟窗口）、改密不吊销会话三者从代码角度并列对比：
+
+| 对比维度 | API Key 撤销（即时失效） | JWT 吊销（延迟窗口） | 改密不吊销会话 |
+|---------|------------------------|---------------------|---------------|
+| **核心代码位置** | [apiKeys.ts](./packages/trpc/routers/apiKeys.ts#L89-L101) `revoke` 过程 | [auth.ts](./apps/web/server/auth.ts#L181-L183) `session.strategy: "jwt"` | [users.ts](./packages/trpc/models/users.ts#L440-L465) `changePassword` 方法 |
+| **失效判断点** | `authenticateApiKey()` 中 `db.query.apiKeys.findFirst()` | `getServerAuthSession()` 中 JWT 签名验证 | 不涉及失效判断（持续有效） |
+| **判断代码** | `if (!apiKey) throw new Error("API key not found")` | `if (!user?.id) throw UNAUTHORIZED`（仅检查 ID 是否解码出来） | 无（密码字段与会话验证完全解耦） |
+| **数据库操作** | `DELETE FROM apiKeys WHERE id = ? AND userId = ?` | 无（不查数据库） | `UPDATE users SET password=?, salt=? WHERE id=?` |
+| **触发条件** | 用户在设置页点击删除 / 调用 `apiKeys.revoke` | 用户被删除（`deleteAccount` 或管理员删除） / 用户被禁用（当前无禁用字段） | 用户执行 `changePassword` |
+| **生效时机** | **立即**（DELETE 提交后，下一个请求直接查不到） | **延迟**（依赖业务代码调用 `User.fromCtx()` 查 DB 时才发现用户不存在） | **永不失效**（已签发凭证与密码无关） |
+| **延迟窗口** | 0ms（网络 + DB 查询时间） | 最长 = JWT 自然过期时间（NextAuth 默认 30 天） | 永久（直到 JWT/Key 自身过期或被主动撤销） |
+| **影响范围** | 仅被撤销的单个 API Key | 该用户所有已签发的 JWT | 无影响（所有 JWT 和 API Key 继续有效） |
+| **攻击者视角** | 拿到 Key → 被撤销 → 立即失效 → 必须重新获取 | 拿到 JWT → 用户改密 → 仍然有效 → 继续使用直到过期 | 拿到 JWT/Key → 用户改密 → 完全不受影响 → 持续可用 |
+| **缓解措施** | 本身就是强控制（即时失效） | 1. ValidAccountCheck 前端探针<br>2. Server Component 布局二次校验<br>3. 敏感操作使用 `usersProcedure`（走 `User.fromCtx`） | 无内置缓解<br>→ 需用户手动去 API Key 列表逐个撤销 |
+| **用户感知** | 扩展/移动端下次操作立即 401 → 跳转登录页 | 仅在访问 dashboard/reader/settings 等布局时跳 /logout<br>纯 tRPC 接口调用可能不触发 | 完全无感知（所有设备继续正常使用） |
+| **对应凭证类型** | API Key（设备凭证） | Web JWT Cookie（浏览器会话） | 两者都不受影响 |
+
+**三条代码路径的对照图：**
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                        凭证验证时的代码路径对比                                 │
+├──────────────────────────┬──────────────────────────┬───────────────────────┤
+│   API Key 验证            │   JWT 验证                │   密码修改            │
+│  [auth.ts:107-160]       │  [client.ts:41-64]       │  [users.ts:440-465]   │
+├──────────────────────────┼──────────────────────────┼───────────────────────┤
+│  1. parseApiKey(key)     │  1. getServerAuthSession │  1. validatePassword  │
+│     解析前缀+keyId+secret│     解码 JWT (不查DB)    │     验证旧密码       │
+│                          │                          │                       │
+│  2. db.query.apiKeys.    │  2. ctx.user = token.user│  2. generatePasswordSalt│
+│     findFirst(keyId)     │     (直接从JWT payload拿) │    生成新盐           │
+│     ────────查DB──────── │                          │                       │
+│                          │  3. authedProcedure 检查  │  3. hashPassword      │
+│  3. if (!apiKey)         │     user.id 是否存在      │     bcrypt 哈希       │
+│     throw "not found"    │     (不查DB，只看解码结果)│                       │
+│     ← 撤销后立即走这里    │                          │  4. UPDATE users SET   │
+│                          │                          │     password + salt    │
+│  4. bcrypt/sha256 校验    │  ✅ 只要 JWT 签名有效     │    ← 只改 users 表    │
+│     secret vs keyHash    │     就一直有效            │    不碰 apiKeys 表    │
+│                          │                          │    不碰 sessions 表   │
+├──────────────────────────┼──────────────────────────┼───────────────────────┤
+│  结论：每次请求都查 DB    │  结论：只查 JWT 签名       │  结论：改密与会话完全  │
+│        行不在 = 失效      │        不查数据库          │        解耦，互不影响 │
+└──────────────────────────┴──────────────────────────┴───────────────────────┘
+```
+
+**安全影响的层级排序（从安全到不安全）：**
+
+1. **API Key 撤销** ⭐⭐⭐⭐⭐ — 即时、确定、无延迟。删除即失效，攻击者拿不到新请求的机会。
+2. **JWT 失效（用户被删除）** ⭐⭐ — 依赖业务代码是否调用 `User.fromCtx`。访问 dashboard 等完整页面会被 ValidAccountCheck 拦下，但纯 tRPC 调用（如果不走 `usersProcedure`）可能一直能用。
+3. **改密不吊销** ⭐ — 完全没有失效机制。攻击者拿到凭证后，即使用户改密，只要不主动撤销 Key，凭证就一直有效到自然过期。
+
+> **代码证据的核心差异**：三者的根本区别在于**认证判断是否查数据库**。
+> - API Key：每次认证都 `findFirst` 查 `apiKeys` 表 → 撤销即时生效
+> - JWT：认证只验证签名 → `ctx.user` 来自 JWT payload → 不查 DB → 无法即时吊销
+> - 改密：只更新 `users.password` 字段 → JWT 和 API Key 的验证逻辑都不读这个字段 → 完全不影响
+
 ---
 
 ## 六、安全提示与账户有效性校验
