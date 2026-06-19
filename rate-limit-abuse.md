@@ -6,7 +6,7 @@
 
 ## 1. 整体架构概览
 
-Karakeep 的防滥用体系分为五层：
+Karakeep 的防滥用体系分为七层：
 
 | 层级 | 作用 | 核心模块 |
 |------|------|----------|
@@ -14,9 +14,11 @@ Karakeep 的防滥用体系分为五层：
 | 限流插件层 | 提供可插拔的限流存储后端（内存/Redis） | `PluginManager` + RateLimit 插件 |
 | 全局限流中间件 | 在 tRPC/Hono 入口对所有请求做基础限流 | `publicProcedure` / `authedProcedure` |
 | 接口级限流 | 对敏感接口做更严格的独立限流 | 各 router 中的 `createRateLimitMiddleware` |
+| 降级限流 | 高负载时将任务降级到低优先级队列 | `shouldUseLowPriorityQueues` + 双层限流 |
 | 业务配额层 | 对用户资源（书签数、存储空间、爬取能力）做配额限制 | `QuotaService` + 数据库字段 |
 | 爬虫层限流 | 对外部网站域名的爬取频率做限制 | `checkDomainRateLimit` |
 | 人机验证层 | Cloudflare Turnstile CAPTCHA | `verifyTurnstileToken` |
+| 日志去重层 | 防止事件日志被洪水般的请求淹没 | `emitRateLimitedEvent` |
 
 ---
 
@@ -277,41 +279,128 @@ const userSegment = c.var.ctx.user?.id ? `:user:${c.var.ctx.user.id}` : "";
 const key = `${ip}${userSegment}:${config.name}`;
 ```
 
-Key 策略说明：
+#### Key 示例汇总
 
-| 场景 | Key 示例 |
-|------|----------|
+| 场景 | Key 格式示例 |
+|------|-------------|
 | 未登录用户访问 tRPC | `192.168.1.1:bookmarks.list` |
-| 已登录用户（ID 为 u123）访问 tRPC | `192.168.1.1:user:u123:bookmarks.list` |
-| Hono API 资产上传 | `192.168.1.1:user:u123:assets.upload` |
+| 已登录用户（u123）访问 tRPC | `192.168.1.1:user:u123:bookmarks.createBookmark` |
+| Hono API 资产上传（已登录） | `192.168.1.1:user:u123:assets.upload` |
 
-**关键特性**：
-- 已登录用户的限流 Key 绑定 `user.id`，**不受 IP 变化影响**（但仍带 IP 前缀）
-- IP 为 `null` 时（无法识别），限流中间件直接跳过（`return next()`）
+### 4.4 IP 变化对已登录用户限流的影响
+
+**核心结论：IP 变化会导致已登录用户的限流 Key 变化，相当于重置限流计数。**
+
+由于 Key 格式为 `${ip}:user:${userId}:${path}`，IP 位于 Key 的最前面，因此：
+
+| 场景 | 限流行为 |
+|------|----------|
+| 用户从 WiFi 切换到 4G | IP 变化 → Key 变化 → 限流计数重置，用户可继续请求 |
+| 同一账户在多个设备同时使用 | 各设备独立计数，不累加（但分别受全局限流约束） |
+| 同一 NAT 下多个用户使用同一 IP | 每人独立计数（因 user.id 不同），互不影响 |
+| 未登录用户共享同一 IP | 共享配额（Key 中无 user.id） |
+
+**设计意图分析**：
+- 这种设计介于"纯 IP 限流"和"纯用户限流"之间
+- 好处：同一 IP 下不同用户互不干扰；用户换 IP 后不会被之前的恶意行为牵连
+- 坏处：攻击者可通过频繁更换 IP（如代理池）绕过已登录用户的接口级限流
+- 注意：全局 `globalAuthed` 限流（3000次/分钟）同样受 IP 变化影响
+
+**特殊例外**：书签高容量检测限流（`shouldUseLowPriorityQueues`）的 Key 仅为 `user.id`，不受 IP 变化影响，详见第 5.2 节。
+
+### 4.5 IP 为 null 时的处理
+
+IP 识别失败时（`ip === null`），所有限流中间件直接跳过（`return opts.next()` / `return next()`），请求不受限制。
 
 ---
 
 ## 5. 各接口级独立限流
 
-除了全局默认限流，敏感接口还叠加了更严格的独立限流：
+除了全局默认限流，敏感接口还叠加了更严格的独立限流。所有接口级限流均使用相同的 Key 生成策略（IP + userID + 接口名）。
 
-### 5.1 tRPC Router 层面限流
+### 5.1 tRPC Router 层面限流完整清单
 
-| 接口 | 配置名 | 窗口 | 最大请求 | 文件 |
-|------|--------|------|----------|------|
-| 用户注册 `users.create` | `users.create` | 60秒 | 3次 | [routers/users.ts#L34-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L34-L38) |
-| 修改密码 `users.changePassword` | `users.changePassword` | 15分钟 | 5次 | [routers/users.ts#L120-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L120-L124) |
-| 邮箱验证 `users.verifyEmail` | `users.verifyEmail` | 5分钟 | 10次 | [routers/users.ts#L220-L224](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L220-L224) |
-| 重发验证邮件 `users.resendVerificationEmail` | `users.resendVerificationEmail` | 5分钟 | 3次 | [routers/users.ts#L238-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L238-L242) |
-| 忘记密码 `users.forgotPassword` | `users.forgotPassword` | 15分钟 | 3次 | [routers/users.ts#L261-L265](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L261-L265) |
+#### 用户与认证相关
 
-### 5.2 Hono REST API 层面限流
+| 接口 | 配置名 | 窗口 | 最大请求 | 过程类型 | 文件 |
+|------|--------|------|----------|----------|------|
+| 用户注册 `users.create` | `users.create` | 60秒 | 3次 | publicProcedure | [routers/users.ts#L34-L38](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L34-L38) |
+| 修改密码 `users.changePassword` | `users.changePassword` | 15分钟 | 5次 | usersProcedure | [routers/users.ts#L120-L124](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L120-L124) |
+| 邮箱验证 `users.verifyEmail` | `users.verifyEmail` | 5分钟 | 10次 | publicProcedure | [routers/users.ts#L220-L224](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L220-L224) |
+| 重发验证邮件 `users.resendVerificationEmail` | `users.resendVerificationEmail` | 5分钟 | 3次 | publicProcedure | [routers/users.ts#L238-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L238-L242) |
+| 忘记密码 `users.forgotPassword` | `users.forgotPassword` | 15分钟 | 3次 | publicProcedure | [routers/users.ts#L261-L265](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L261-L265) |
+| 重置密码 `users.resetPassword` | `users.resetPassword` | 5分钟 | 10次 | publicProcedure | [routers/users.ts#L278-L282](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/users.ts#L278-L282) |
 
-| 接口 | 配置名 | 窗口 | 最大请求 | 文件 |
-|------|--------|------|----------|------|
-| 资产上传 `POST /api/assets` | `assets.upload` | 60秒 | 30次 | [routes/assets.ts#L18-L22](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/api/routes/assets.ts#L18-L22) |
+#### 书签相关
 
-### 5.3 限流执行流程
+| 接口 | 配置名 | 窗口 | 最大请求 | 过程类型 | 文件 |
+|------|--------|------|----------|----------|------|
+| 创建书签 `bookmarks.createBookmark` | `bookmarks.createBookmark` | 60秒 | 30次 | bookmarksProcedure | [routers/bookmarks.ts#L187-L191](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/bookmarks.ts#L187-L191) |
+| 重爬书签 `bookmarks.recrawlBookmark` | `bookmarks.recrawlBookmark` | 30分钟 | 200次 | bookmarksProcedure | [routers/bookmarks.ts#L714-L718](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/bookmarks.ts#L714-L718) |
+| 摘要书签 `bookmarks.summarizeBookmark` | `bookmarks.summarizeBookmark` | 30分钟 | 100次 | bookmarksProcedure | [routers/bookmarks.ts#L1225-L1229](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/bookmarks.ts#L1225-L1229) |
+
+#### API Key 相关
+
+| 接口 | 配置名 | 窗口 | 最大请求 | 过程类型 | 用途 | 文件 |
+|------|--------|------|----------|----------|------|------|
+| API Key 交换 `apiKeys.exchange` | `apiKey.exchange` | 15分钟 | 10次 | publicProcedure | 浏览器扩展用用户名密码换 API Key | [routers/apiKeys.ts#L136-L140](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/apiKeys.ts#L136-L140) |
+| API Key 验证 `apiKeys.validate` | `apiKey.validate` | 60秒 | 30次 | publicProcedure | 验证 API Key 是否有效 | [routers/apiKeys.ts#L197-L201](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/apiKeys.ts#L197-L201) |
+
+#### 备份相关
+
+| 接口 | 配置名 | 窗口 | 最大请求 | 过程类型 | 文件 |
+|------|--------|------|----------|----------|------|
+| 触发备份 `backups.triggerBackup` | `backups.triggerBackup` | 1小时 | 5次 | backupsProcedure | [routers/backups.ts#L47-L51](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/backups.ts#L47-L51) |
+
+#### 邀请相关（admin 邀请新用户）
+
+| 接口 | 配置名 | 窗口 | 最大请求 | 过程类型 | 文件 |
+|------|--------|------|----------|----------|------|
+| 获取邀请信息 `invites.get` | `invites.get` | 60秒 | 10次 | publicProcedure | [routers/invites.ts#L118-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/invites.ts#L118-L122) |
+| 接受邀请 `invites.accept` | `invites.accept` | 60秒 | 10次 | publicProcedure | [routers/invites.ts#L155-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/invites.ts#L155-L159) |
+
+#### 协作者相关（列表共享）
+
+| 接口 | 配置名 | 窗口 | 最大请求 | 过程类型 | 文件 |
+|------|--------|------|----------|----------|------|
+| 添加协作者 `lists.addCollaborator` | `lists.addCollaborator` | 15分钟 | 20次 | listsProcedure | [routers/lists.ts#L264-L268](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/lists.ts#L264-L268) |
+
+### 5.2 书签创建的双层限流与队列降级
+
+书签创建接口使用了**双层限流**设计，第一层硬拒绝，第二层软降级：
+
+**文件**: [packages/trpc/routers/bookmarks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/routers/bookmarks.ts#L154-L182)
+
+```
+第一层：createRateLimitMiddleware
+  配置名: bookmarks.createBookmark
+  窗口: 60秒
+  上限: 30次
+  Key: IP + userID + path
+  超限行为: 直接返回 429 TOO_MANY_REQUESTS
+
+         ↓ （通过后）
+
+第二层：shouldUseLowPriorityQueues（高容量检测）
+  配置名: bookmarks.createBookmark.highVolume
+  窗口: 5分钟
+  上限: 30次
+  Key: 仅 user.id（不受 IP 影响）
+  超限行为: 不拒绝，而是将爬虫任务发到低优先级队列
+```
+
+第二层限流 Key **仅使用 `user.id`**，不包含 IP，因此：
+- 用户换 IP 无法绕过此限制
+- 用于检测用户是否在短时间内大量创建书签
+- 触发后仅降级到低优先级队列，不阻塞用户使用
+
+### 5.3 Hono REST API 层面限流
+
+| 接口 | 配置名 | 窗口 | 最大请求 | 认证方式 | 文件 |
+|------|--------|------|----------|----------|------|
+| 资产上传 `POST /api/assets` | `assets.upload` | 60秒 | 30次 | API Key + Scope | [routes/assets.ts#L18-L22](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/api/routes/assets.ts#L18-L22) |
+
+### 5.4 限流执行流程
 
 tRPC 限流中间件流程（[packages/trpc/lib/rateLimit.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L12-L51)）：
 
@@ -334,11 +423,39 @@ tRPC 限流中间件流程（[packages/trpc/lib/rateLimit.ts](file:///d:/fz/0601
   │                    HTTP 429
 ```
 
+**注意**：全局限流 + 接口级限流是**独立计数**的，两者都通过才能执行。即一个请求会消耗两个限流配额。
+
 ---
 
-## 6. 用户配额系统（业务级防滥用）
+## 6. 事件日志去重限流
 
-### 6.1 配额类型与数据库字段
+除了请求限流，项目还使用限流机制对事件日志做去重，防止日志洪水。
+
+**文件**: [packages/trpc/lib/rateLimitedEvent.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimitedEvent.ts#L10-L40)
+
+```typescript
+export function emitRateLimitedEvent<F extends EventLogType>(
+  eventName: F,
+  dedupKey: string,    // 去重 Key
+  windowMs: number,    // 时间窗口
+  fields: EventFields<F>,
+): void {
+  // 使用限流客户端检查：窗口内最多 1 次
+  // 未超限则记录日志，超限则静默丢弃
+  // 异步执行，永不阻塞请求
+}
+```
+
+特点：
+- 使用限流插件的 `maxRequests: 1` 实现"窗口内只记一次"的去重效果
+- 异步 fire-and-forget，失败不影响请求
+- 用途：防止同一类错误/事件在短时间内重复刷屏
+
+---
+
+## 7. 用户配额系统（业务级防滥用）
+
+### 7.1 配额类型与数据库字段
 
 **文件**: [packages/db/schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/db/schema.ts#L45-L50)
 
@@ -349,7 +466,7 @@ storageQuota: integer("storageQuota"),             // 存储空间上限字节 (
 browserCrawlingEnabled: integer("browserCrawlingEnabled", { mode: "boolean" }),  // 浏览器爬取开关
 ```
 
-### 6.2 环境变量默认配额
+### 7.2 环境变量默认配额
 
 **文件**: [packages/shared/config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared/config.ts#L194-L199)
 
@@ -364,7 +481,7 @@ PAID_BROWSER_CRAWLING_ENABLED: optionalStringBool(),
 
 通过 Stripe 订阅区分免费/付费用户，具体分配逻辑在 `subscriptions` router。
 
-### 6.3 QuotaService 实现
+### 7.3 QuotaService 实现
 
 **文件**: [packages/shared-server/src/services/quotaService.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared-server/src/services/quotaService.ts#L1-L96)
 
@@ -404,7 +521,7 @@ export class QuotaApproved {
 
 这是一个防 TOCTOU（Time-of-check to time-of-use）攻击的设计：资产保存函数 `saveAsset` 必须接收 `QuotaApproved` token 才执行写入，防止检查通过后、写入前配额被并发耗尽。
 
-### 6.4 配额检查的应用场景
+### 7.4 配额检查的应用场景
 
 | 场景 | 检查方式 | 位置 |
 |------|----------|------|
@@ -417,7 +534,7 @@ export class QuotaApproved {
 
 ---
 
-## 7. 爬虫层域名限流（对外请求防滥用）
+## 8. 爬虫层域名限流（对外请求防滥用）
 
 这是对**外部网站**的礼貌限流，防止 Karakeep 爬虫被目标网站封禁。
 
@@ -454,11 +571,13 @@ CRAWLER_DOMAIN_RATE_LIMIT_MAX_REQUESTS: z.coerce.number().min(1).optional(),
 
 两者都设置才生效。被限流的任务会延迟后重试（通过 `QueueRetryAfterError`）。
 
+**Key 特点**：仅使用域名作为 Key，**所有用户共享同一域名的配额**。这是为了避免单个域名被 Karakeep 的所有用户集中访问而被封禁。
+
 ---
 
-## 8. 人机验证（Turnstile CAPTCHA）
+## 9. 人机验证（Turnstile CAPTCHA）
 
-### 8.1 配置
+### 9.1 配置
 
 **文件**: [packages/shared/config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared/config.ts#L58-L59)
 
@@ -469,7 +588,7 @@ TURNSTILE_SECRET_KEY: z.string().optional(),
 auth.turnstile.enabled = (TURNSTILE_SITE_KEY !== undefined)
 ```
 
-### 8.2 验证实现
+### 9.2 验证实现
 
 **文件**: [packages/trpc/lib/turnstile.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/turnstile.ts#L13-L71)
 
@@ -491,15 +610,15 @@ const result = await verifyTurnstileToken(
 );
 ```
 
-### 8.3 应用场景
+### 9.3 应用场景
 
 - 用户注册 `users.create`（结合 60秒3次 的限流）
 
 ---
 
-## 9. 其他防滥用机制
+## 10. 其他防滥用机制
 
-### 9.1 Demo Mode
+### 10.1 Demo Mode
 
 **文件**: [packages/trpc/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/index.ts#L96-L104)
 
@@ -514,7 +633,7 @@ procedure.use(function isDemoMode(opts) {
 
 Demo 模式下禁止所有写操作（mutation）。
 
-### 9.2 密码防暴力破解
+### 10.2 密码防暴力破解
 
 **文件**: [packages/trpc/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/auth.ts#L178-L186)
 
@@ -528,7 +647,7 @@ if (!user) {
 
 即使邮箱不存在也执行 bcrypt，防止通过响应时间枚举注册邮箱。
 
-### 9.3 API Key 节流更新
+### 10.3 API Key 节流更新
 
 **文件**: [packages/trpc/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/auth.ts#L139-L150)
 
@@ -543,7 +662,7 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 
 防止高频 API Key 调用产生过多 DB 写入。
 
-### 9.4 爬虫 SSRF 防护
+### 10.4 爬虫 SSRF 防护
 
 **文件**: [apps/workers/network.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/workers/network.ts#L13-L88)
 
@@ -556,9 +675,9 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 
 ---
 
-## 10. 不同入口拦截点汇总
+## 11. 不同入口拦截点汇总
 
-### 10.1 请求入口总览
+### 11.1 请求入口总览
 
 ```
 客户端请求
@@ -573,8 +692,9 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
   │                   ├─ trpcAdapter (错误映射)
   │                   ├─ /api/trpc/* ──► tRPC globalPublic/globalAuthed 限流
   │                   │                    └─ 各 router 自定义限流
+  │                   │                    └─ 业务配额检查（书签/存储）
   │                   ├─ /api/v1/* (REST)
-  │                   ├─ /api/assets/* ──► assets.upload 限流
+  │                   ├─ /api/assets/* ──► assets.upload 限流 + 存储配额
   │                   └─ /api/public/*
   │
   ├─ 浏览器扩展 / CLI / Mobile / MCP
@@ -582,39 +702,70 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
   │
   └─ Workers 后台任务
        └─ 队列消费 (crawler/inference/...)
-            └─ checkDomainRateLimit() 域名限流
-            └─ QuotaService 业务配额检查
+            ├─ checkDomainRateLimit() 域名限流（对外）
+            ├─ QuotaService 业务配额检查
+            └─ SSRF 防护（对外请求）
 ```
 
-### 10.2 各入口限流矩阵
+### 11.2 各入口限流矩阵（完整版）
 
-| 入口 | 认证方式 | IP 识别 | 全局限流 | 接口限流 | 业务配额 |
-|------|----------|---------|----------|----------|----------|
-| `publicProcedure` | 无 | ✅ request-ip | ✅ 60s/1000次 | ✅ 如注册接口 | - |
-| `authedProcedure` | Session / API Key | ✅ request-ip | ✅ 60s/3000次 | ✅ 如改密码 | ✅ 书签/存储 |
-| `sessionProcedure` | Session（禁止 API Key） | ✅ request-ip | ✅ 继承 authed | 视接口而定 | ✅ |
-| REST `/api/assets` | authMiddleware + API Key Scope | ✅ request-ip | - | ✅ 60s/30次 | ✅ 存储配额 |
-| REST `/api/v1/*` | authMiddleware | ✅ request-ip | - | - | 视业务而定 |
-| Crawler Worker | 队列任务（已认证用户触发） | N/A（对外请求） | - | ✅ 域名级限流 | ✅ 存储配额 |
+#### tRPC 过程类型层级
+
+| 过程类型 | 继承关系 | 全局默认限流 | 典型接口 |
+|----------|----------|-------------|----------|
+| `procedure` | 最底层 | - | - |
+| `publicProcedure` | procedure → rateLimit | 60s/1000次 (globalPublic) | 注册、登录、忘记密码、邀请验证 |
+| `authedProcedure` | procedure → rateLimit → isAuthed | 60s/3000次 (globalAuthed) | 所有需要登录的接口 |
+| `sessionProcedure` | authedProcedure → isSession | 继承 globalAuthed | 修改密码、管理 API Key |
+| `*Procedure` (scoped) | authedProcedure → createScopedAuthedProcedure | 继承 globalAuthed | bookmarksProcedure、usersProcedure 等 |
+
+#### 各业务入口限流详情
+
+| 入口/接口 | 认证方式 | IP 绑定 | 全局限流 | 接口级限流 | 业务配额 | 其他防护 |
+|-----------|----------|---------|----------|-----------|----------|----------|
+| **用户注册** `users.create` | 无 | ✅ IP+userID（创建前仅 IP） | 60s/1000次 | 60s/3次 | - | Turnstile CAPTCHA |
+| **登录** `auth.login` | 无 | ✅ IP | 60s/1000次 | ❌ 无 | - | bcrypt 时序防护 |
+| **修改密码** `users.changePassword` | Session | ✅ IP+userID | 60s/3000次 | 15min/5次 | - | - |
+| **邮箱验证** `users.verifyEmail` | 无 | ✅ IP | 60s/1000次 | 5min/10次 | - | - |
+| **重发验证邮件** `users.resendVerificationEmail` | 无 | ✅ IP | 60s/1000次 | 5min/3次 | - | - |
+| **忘记密码** `users.forgotPassword` | 无 | ✅ IP | 60s/1000次 | 15min/3次 | - | - |
+| **重置密码** `users.resetPassword` | 无 | ✅ IP | 60s/1000次 | 5min/10次 | - | - |
+| **创建书签** `bookmarks.createBookmark` | Session/API Key | ✅ IP+userID | 60s/3000次 | 60s/30次 + 5min/30次(降级) | ✅ 书签数配额 | 队列降级 |
+| **重爬书签** `bookmarks.recrawlBookmark` | Session/API Key | ✅ IP+userID | 60s/3000次 | 30min/200次 | - | - |
+| **摘要书签** `bookmarks.summarizeBookmark` | Session/API Key | ✅ IP+userID | 60s/3000次 | 30min/100次 | - | - |
+| **API Key 交换** `apiKeys.exchange` | 无（用户名+密码） | ✅ IP | 60s/1000次 | 15min/10次 | - | - |
+| **API Key 验证** `apiKeys.validate` | 无 | ✅ IP | 60s/1000次 | 60s/30次 | - | - |
+| **触发备份** `backups.triggerBackup` | Session/API Key | ✅ IP+userID | 60s/3000次 | 1h/5次 | - | - |
+| **获取邀请** `invites.get` | 无 | ✅ IP | 60s/1000次 | 60s/10次 | - | - |
+| **接受邀请** `invites.accept` | 无 | ✅ IP | 60s/1000次 | 60s/10次 | - | - |
+| **添加协作者** `lists.addCollaborator` | Session/API Key | ✅ IP+userID | 60s/3000次 | 15min/20次 | - | - |
+| **资产上传** `POST /api/assets` | API Key + Scope | ✅ IP+userID | - | 60s/30次 | ✅ 存储配额 | QuotaApproved Token |
+| **爬虫（对外）** `crawlerWorker` | 队列任务 | N/A | - | 域名级（按配置） | ✅ 存储配额 | SSRF 防护 + 抖动重试 |
 
 ---
 
-## 11. 风险与改进建议
+## 12. 风险与改进建议
 
-### 已识别的潜在风险
+### 12.1 已识别的潜在风险
 
-| 风险点 | 位置 | 说明 |
-|--------|------|------|
-| 限流默认关闭 | [config.ts#L182](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared/config.ts#L182) | `RATE_LIMITING_ENABLED` 默认为 `false`，部署时需显式开启 |
-| 代理头无条件信任 | [client.ts#L13-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/server/api/client.ts#L13-L15) | `request-ip` 未配置可信代理，可能被伪造头绕过 |
-| IP 缺失时无限流 | [rateLimit.ts#L20-L22](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/api/middlewares/rateLimit.ts#L20-L22) | IP 为 null 时直接放行 |
-| Redis 故障时 Fail-Open | [ratelimit-redis/index.ts#L96-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-redis/src/index.ts#L96-L103) | Redis 不可用时段无限流保护 |
-| 内存限流失效 | [ratelimit-memory/src/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-memory/src/index.ts) | 多实例部署时状态不共享 |
+| 风险点 | 位置 | 严重度 | 说明 |
+|--------|------|--------|------|
+| 限流默认关闭 | [config.ts#L182](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared/config.ts#L182) | 高 | `RATE_LIMITING_ENABLED` 默认为 `false`，部署时需显式开启 |
+| 代理头无条件信任 | [client.ts#L13-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/server/api/client.ts#L13-L15) | 高 | `request-ip` 未配置可信代理，攻击者可伪造 `X-Forwarded-For` 绕过 IP 限流 |
+| IP 缺失时无限流 | [rateLimit.ts#L25-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L25-L28) | 中 | IP 为 null 时直接放行所有限流检查 |
+| 已登录用户限流可通过换 IP 绕过 | [rateLimit.ts#L38-L39](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L38-L39) | 中 | Key 包含 IP，攻击者可通过代理池轮换 IP 绕过接口级限流（除书签高容量检测外） |
+| Redis 故障时 Fail-Open | [ratelimit-redis/index.ts#L96-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-redis/src/index.ts#L96-L103) | 中 | Redis 不可用时段无限流保护（可用性优先） |
+| 内存限流失效 | [ratelimit-memory/src/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-memory/src/index.ts) | 中 | 多实例部署时状态不共享，仅单实例有效 |
+| 登录接口无独立限流 | [routers/auth.ts?] | 中 | `auth.login` 只有全局 publicProcedure 限流（1000次/分钟），无独立的防暴力破解限流 |
+| 全局 + 接口级限流双重计数 | 全局中间件 + 各 router | 低 | 一个请求消耗两个限流配额（全局 + 接口），配额设计需考虑叠加效应 |
 
-### 建议改进项
+### 12.2 建议改进项
 
-1. **配置可信代理**：在 `requestIp.getClientIp()` 调用时传入 `trustProxy` 参数，仅信任部署环境中的反向代理 IP
-2. **IP 缺失时的兜底**：考虑对无法识别 IP 的请求使用更严格的默认限流（如按 User-Agent 或完全拒绝）
-3. **Redis Fail-Open 降级**：Redis 故障时可降级到内存限流（而非完全放行），或触发告警
-4. **部署文档**：明确 `RATE_LIMITING_ENABLED=true` 为生产必配项
-5. **限流指标暴露**：将限流命中次数接入 Prometheus，便于监控滥用攻击
+1. **配置可信代理**：在 `requestIp.getClientIp()` 调用时传入 `trustProxy` 参数，仅信任部署环境中的反向代理 IP 列表
+2. **IP 缺失时的兜底**：考虑对无法识别 IP 的请求使用更严格的默认限流（如按 User-Agent 哈希），或直接拒绝
+3. **已登录用户纯用户级限流**：对于已登录用户的敏感接口，考虑增加一层纯 `user.id` 的限流（类似 `shouldUseLowPriorityQueues` 的做法），防止换 IP 绕过
+4. **登录接口增加独立限流**：为 `auth.login` 增加专门的暴力破解限流（如 5次/分钟/IP + 5次/小时/账号）
+5. **Redis Fail-Open 降级**：Redis 故障时可降级到内存限流（而非完全放行），或触发告警通知
+6. **部署文档**：明确 `RATE_LIMITING_ENABLED=true` 为生产必配项
+7. **限流指标暴露**：将限流命中次数接入 Prometheus/OpenTelemetry，便于监控滥用攻击
+8. **限流统一维度**：考虑对已登录用户使用"IP 独立计数 + userID 独立计数 + 取较小值"的双维度策略，兼顾安全性与用户体验
