@@ -137,11 +137,15 @@ Karakeep **不直接实现 oEmbed 协议客户端**，而是通过 `metascraper`
 - **超时**: `CRAWLER_SCREENSHOT_TIMEOUT_SEC` (默认 5 秒)
 - **资源防护**: 自动屏蔽 `media` 类型请求 + 显式 video/audio Content-Type，避免页面加载大视频导致超时
 
-### 3.4 视频缩略图: 委托给 yt-dlp
+### 3.4 视频缩略图: 走通用 og:image 管道
 
-视频 Worker 本身**不生成缩略图**，依赖两个间接路径：
-1. **metascraper-image** 已提取 og:image（YouTube/Vimeo 等平台自动提供视频缩略图）
-2. **前端 `<video>` 标签** 原生海报机制 (浏览器自动显示首帧)
+视频链接**没有独立的缩略图机制**，完全复用通用的卡片取图管道：
+
+1. **后端提取**：由 `metascraper-image` / `metascraper-youtube` 等插件从 og:image、twitter:image 等元数据中提取视频封面 URL，写入 `bookmarkLinks.imageUrl`
+2. **本地化**：`downloadAndStoreImage()` 将远程封面下载为 `LINK_BANNER_IMAGE` 类型资产，写入 `imageAssetId`
+3. **前端展示**：卡片通过 `getBookmarkLinkImageUrl()` 按通用优先级选择图片，与普通网页无区别
+
+**播放时的首帧**由浏览器 `<video>` 标签原生处理，不单独生成 poster 资产。
 
 ---
 
