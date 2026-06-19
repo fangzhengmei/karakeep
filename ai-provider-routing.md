@@ -8,7 +8,7 @@
 
 ### 1.1 核心接口 `InferenceClient`
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L115-L127)
+位置：`packages/shared/inference.ts`（第 115-127 行）
 
 `InferenceClient` 是 AI 推理能力的统一抽象，定义了三个核心方法：
 
@@ -33,11 +33,11 @@ export interface InferenceClient {
 }
 ```
 
-> **注意**：`generateEmbeddingFromText` 方法没有 `opts` 参数，也不支持 `abortSignal`。
+> 注意：`generateEmbeddingFromText` 方法没有 `opts` 参数，也不支持 `abortSignal`。
 
 ### 1.2 返回值结构
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L11-L20)
+位置：`packages/shared/inference.ts`（第 11-20 行）
 
 ```typescript
 // 文本推理响应
@@ -56,7 +56,7 @@ export interface EmbeddingResponse {
 
 ### 1.3 推理选项 `InferenceOptions`
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L105-L109)
+位置：`packages/shared/inference.ts`（第 105-109 行）
 
 ```typescript
 export interface InferenceOptions {
@@ -71,7 +71,7 @@ export interface InferenceOptions {
 
 ### 2.1 选择优先级
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L154-L165)
+位置：`packages/shared/inference.ts`（第 154-165 行）
 
 `InferenceClientFactory.build()` 按以下优先级选择 Provider：
 
@@ -81,11 +81,11 @@ export interface InferenceOptions {
 都未配置  → 返回 null（AI 功能不可用）
 ```
 
-> 若两者同时配置，**OpenAI 优先**。OpenAI 兼容客户端可对接任何 OpenAI API 兼容服务（Groq、Together、OpenRouter 等），通过 `OPENAI_BASE_URL` 切换端点。
+若两者同时配置，**OpenAI 优先**。OpenAI 兼容客户端可对接任何 OpenAI API 兼容服务（Groq、Together、OpenRouter 等），通过 `OPENAI_BASE_URL` 切换端点。
 
 ### 2.2 配置驱动的模型参数
 
-[packages/shared/config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/config.ts#L305-L340)
+位置：`packages/shared/config.ts`（第 305-340 行）
 
 模型相关的核心配置项：
 
@@ -101,7 +101,7 @@ export interface InferenceOptions {
 
 ### 2.3 结构化输出 Schema 映射
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L129-L137)
+位置：`packages/shared/inference.ts`（第 129-137 行）
 
 `mapInferenceOutputSchema` 是一个类型安全的映射函数，根据 `outputSchema` 配置和 Provider 特性，返回不同的结构化输出参数：
 
@@ -113,7 +113,7 @@ export interface InferenceOptions {
 
 ### 2.4 OpenAI Provider 实现
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L167-L317)
+位置：`packages/shared/inference.ts`（第 167-317 行）
 
 `OpenAIInferenceClient` 关键特性：
 
@@ -138,7 +138,7 @@ this.openAI = new OpenAI({
 
 ### 2.5 Ollama Provider 实现
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L329-L473)
+位置：`packages/shared/inference.ts`（第 329-473 行）
 
 `OllamaInferenceClient` 关键特性：
 
@@ -156,7 +156,7 @@ Karakeep 的超时设计是**分层嵌套**的，但 OpenAI 和 Ollama 走的路
 
 ### 3.1 共有层：队列 Job 级超时
 
-[apps/workers/workers/inference/inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L72-L76)
+位置：`apps/workers/workers/inference/inferenceWorker.ts`（第 72-76 行）
 
 最外层是队列 Runner 级别的 Job 超时：
 
@@ -172,7 +172,7 @@ Karakeep 的超时设计是**分层嵌套**的，但 OpenAI 和 Ollama 走的路
 
 ### 3.2 共有层：`AbortSignal` 级联取消（仅推理）
 
-[packages/shared/queueing.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/queueing.ts#L34-L40)
+位置：`packages/shared/queueing.ts`（第 34-40 行）
 
 队列 Runner 为每个 Job 注入 `abortSignal`，沿调用链传递：
 
@@ -184,11 +184,11 @@ job.abortSignal
                  └─ OpenAI / Ollama SDK 接收 signal
 ```
 
-> **注意**：`generateEmbeddingFromText` 方法没有 `abortSignal` 参数，嵌入生成不走这一层取消。
+注意：`generateEmbeddingFromText` 方法没有 `abortSignal` 参数，嵌入生成不走这一层取消。
 
 ### 3.3 OpenAI 专属：SDK 级超时
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L174-L186)
+位置：`packages/shared/inference.ts`（第 174-186 行）
 
 OpenAI SDK 在构造时设置全局超时（`OPENAI_TIMEOUT_SEC`），所有请求（包括 `chat.completions.create` 和 `embeddings.create`）都受此超时约束。
 
@@ -196,7 +196,7 @@ OpenAI SDK 在构造时设置全局超时（`OPENAI_TIMEOUT_SEC`），所有请�
 
 ### 3.4 Ollama 专属：`customFetch` 级超时
 
-[packages/shared/customFetch.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/customFetch.ts#L1-L24)
+位置：`packages/shared/customFetch.ts`（第 1-24 行）
 
 Ollama SDK 在构造时注入 `customFetch`，每次请求都会加上 `AbortSignal.timeout()`：
 
@@ -214,7 +214,7 @@ export function createCustomFetch(fetchImpl = globalThis.fetch) {
 
 Ollama 还有一层特殊的 AbortSignal 处理：
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L364-L370)
+位置：`packages/shared/inference.ts`（第 364-370 行）
 
 ```typescript
 let newAbortSignal = undefined;
@@ -257,7 +257,7 @@ if (optsWithDefaults.abortSignal) {
 
 ### 4.1 队列级重试
 
-[packages/shared-server/src/queues.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/queues.ts#L130-L135)
+位置：`packages/shared-server/src/queues.ts`（第 130-135 行）
 
 两个 AI 相关队列都配置了重试：
 
@@ -277,7 +277,7 @@ export const EmbeddingsQueue = createDeferredQueue<ZEmbeddingsRequest>("embeddin
 
 ### 4.2 状态标记与永久失败
 
-[apps/workers/workers/inference/inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L54-L70)
+位置：`apps/workers/workers/inference/inferenceWorker.ts`（第 54-70 行）
 
 `onError` 回调中，通过 `job.numRetriesLeft` 判断是否为最后一次重试：
 
@@ -288,7 +288,7 @@ export const EmbeddingsQueue = createDeferredQueue<ZEmbeddingsRequest>("embeddin
 
 ### 4.3 Embedding → Tagging 降级兜底
 
-[apps/workers/workers/embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L53-L64)
+位置：`apps/workers/workers/embeddingsWorker.ts`（第 53-64 行）
 
 这是最关键的兜底设计：**Embedding 永久失败时，仍然调度不带向量的 Tagging，确保 bookmark 不会处于无标签状态**。
 
@@ -311,7 +311,7 @@ onError: async (job) => {
 
 `enqueueTaggingFallback` 从数据库查询 bookmark 的 `userId`，然后提交一个**不携带 `embedding` 参数**的 tagging job：
 
-[apps/workers/workers/embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L127-L147)
+位置：`apps/workers/workers/embeddingsWorker.ts`（第 127-147 行）
 
 ```typescript
 async function enqueueTaggingFallback(job) {
@@ -326,18 +326,18 @@ async function enqueueTaggingFallback(job) {
 
 ### 4.4 Tagging 内部：JSON 解析多层兜底
 
-[apps/workers/workers/inference/tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts#L45-L79)
+位置：`apps/workers/workers/inference/tagging.ts`（第 45-79 行）
 
 当 LLM 不遵守结构化输出 Schema 时，`parseJsonFromLLMResponse` 提供 4 层解析兜底：
 
 1. **直接解析**：`JSON.parse(trimmedResponse)`
-2. **Markdown 代码块提取**：用正则匹配 `\`\`\`json ... \`\`\`` 中的内容
+2. **Markdown 代码块提取**：用正则匹配 `` ```json ... ``` `` 中的内容
 3. **边界匹配**：用正则 `\{[\s\S]*\}` 查找最外层 JSON 对象边界
 4. **最终重试**：再用原始响应 `JSON.parse` 一次，抛出原始错误
 
 ### 4.5 Ollama 流式异常兜底
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L396-L416)
+位置：`packages/shared/inference.ts`（第 396-416 行）
 
 Ollama JS SDK 存在已知 Bug：流式返回部分成功结果后仍可能抛出异常。代码通过 `try-catch` 包裹迭代，异常时保留已累积的响应：
 
@@ -364,7 +364,7 @@ try {
 
 #### OpenAI 路径
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L241-L245)
+位置：`packages/shared/inference.ts`（第 241-245 行）
 
 直接使用 SDK 返回的 `usage.total_tokens`：
 
@@ -374,7 +374,7 @@ return { response, totalTokens: chatCompletion.usage?.total_tokens };
 
 #### Ollama 路径
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L394-L405)
+位置：`packages/shared/inference.ts`（第 394-405 行）
 
 流式逐块累加 `eval_count` 和 `prompt_eval_count`：
 
@@ -391,11 +391,11 @@ for await (const part of chatCompletion) {
 }
 ```
 
-> **注意**：若流式迭代中发生非 Abort 异常，`totalTokens` 会被设为 `NaN`。
+注意：若流式迭代中发生非 Abort 异常，`totalTokens` 会被设为 `NaN`。
 
 ### 5.2 嵌入 Token 采集
 
-[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L76-L103)
+位置：`packages/shared/inference.ts`（第 76-103 行）
 
 `parseEmbeddingUsage` 函数兼容多种响应格式，按优先级读取：
 
@@ -406,7 +406,7 @@ for await (const part of chatCompletion) {
 
 ### 5.3 Token 与事件日志关联
 
-[packages/shared-server/src/eventLogTypes.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/eventLogTypes.ts#L10-L27)
+位置：`packages/shared-server/src/eventLogTypes.ts`（第 10-27 行）
 
 `inferenceWorker.run` 事件包含的 Token / 计费字段：
 
@@ -430,7 +430,7 @@ for await (const part of chatCompletion) {
 
 ### 5.4 日志注入方式
 
-[packages/shared-server/src/eventLogger.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/eventLogger.ts#L211-L220)
+位置：`packages/shared-server/src/eventLogger.ts`（第 211-220 行）
 
 通过 `addLogFields<T>()` 渐进式填充事件日志字段，执行过程中任意位置均可追加：
 
@@ -477,13 +477,13 @@ LinkCrawlerQueue (numRetries=5)
           └─ 生成摘要，写入 bookmarks.summary
 ```
 
-> 关键点：`summarize` 任务始终由 Crawler 直接触发，不经过 Embedding Worker，与 embedding 开关无关。
+关键点：`summarize` 任务始终由 Crawler 直接触发，不经过 Embedding Worker，与 embedding 开关无关。
 
 ### 6.2 触发点代码核对
 
 Crawler 完成后的触发逻辑：
 
-[apps/workers/workers/crawlerWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/crawlerWorker.ts#L2312-L2338)
+位置：`apps/workers/workers/crawlerWorker.ts`（第 2312-2338 行）
 
 ```typescript
 if (job.data.runInference !== false) {
@@ -504,7 +504,7 @@ if (job.data.runInference !== false) {
 
 ### 6.3 Inference Worker 调度层
 
-[apps/workers/workers/inference/inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L44-L124)
+位置：`apps/workers/workers/inference/inferenceWorker.ts`（第 44-124 行）
 
 `OpenAiWorker.build()` 职责：
 
@@ -521,7 +521,7 @@ run: withWorkerTracing(
 
 ### 6.4 Tagging 业务层
 
-[apps/workers/workers/inference/tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts#L619-L728)
+位置：`apps/workers/workers/inference/tagging.ts`（第 619-728 行）
 
 `runTagging` 执行流程：
 
@@ -552,7 +552,7 @@ run: withWorkerTracing(
 
 ### 6.5 Embeddings Worker 层（重试隔离设计）
 
-[apps/workers/workers/embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L394-L498)
+位置：`apps/workers/workers/embeddingsWorker.ts`（第 394-498 行）
 
 这是最精巧的设计——**将向量生成与向量入库解耦为两个独立 Job，各自拥有独立的重试域**：
 
@@ -562,15 +562,15 @@ run: withWorkerTracing(
 | `type: "index"` | 将预生成的向量写入向量存储（Meilisearch） | 失败仅影响向量搜索，不影响 tagging |
 | `type: "delete"` | 从向量存储中删除向量 | - |
 
-> 设计收益：向量入库（通常依赖外部 Meilisearch，可能很慢）即使失败重试，也**绝不会重复触发 tagging**，避免重复消费 Token 和产生重复标签。
+设计收益：向量入库（通常依赖外部 Meilisearch，可能很慢）即使失败重试，也**绝不会重复触发 tagging**，避免重复消费 Token 和产生重复标签。
 
 ### 6.6 插件化的 Queue Provider
 
-[packages/shared/plugins.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/plugins.ts)
+位置：`packages/shared/plugins.ts`
 
 队列本身也是插件化的，通过 `PluginManager` 管理：
 
-[packages/shared-server/src/plugins.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/plugins.ts#L16-L43)
+位置：`packages/shared-server/src/plugins.ts`（第 16-43 行）
 
 ```typescript
 // 加载顺序（后者优先，Last one wins）
@@ -618,12 +618,12 @@ await import("@karakeep/plugins/queue-restate");   // Restate 分布式队列
 
 | 层次 | 职责 | 关键文件 |
 |---|---|---|
-| **接口抽象层** | `InferenceClient` 统一三能力接口 | [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts) |
-| **Provider 实现层** | OpenAI / Ollama 差异封装 | [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts) |
-| **配置驱动层** | 环境变量 → 强类型配置 | [config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/config.ts) |
-| **队列调度层** | 重试 / 超时 / 并发控制 | [queues.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/queues.ts) |
-| **Worker 执行层** | 业务逻辑（打标/摘要/嵌入） | [tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts) · [summarize.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/summarize.ts) · [embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts) |
-| **可观测性层** | Token 统计 / 链路追踪 / 事件日志 | [eventLogger.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/eventLogger.ts) + [tracing.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/tracing.ts) |
+| **接口抽象层** | `InferenceClient` 统一三能力接口 | `packages/shared/inference.ts` |
+| **Provider 实现层** | OpenAI / Ollama 差异封装 | `packages/shared/inference.ts` |
+| **配置驱动层** | 环境变量 → 强类型配置 | `packages/shared/config.ts` |
+| **队列调度层** | 重试 / 超时 / 并发控制 | `packages/shared-server/src/queues.ts` |
+| **Worker 执行层** | 业务逻辑（打标/摘要/嵌入） | `apps/workers/workers/inference/tagging.ts` · `apps/workers/workers/inference/summarize.ts` · `apps/workers/workers/embeddingsWorker.ts` |
+| **可观测性层** | Token 统计 / 链路追踪 / 事件日志 | `packages/shared-server/src/eventLogger.ts` + `packages/shared-server/src/tracing.ts` |
 
 ### 8.2 弹性设计要点
 
