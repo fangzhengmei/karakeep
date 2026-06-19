@@ -10,7 +10,7 @@
 
 ### 1.1 用户表 `users`
 
-定义位置：[schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/db/schema.ts#L32-L101)
+定义位置：[schema.ts](./packages/db/schema.ts#L32-L101)
 
 | 字段 | 说明 | 与安全相关的用途 |
 |------|------|-----------------|
@@ -23,7 +23,7 @@
 
 ### 1.2 会话表 `sessions`
 
-定义位置：[schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/db/schema.ts#L127-L136)
+定义位置：[schema.ts](./packages/db/schema.ts#L127-L136)
 
 ```typescript
 export const sessions = sqliteTable("session", {
@@ -33,11 +33,11 @@ export const sessions = sqliteTable("session", {
 });
 ```
 
-> ⚠️ **注意**：虽然存在 `sessions` 表，但 [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts#L181-L183) 中 `session.strategy` 配置为 `"jwt"`，意味着 **Web 端实际上不使用数据库会话表**，所有会话状态存储在 JWT Token 中（HttpOnly Cookie）。该表目前仅作为 NextAuth DrizzleAdapter 的兼容存在。
+> ⚠️ **注意**：虽然存在 `sessions` 表，但 [auth.ts](./apps/web/server/auth.ts#L181-L183) 中 `session.strategy` 配置为 `"jwt"`，意味着 **Web 端实际上不使用数据库会话表**，所有会话状态存储在 JWT Token 中（HttpOnly Cookie）。该表目前仅作为 NextAuth DrizzleAdapter 的兼容存在。
 
 ### 1.3 API Key 表 `apiKeys`
 
-定义位置：[schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/db/schema.ts#L165-L186)
+定义位置：[schema.ts](./packages/db/schema.ts#L165-L186)
 
 | 字段 | 说明 |
 |------|------|
@@ -52,13 +52,13 @@ export const sessions = sqliteTable("session", {
 
 ### 1.4 邮箱验证 Token 表 `verificationTokens`
 
-定义位置：[schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/db/schema.ts#L138-L146)
+定义位置：[schema.ts](./packages/db/schema.ts#L138-L146)
 
 用于新用户邮箱验证和 NextAuth 内部流程。
 
 ### 1.5 密码重置 Token 表 `passwordResetTokens`
 
-定义位置：[schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/db/schema.ts#L148-L163)
+定义位置：[schema.ts](./packages/db/schema.ts#L148-L163)
 
 | 字段 | 说明 |
 |------|------|
@@ -86,12 +86,12 @@ export const sessions = sqliteTable("session", {
 
 | 层级 | 建议文件 | 新增内容 |
 |------|---------|---------|
-| 数据库 | [schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/db/schema.ts) | `users` 表增加 `totpSecret`、`twoFactorEnabled`；新增 `recoveryCodes` 表 |
-| 认证核心 | [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts) | 新增 `validateTotpCode()`、`generateRecoveryCodes()` 函数 |
-| tRPC 路由 | [users.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/users.ts) | 新增 `enableTwoFactor`、`disableTwoFactor`、`verifyTwoFactor`、`regenerateRecoveryCodes` 过程 |
-| 登录流程 | [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts#L191-L252) | `signIn` callback 中增加 2FA 状态检查，未验证时不签发完整 JWT |
-| 前端设置页 | [info/page.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/settings/info/page.tsx) | 新增 TwoFactorSection 组件，包含二维码、输入验证、恢复码展示 |
-| 登录页 | [CredentialsForm.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/signin/CredentialsForm.tsx) | 密码校验通过后，跳转到 2FA 验证码输入步骤 |
+| 数据库 | [schema.ts](./packages/db/schema.ts) | `users` 表增加 `totpSecret`、`twoFactorEnabled`；新增 `recoveryCodes` 表 |
+| 认证核心 | [auth.ts](./packages/trpc/auth.ts) | 新增 `validateTotpCode()`、`generateRecoveryCodes()` 函数 |
+| tRPC 路由 | [users.ts](./packages/trpc/routers/users.ts) | 新增 `enableTwoFactor`、`disableTwoFactor`、`verifyTwoFactor`、`regenerateRecoveryCodes` 过程 |
+| 登录流程 | [auth.ts](./apps/web/server/auth.ts#L191-L252) | `signIn` callback 中增加 2FA 状态检查，未验证时不签发完整 JWT |
+| 前端设置页 | [info/page.tsx](./apps/web/app/settings/info/page.tsx) | 新增 TwoFactorSection 组件，包含二维码、输入验证、恢复码展示 |
+| 登录页 | [CredentialsForm.tsx](./apps/web/components/signin/CredentialsForm.tsx) | 密码校验通过后，跳转到 2FA 验证码输入步骤 |
 
 ---
 
@@ -123,9 +123,9 @@ export const sessions = sqliteTable("session", {
 ```
 
 关键代码：
-- 前端登录表单：[CredentialsForm.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/signin/CredentialsForm.tsx#L76-L95)
-- NextAuth 配置：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts#L177-L270)
-- 密码校验：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts#L166-L201)
+- 前端登录表单：[CredentialsForm.tsx](./apps/web/components/signin/CredentialsForm.tsx#L76-L95)
+- NextAuth 配置：[auth.ts](./apps/web/server/auth.ts#L177-L270)
+- 密码校验：[auth.ts](./packages/trpc/auth.ts#L166-L201)
 
 ### 3.2 OAuth 登录流程
 
@@ -147,9 +147,9 @@ OAuth 服务商回调 → NextAuth 处理
 ```
 
 关键代码：
-- OAuth Profile 处理：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts#L161-L174)
-- 自动建用户：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts#L98-L110)
-- 首用户 admin 判定：[users.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/models/users.ts#L106-L112)
+- OAuth Profile 处理：[auth.ts](./apps/web/server/auth.ts#L161-L174)
+- 自动建用户：[auth.ts](./apps/web/server/auth.ts#L98-L110)
+- 首用户 admin 判定：[users.ts](./packages/trpc/models/users.ts#L106-L112)
 
 ### 3.3 API Key 交换流程（浏览器扩展 / CLI / 移动端）
 
@@ -175,8 +175,8 @@ OAuth 服务商回调 → NextAuth 处理
 ```
 
 关键代码：
-- 交换路由：[apiKeys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/apiKeys.ts#L134-L194)
-- Key 生成：[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts#L52-L82)
+- 交换路由：[apiKeys.ts](./packages/trpc/routers/apiKeys.ts#L134-L194)
+- Key 生成：[auth.ts](./packages/trpc/auth.ts#L52-L82)
 
 ### 3.4 Web JWT 会话 vs API Key 设备凭证 — 边界与差异深度对比
 
@@ -209,7 +209,7 @@ OAuth 服务商回调 → NextAuth 处理
                    }
 ```
 
-**Web 端 Context 注入**（[client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/api/client.ts#L41-L64)）：
+**Web 端 Context 注入**（[client.ts](./apps/web/server/api/client.ts#L41-L64)）：
 
 ```typescript
 export const createContext = async (database?, ip?): Promise<Context> => {
@@ -225,7 +225,7 @@ export const createContext = async (database?, ip?): Promise<Context> => {
 };
 ```
 
-**API Key Context 注入**（[client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/api/client.ts#L10-L38)）：
+**API Key Context 注入**（[client.ts](./apps/web/server/api/client.ts#L10-L38)）：
 
 ```typescript
 export async function createContextFromRequest(req: Request) {
@@ -256,7 +256,7 @@ export async function createContextFromRequest(req: Request) {
 
 #### 3.4.2 RequestAuth 类型与过程级权限隔离
 
-tRPC 层通过 `ctx.auth.type` 进行三级权限隔离（[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/index.ts#L33-L42)）：
+tRPC 层通过 `ctx.auth.type` 进行三级权限隔离（[index.ts](./packages/trpc/index.ts#L33-L42)）：
 
 ```typescript
 export type RequestAuth =
@@ -273,7 +273,7 @@ export type RequestAuth =
 | `sessionProcedure` | `authedProcedure.use(rejectApiKeyAuth())` | **仅 `session`**，API Key 返回 403 | 敏感操作：创建/撤销 API Key、改密、删号 |
 | `createScopedAuthedProcedure(resource)` | `authedProcedure` + scope 检查 | `session` 放行 / `apiKey` 需匹配 scope | 分资源的细粒度鉴权（用户、书签、列表等） |
 
-**`rejectApiKeyAuth` 中间件**（[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/index.ts#L163-L175)）：
+**`rejectApiKeyAuth` 中间件**（[index.ts](./packages/trpc/index.ts#L163-L175)）：
 
 ```typescript
 function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint") {
@@ -303,18 +303,18 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 | **有效期** | JWT 由 NextAuth 控制（默认 30 天 Cookie 过期 + JWT 自身过期） | **永不过期**，仅在用户主动删除/重新生成时失效 |
 | **签发数量** | 每个浏览器一个 Cookie（不追踪多端） | 无上限，每个设备/用途可独立创建一个 Key |
 | **泄露后风险窗口** | JWT 过期前一直有效（无法服务端吊销） | 删除 DB 行后**立即失效**（下次请求查不到） |
-| **使用痕迹** | 不记录（无 lastUsedAt） | `lastUsedAt` 10 分钟节流更新（[auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts#L139-L150)） |
+| **使用痕迹** | 不记录（无 lastUsedAt） | `lastUsedAt` 10 分钟节流更新（[auth.ts](./packages/trpc/auth.ts#L139-L150)） |
 
 #### 3.4.4 各客户端的凭证选型
 
 | 客户端 | 凭证类型 | 代码位置 | 传输方式 |
 |-------|---------|---------|---------|
-| Web 浏览器 | JWT Cookie | [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts#L181-L183) | HttpOnly Cookie（自动携带） |
-| 浏览器扩展 | API Key | [trpc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/browser-extension/src/utils/trpc.ts#L102-L106) | `Authorization: Bearer <apiKey>` |
-| CLI | API Key | [trpc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/cli/src/lib/trpc.ts#L16-L19) | `Authorization: Bearer <apiKey>` |
-| MCP 服务 | API Key | [shared.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/mcp/src/shared.ts#L20-L27) | `Authorization: Bearer <apiKey>` |
-| 移动端 | API Key | [session.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/mobile/lib/session.ts) | `Authorization: Bearer <apiKey>` |
-| Workers（内部） | Impersonated Context | [trpc.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/workers/trpc.ts#L10-L13) | 直接构造 `AuthedContext`，不走 HTTP |
+| Web 浏览器 | JWT Cookie | [auth.ts](./apps/web/server/auth.ts#L181-L183) | HttpOnly Cookie（自动携带） |
+| 浏览器扩展 | API Key | [trpc.ts](./apps/browser-extension/src/utils/trpc.ts#L102-L106) | `Authorization: Bearer <apiKey>` |
+| CLI | API Key | [trpc.ts](./apps/cli/src/lib/trpc.ts#L16-L19) | `Authorization: Bearer <apiKey>` |
+| MCP 服务 | API Key | [shared.ts](./apps/mcp/src/shared.ts#L20-L27) | `Authorization: Bearer <apiKey>` |
+| 移动端 | API Key | [session.ts](./apps/mobile/lib/session.ts) | `Authorization: Bearer <apiKey>` |
+| Workers（内部） | Impersonated Context | [trpc.ts](./apps/workers/trpc.ts#L10-L13) | 直接构造 `AuthedContext`，不走 HTTP |
 
 > **注意 Workers 的特殊路径**：后台任务通过 `buildImpersonatingAuthedContext(userId)` 直接构造 Context，绕过了 HTTP 层。此时 `ctx.auth` 为 `undefined`（不是 `"session"` 也不是 `"apiKey"`），但由于 `authedProcedure` 只检查 `ctx.user?.id`，所以 Worker 可以正常调用需要认证的端点。不过 Worker 无法调用 `sessionProcedure` 保护的端点（因为 auth 不为 `"session"`），这在设计上是正确的——Worker 不应能创建或撤销 API Key。
 
@@ -340,9 +340,9 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 ```
 
 关键代码：
-- 列表路由：[apiKeys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/apiKeys.ts#L102-L131)
-- 前端渲染：[ApiKeySettings.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/settings/ApiKeySettings.tsx#L19-L78)
-- sessionProcedure 定义（拒绝 API Key 访问敏感端点）：[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/index.ts#L197)
+- 列表路由：[apiKeys.ts](./packages/trpc/routers/apiKeys.ts#L102-L131)
+- 前端渲染：[ApiKeySettings.tsx](./apps/web/components/settings/ApiKeySettings.tsx#L19-L78)
+- sessionProcedure 定义（拒绝 API Key 访问敏感端点）：[index.ts](./packages/trpc/index.ts#L197)
 
 ### 4.2 API Key 创建数据流
 
@@ -359,8 +359,8 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 ```
 
 关键代码：
-- 创建表单：[AddApiKey.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/settings/AddApiKey.tsx#L159-L359)
-- 创建路由：[apiKeys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/apiKeys.ts#L36-L60)
+- 创建表单：[AddApiKey.tsx](./apps/web/components/settings/AddApiKey.tsx#L159-L359)
+- 创建路由：[apiKeys.ts](./packages/trpc/routers/apiKeys.ts#L36-L60)
 
 ### 4.3 API Key 重新生成（轮换）
 
@@ -375,7 +375,7 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 ```
 
 关键代码：
-- 重生成路由：[apiKeys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/apiKeys.ts#L61-L88)
+- 重生成路由：[apiKeys.ts](./packages/trpc/routers/apiKeys.ts#L61-L88)
 
 ---
 
@@ -395,8 +395,8 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 ```
 
 关键代码：
-- 注销入口：[ProfileOptions.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/dashboard/header/ProfileOptions.tsx#L144-L147)
-- 注销页面：[logout/page.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/logout/page.tsx#L9-L26)
+- 注销入口：[ProfileOptions.tsx](./apps/web/components/dashboard/header/ProfileOptions.tsx#L144-L147)
+- 注销页面：[logout/page.tsx](./apps/web/app/logout/page.tsx#L9-L26)
 
 > ⚠️ **局限**：由于使用 JWT 策略，JWT 本身是无状态的。服务端注销仅清除浏览器 Cookie，但已签发的 JWT 在过期前仍然有效（如果被窃取）。数据库 `sessions` 表未被实际使用，无法做服务端主动失效。
 
@@ -412,8 +412,8 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 ```
 
 关键代码：
-- 扩展注销：[OptionsPage.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/browser-extension/src/OptionsPage.tsx#L102-L109)
-- 删除 Key 路由：[apiKeys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/apiKeys.ts#L89-L101)
+- 扩展注销：[OptionsPage.tsx](./apps/browser-extension/src/OptionsPage.tsx#L102-L109)
+- 删除 Key 路由：[apiKeys.ts](./packages/trpc/routers/apiKeys.ts#L89-L101)
 
 ### 5.3 移动端注销
 
@@ -426,7 +426,7 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 ```
 
 关键代码：
-- 移动端会话 Hook：[session.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/mobile/lib/session.ts#L8-L26)
+- 移动端会话 Hook：[session.ts](./apps/mobile/lib/session.ts#L8-L26)
 
 ### 5.4 远程强制下线（撤销 API Key）
 
@@ -453,7 +453,7 @@ DELETE FROM apiKeys WHERE id = ? AND userId = ?
 这是一个关键的安全组件，解决 **"JWT 仍有效但用户已被删除/禁用"** 的不一致问题。
 
 挂载位置：
-- [SidebarLayout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/shared/sidebar/SidebarLayout.tsx)（通过全局布局引入）
+- [SidebarLayout.tsx](./apps/web/components/shared/sidebar/SidebarLayout.tsx)（通过全局布局引入）
 
 数据流：
 ```
@@ -470,7 +470,7 @@ useEffect 监听 error
 ```
 
 关键代码：
-- [ValidAccountCheck.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/utils/ValidAccountCheck.tsx#L13-L33)
+- [ValidAccountCheck.tsx](./apps/web/components/utils/ValidAccountCheck.tsx#L13-L33)
 
 ### 6.2 服务端布局层二次校验
 
@@ -493,13 +493,13 @@ if (userSettings.error) {
 ```
 
 涉及文件：
-- [dashboard/layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/dashboard/layout.tsx#L32-L52)
-- [reader/layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/reader/layout.tsx#L15-L32)
-- [settings/layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/settings/layout.tsx#L119-L136)
+- [dashboard/layout.tsx](./apps/web/app/dashboard/layout.tsx#L32-L52)
+- [reader/layout.tsx](./apps/web/app/reader/layout.tsx#L15-L32)
+- [settings/layout.tsx](./apps/web/app/settings/layout.tsx#L119-L136)
 
 ### 6.3 tRPC 认证中间件
 
-定义位置：[index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/index.ts#L131-L152)
+定义位置：[index.ts](./packages/trpc/index.ts#L131-L152)
 
 ```typescript
 export const authedProcedure = procedure
@@ -514,11 +514,11 @@ export const authedProcedure = procedure
 
 Context 中的 `user` 来源：
 - Web 端：由 NextAuth JWT 解码后注入
-- API 端：由 [auth.ts:authenticateApiKey()](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts#L107-L160) 解析 API Key 后注入
+- API 端：由 [auth.ts:authenticateApiKey()](./packages/trpc/auth.ts#L107-L160) 解析 API Key 后注入
 
 Hono API 层进一步封装：
-- [api/middlewares/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/api/middlewares/auth.ts#L24-L37) — `authMiddleware` 校验 `ctx.user` 存在
-- [api/middlewares/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/api/middlewares/auth.ts#L39-L59) — `adminAuthMiddleware` 额外校验 `role === "admin"`
+- [api/middlewares/auth.ts](./packages/api/middlewares/auth.ts#L24-L37) — `authMiddleware` 校验 `ctx.user` 存在
+- [api/middlewares/auth.ts](./packages/api/middlewares/auth.ts#L39-L59) — `adminAuthMiddleware` 额外校验 `role === "admin"`
 
 ### 6.4 密码修改安全
 
@@ -539,8 +539,8 @@ Hono API 层进一步封装：
 ```
 
 关键代码：
-- 修改密码表单：[ChangePassword.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/settings/ChangePassword.tsx#L28-L209)
-- 修改密码模型方法：[users.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/models/users.ts#L440-L465)
+- 修改密码表单：[ChangePassword.tsx](./apps/web/components/settings/ChangePassword.tsx#L28-L209)
+- 修改密码模型方法：[users.ts](./packages/trpc/models/users.ts#L440-L465)
 
 ### 6.5 邮箱验证强制登录拦截
 
@@ -554,7 +554,7 @@ if (serverConfig.auth.emailVerificationRequired && !user.emailVerified) {
 ```
 
 前端收到此错误时，跳转到 `/check-email` 页面：
-- [CredentialsForm.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/signin/CredentialsForm.tsx#L85-L88)
+- [CredentialsForm.tsx](./apps/web/components/signin/CredentialsForm.tsx#L85-L88)
 
 ---
 
@@ -621,25 +621,36 @@ if (serverConfig.auth.emailVerificationRequired && !user.emailVerified) {
 
 | 文件路径 | 角色 |
 |---------|------|
-| [packages/db/schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/db/schema.ts) | 数据库表定义 |
-| [apps/web/server/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/server/auth.ts) | NextAuth 配置（Web 端登录核心） |
-| [apps/web/lib/auth/client.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/lib/auth/client.ts) | 客户端认证导出层 |
-| [packages/trpc/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/auth.ts) | 密码校验、API Key 生成与认证 |
-| [packages/trpc/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/index.ts) | tRPC 过程定义（authedProcedure 等） |
-| [packages/trpc/routers/users.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/users.ts) | 用户相关路由（注册、改密、注销等） |
-| [packages/trpc/routers/apiKeys.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/routers/apiKeys.ts) | API Key 路由（设备凭证管理） |
-| [packages/trpc/models/users.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/trpc/models/users.ts) | User 模型（改密、邮箱验证、重置密码） |
-| [packages/api/middlewares/auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/packages/api/middlewares/auth.ts) | Hono API 认证中间件 |
-| [apps/web/app/logout/page.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/logout/page.tsx) | Web 端注销页面 |
-| [apps/web/components/utils/ValidAccountCheck.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/utils/ValidAccountCheck.tsx) | 账户有效性校验 |
-| [apps/web/components/dashboard/header/ProfileOptions.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/dashboard/header/ProfileOptions.tsx) | 用户菜单（含注销入口） |
-| [apps/web/components/signin/CredentialsForm.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/signin/CredentialsForm.tsx) | 密码登录表单 |
-| [apps/web/components/signin/SignInForm.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/signin/SignInForm.tsx) | 登录页组合组件 |
-| [apps/web/components/settings/ChangePassword.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/settings/ChangePassword.tsx) | 修改密码表单 |
-| [apps/web/components/settings/ApiKeySettings.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/settings/ApiKeySettings.tsx) | API Key 列表（设备列表） |
-| [apps/web/components/settings/AddApiKey.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/components/settings/AddApiKey.tsx) | 新建 API Key |
-| [apps/web/app/dashboard/layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/dashboard/layout.tsx) | Dashboard 布局（含二次认证校验） |
-| [apps/web/app/reader/layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/reader/layout.tsx) | Reader 布局（含二次认证校验） |
-| [apps/web/app/settings/layout.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/web/app/settings/layout.tsx) | Settings 布局（含二次认证校验） |
-| [apps/browser-extension/src/OptionsPage.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/browser-extension/src/OptionsPage.tsx) | 浏览器扩展设置（含注销） |
-| [apps/mobile/lib/session.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/44-karakeep/apps/mobile/lib/session.ts) | 移动端会话管理 |
+| [packages/db/schema.ts](./packages/db/schema.ts) | 数据库表定义 |
+| [apps/web/server/auth.ts](./apps/web/server/auth.ts) | NextAuth 配置（Web 端登录核心） |
+| [apps/web/lib/auth/client.ts](./apps/web/lib/auth/client.ts) | 客户端认证导出层 |
+| [packages/trpc/auth.ts](./packages/trpc/auth.ts) | 密码校验、API Key 生成与认证 |
+| [packages/trpc/index.ts](./packages/trpc/index.ts) | tRPC 过程定义（authedProcedure 等） |
+| [packages/trpc/routers/users.ts](./packages/trpc/routers/users.ts) | 用户相关路由（注册、改密、注销等） |
+| [packages/trpc/routers/apiKeys.ts](./packages/trpc/routers/apiKeys.ts) | API Key 路由（设备凭证管理） |
+| [packages/trpc/models/users.ts](./packages/trpc/models/users.ts) | User 模型（改密、邮箱验证、重置密码） |
+| [packages/api/middlewares/auth.ts](./packages/api/middlewares/auth.ts) | Hono API 认证中间件 |
+| [apps/web/app/logout/page.tsx](./apps/web/app/logout/page.tsx) | Web 端注销页面 |
+| [apps/web/components/utils/ValidAccountCheck.tsx](./apps/web/components/utils/ValidAccountCheck.tsx) | 账户有效性校验 |
+| [apps/web/components/dashboard/header/ProfileOptions.tsx](./apps/web/components/dashboard/header/ProfileOptions.tsx) | 用户菜单（含注销入口） |
+| [apps/web/components/signin/CredentialsForm.tsx](./apps/web/components/signin/CredentialsForm.tsx) | 密码登录表单 |
+| [apps/web/components/signin/SignInForm.tsx](./apps/web/components/signin/SignInForm.tsx) | 登录页组合组件 |
+| [apps/web/components/settings/ChangePassword.tsx](./apps/web/components/settings/ChangePassword.tsx) | 修改密码表单 |
+| [apps/web/components/settings/ApiKeySettings.tsx](./apps/web/components/settings/ApiKeySettings.tsx) | API Key 列表（设备列表） |
+| [apps/web/components/settings/AddApiKey.tsx](./apps/web/components/settings/AddApiKey.tsx) | 新建 API Key |
+| [apps/web/app/dashboard/layout.tsx](./apps/web/app/dashboard/layout.tsx) | Dashboard 布局（含二次认证校验） |
+| [apps/web/app/reader/layout.tsx](./apps/web/app/reader/layout.tsx) | Reader 布局（含二次认证校验） |
+| [apps/web/app/settings/layout.tsx](./apps/web/app/settings/layout.tsx) | Settings 布局（含二次认证校验） |
+| [apps/browser-extension/src/OptionsPage.tsx](./apps/browser-extension/src/OptionsPage.tsx) | 浏览器扩展设置（含注销） |
+| [apps/mobile/lib/session.ts](./apps/mobile/lib/session.ts) | 移动端会话管理 |
+| [apps/web/server/api/client.ts](./apps/web/server/api/client.ts) | Context 构建（JWT Cookie 与 API Key 两条注入链路） |
+| [apps/web/server/api/trpc.ts](./apps/web/server/api/trpc.ts) | Server Component tRPC 代理 |
+| [apps/web/app/api/\[\[...route\]\]/route.ts](./apps/web/app/api/%5B%5B...route%5D%5D/route.ts) | Next.js API Route 入口（挂载 Hono） |
+| [apps/browser-extension/src/utils/trpc.ts](./apps/browser-extension/src/utils/trpc.ts) | 扩展 tRPC 客户端（Bearer Token 注入） |
+| [apps/cli/src/lib/trpc.ts](./apps/cli/src/lib/trpc.ts) | CLI tRPC 客户端（Bearer Token 注入） |
+| [apps/mcp/src/shared.ts](./apps/mcp/src/shared.ts) | MCP 服务 tRPC 客户端（Bearer Token 注入） |
+| [apps/workers/trpc.ts](./apps/workers/trpc.ts) | Worker 内部上下文构造（Impersonate 模式） |
+| [packages/trpc/lib/impersonate.ts](./packages/trpc/lib/impersonate.ts) | Impersonated Context 构造函数 |
+| [packages/api/index.ts](./packages/api/index.ts) | Hono API 应用组装（tRPC + REST 路由 |
+| [packages/api/middlewares/trpcAdapter.ts](./packages/api/middlewares/trpcAdapter.ts) | tRPC 错误到 HTTP 状态码映射 |
+| [packages/api/routes/trpc.ts](./packages/api/routes/trpc.ts) | Hono tRPC 路由（Context 透传） |
