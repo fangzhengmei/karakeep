@@ -286,12 +286,21 @@ function rejectApiKeyAuth(message = "API keys are not allowed for this endpoint"
 }
 ```
 
-> **关键边界②**：以下端点只能通过 Web JWT 会话访问，API Key 一概拒绝——
-> - `apiKeys.create / regenerate / revoke / list`（全部使用 `sessionProcedure`）
-> - `users.changePassword` 使用 `usersProcedure`（createScopedAuthedProcedure），但内部还需再次校验密码
-> - `users.deleteAccount` 同理
+> **关键边界②**：两类敏感操作的权限控制并不一致，需要明确区分：
 >
-> 这意味着：**持有某设备的 API Key 无法横向扩展权限去创建新的 API Key 或修改账号密码**。即使 API Key 泄露，攻击者也无法进一步接管账号。
+> **A. 完全禁止 API Key（仅 Web JWT 会话允许）**
+> - `apiKeys.create / regenerate / revoke / list`（全部使用 `sessionProcedure`）
+> - 这意味着：**持有某设备的 API Key 无法横向扩展权限去创建新的 API Key**。即使 API Key 泄露，攻击者也无法进一步扩展设备数量。
+>
+> **B. API Key 可调用（但需具备 users 资源的 readwrite scope，且内部再次校验密码）**
+> - `users.changePassword` 使用 `usersProcedure`（= `createScopedAuthedProcedure("users")`），内部还需二次校验旧密码
+> - `users.deleteAccount` 使用 `usersProcedure`，内部还需二次校验密码（本地账号）
+>
+> **B 类的安全前提**：`apiKeys.exchange`（创建设备 Key）默认授予的是 `API_KEY_FULL_ACCESS_SCOPE`（`*:*`），所以所有设备 Key 实际上都具备 users:readwrite scope。但 `changePassword` / `deleteAccount` 内部都要求再次输入当前密码——这层密码校验才是真正的防线，而不是 procedure 层面的 type 检查。
+>
+> 如果创建 Key 时显式传入了更窄的 scopes（不含 users），则 B 类端点会被 `createScopedAuthedProcedure` 拦截并返回 403。
+>
+> **⚠️ 关于后台任务的边界说明**：`buildImpersonatingAuthedContext` 返回的 Context 中 `auth` 字段为 `undefined`（而非 `"session"`）。由于 `rejectApiKeyAuth` 只拒绝 `auth.type === "apiKey"`，对 `undefined` 不拦截，因此 Worker 可以通过 sessionProcedure（但 Worker 内部无构造完整 users 的逻辑，实际影响有限，见 §3.4.5）。
 
 #### 3.4.3 状态存储与持久性对比
 
