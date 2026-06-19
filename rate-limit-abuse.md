@@ -722,7 +722,7 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 | 过程类型 | 继承关系 | 全局默认限流 | 典型接口 |
 |----------|----------|-------------|----------|
 | `procedure` | 最底层 | - | - |
-| `publicProcedure` | procedure → rateLimit | 60s/1000次 (globalPublic) | 注册、登录、忘记密码、邀请验证 |
+| `publicProcedure` | procedure → rateLimit | 60s/1000次 (globalPublic) | 注册、忘记密码、邮箱验证、邀请验证、API Key 交换/验证（注：登录走 NextAuth 独立路由，不经过此过程） |
 | `authedProcedure` | procedure → rateLimit → isAuthed | 60s/3000次 (globalAuthed) | 所有需要登录的接口 |
 | `sessionProcedure` | authedProcedure → isSession | 继承 globalAuthed | 修改密码、管理 API Key |
 | `*Procedure` (scoped) | authedProcedure → createScopedAuthedProcedure | 继承 globalAuthed | bookmarksProcedure、usersProcedure 等 |
@@ -731,9 +731,12 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 
 | 入口/接口 | 认证方式 | IP 绑定 | 全局限流 | 接口级限流 | 业务配额 | 其他防护 |
 |-----------|----------|---------|----------|-----------|----------|----------|
-| **用户注册** `users.create` | 无 | ✅ IP+userID（创建前仅 IP） | 60s/1000次 | 60s/3次 | - | Turnstile CAPTCHA |
-| **登录** `auth.login` | 无 | ✅ IP | 60s/1000次 | ❌ 无 | - | bcrypt 时序防护 |
-| **修改密码** `users.changePassword` | Session | ✅ IP+userID | 60s/3000次 | 15min/5次 | - | - |
+| **用户注册** `users.create` | 无（tRPC publicProcedure） | ✅ IP+userID（创建前仅 IP） | 60s/1000次 (globalPublic) | 60s/3次 | - | Turnstile CAPTCHA |
+| **密码登录** `POST /api/auth/callback/credentials` | 无（NextAuth 独立路由） | ❌ 无（未提取 IP） | ❌ 无（不走 tRPC） | ❌ 无 | - | bcrypt 时序防护（仅防枚举） |
+| **OAuth 登录** `GET /api/auth/signin/custom` + callback | 无（NextAuth 独立路由） | ❌ 无（未提取 IP） | ❌ 无（不走 tRPC） | ❌ 无 | - | OAuth 协议本身防护 |
+| **查询 Session** `GET /api/auth/session` | 无（Cookie） | ❌ 无（未提取 IP） | ❌ 无（不走 tRPC） | ❌ 无 | - | JWT 签名验证 |
+| **登出** `POST /api/auth/signout` | Cookie | ❌ 无（未提取 IP） | ❌ 无（不走 tRPC） | ❌ 无 | - | - |
+| **修改密码** `users.changePassword` | Session（tRPC sessionProcedure） | ✅ IP+userID | 60s/3000次 (globalAuthed) | 15min/5次 | - | - |
 | **邮箱验证** `users.verifyEmail` | 无 | ✅ IP | 60s/1000次 | 5min/10次 | - | - |
 | **重发验证邮件** `users.resendVerificationEmail` | 无 | ✅ IP | 60s/1000次 | 5min/3次 | - | - |
 | **忘记密码** `users.forgotPassword` | 无 | ✅ IP | 60s/1000次 | 15min/3次 | - | - |
@@ -754,26 +757,48 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 
 ## 12. 风险与改进建议
 
-### 12.1 已识别的潜在风险
+### 12.1 已识别的潜在风险（按严重度降序）
 
 | 风险点 | 位置 | 严重度 | 说明 |
 |--------|------|--------|------|
-| 限流默认关闭 | [config.ts#L182](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared/config.ts#L182) | 高 | `RATE_LIMITING_ENABLED` 默认为 `false`，部署时需显式开启 |
-| 代理头无条件信任 | [client.ts#L13-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/server/api/client.ts#L13-L15) | 高 | `request-ip` 未配置可信代理，攻击者可伪造 `X-Forwarded-For` 绕过 IP 限流 |
-| IP 缺失时无限流 | [rateLimit.ts#L25-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L25-L28) | 中 | IP 为 null 时直接放行所有限流检查 |
-| 已登录用户限流可通过换 IP 绕过 | [rateLimit.ts#L38-L39](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L38-L39) | 中 | Key 包含 IP，攻击者可通过代理池轮换 IP 绕过接口级限流（除书签高容量检测外） |
-| Redis 故障时 Fail-Open | [ratelimit-redis/index.ts#L96-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-redis/src/index.ts#L96-L103) | 中 | Redis 不可用时段无限流保护（可用性优先） |
-| 内存限流失效 | [ratelimit-memory/src/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-memory/src/index.ts) | 中 | 多实例部署时状态不共享，仅单实例有效 |
-| 登录接口无独立限流 | [routers/auth.ts?] | 中 | `auth.login` 只有全局 publicProcedure 限流（1000次/分钟），无独立的防暴力破解限流 |
-| 全局 + 接口级限流双重计数 | 全局中间件 + 各 router | 低 | 一个请求消耗两个限流配额（全局 + 接口），配额设计需考虑叠加效应 |
+| NextAuth 路径完全无限流（密码登录、OAuth、session、signout） | [route.tsx#L1-L3](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/app/api/auth/[...nextauth]/route.tsx#L1-L3) | 高 (Critical) | 所有 `/api/auth/*` 走独立路由，完全绕过 Hono 中间件 + tRPC 限流体系，攻击者可无限制爆破密码、刷 session、枚举 OAuth |
+| NextAuth 路径无 IP 识别 | [route.tsx#L1-L3](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/app/api/auth/[...nextauth]/route.tsx#L1-L3) | 高 (Critical) | 未调用 `createContextFromRequest()`，不提取 `X-Forwarded-For` 等，无法做 IP 维度限流/封禁/溯源，撞库攻击不留痕 |
+| 限流默认关闭 | [config.ts#L182](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared/config.ts#L182) | 高 | `RATE_LIMITING_ENABLED` 默认为 `false`，部署时需显式开启；若忘记，全 tRPC 路径也无限流 |
+| 代理头无条件信任 | [client.ts#L13-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/server/api/client.ts#L13-L15) | 高 | `request-ip` 未配置 `trustProxy`，攻击者伪造 `X-Forwarded-For` 可绕过所有 tRPC 路径的 IP 维度限流 |
+| 已登录用户限流可通过换 IP 绕过 | [rateLimit.ts#L38-L39](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L38-L39) | 中 | tRPC Key 格式为 `${ip}:user:${id}:${path}`，攻击者通过代理池换 IP 即可重置计数（书签高容量检测除外，其 Key 仅 user.id） |
+| IP 缺失时 tRPC 限流直接放行 | [rateLimit.ts#L25-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L25-L28) | 中 | IP 为 null 时 `return next()` 直接跳过，若 request-ip 解析失败等同于无限流 |
+| Redis 故障时 Fail-Open | [ratelimit-redis/index.ts#L96-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-redis/src/index.ts#L96-L103) | 中 | Redis 不可用全部放行（可用性优先），此时若遭遇攻击无限流保护 |
+| 内存限流失效（多实例部署） | [ratelimit-memory/src/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-memory/src/index.ts) | 中 | 多实例时 Map 状态不共享，限流仅按实例粒度，N 实例等效于 N 倍配额 |
+| 全局 + 接口级限流双重计数 | 全局中间件 + 各 router | 低 | 一个请求消耗两份配额（globalPublic/Authed + 接口级），调参数时需考虑叠加效应，否则实际限制比预期更严 |
 
-### 12.2 建议改进项
+### 12.2 建议改进项（按优先级排序）
 
-1. **配置可信代理**：在 `requestIp.getClientIp()` 调用时传入 `trustProxy` 参数，仅信任部署环境中的反向代理 IP 列表
-2. **IP 缺失时的兜底**：考虑对无法识别 IP 的请求使用更严格的默认限流（如按 User-Agent 哈希），或直接拒绝
-3. **已登录用户纯用户级限流**：对于已登录用户的敏感接口，考虑增加一层纯 `user.id` 的限流（类似 `shouldUseLowPriorityQueues` 的做法），防止换 IP 绕过
-4. **登录接口增加独立限流**：为 `auth.login` 增加专门的暴力破解限流（如 5次/分钟/IP + 5次/小时/账号）
-5. **Redis Fail-Open 降级**：Redis 故障时可降级到内存限流（而非完全放行），或触发告警通知
-6. **部署文档**：明确 `RATE_LIMITING_ENABLED=true` 为生产必配项
-7. **限流指标暴露**：将限流命中次数接入 Prometheus/OpenTelemetry，便于监控滥用攻击
-8. **限流统一维度**：考虑对已登录用户使用"IP 独立计数 + userID 独立计数 + 取较小值"的双维度策略，兼顾安全性与用户体验
+**P0（上线前必须修）**
+
+1. **为 NextAuth 路径增加 IP 提取 + 限流 + 失败锁定**：
+   - **方案 A（推荐）**：在 `apps/web/app/api/auth/[...nextauth]/route.tsx` 中手动调用 `requestIp.getClientIp()` + 限流客户端，在调用 `authHandler` 之前/之后拦截关键操作
+   - **方案 B**：新增 `middleware.ts`（Next.js Middleware）对 `/api/auth/:path*` 做统一限流，不侵入业务代码
+   - 至少覆盖：密码登录（`/callback/credentials`）、OAuth callback、signin、session、signout、csrf
+   - 建议规则：密码登录 5次/分钟/IP + 10次/小时/邮箱 + 连续失败 5 次临时锁定账户 15 分钟
+2. **确保 `RATE_LIMITING_ENABLED=true`**：在部署模板（docker-compose / Helm / env 示例）中默认开启，避免漏配
+
+**P1（安全加固）**
+
+3. **配置 `request-ip` 可信代理范围**：
+   - 在 `createContextFromRequest()` 中给 `requestIp.getClientIp()` 传 `{ headers, trustProxy: [...] }` 或配置上游 CDN 的 IP 白名单
+   - 否则伪造 `X-Forwarded-For` 可绕过所有 tRPC 限流
+4. **tRPC 已登录用户接口增加纯 user.id 维度限流**：
+   - 与书签高容量检测一致，对敏感写接口（createBookmark、summarize、addCollaborator 等）加一层 Key 仅为 `${config.name}:user:${userId}` 的限流
+   - 防止换 IP 绕过；两层都通过才执行，取更严格者
+
+**P2（可用性与可观测性）**
+
+5. **Redis 故障时降级到内存限流**：将 `fail-open` 改为「先查 Redis，失败则回退到进程内 LRU Map」，避免窗口内完全失控
+6. **限流命中指标**：暴露 `rate_limit_hits_total{rule,status}` Prometheus 指标 + 命中后的结构化告警（单规则 5 分钟内命中 >100 次触发告警）
+7. **登录失败事件接风控**：`user.login_failed` 事件中补 IP 字段，接入 SIEM，按小时/天检测撞库（同一 IP 尝试大量邮箱）模式
+8. **登录失败 N 次后强制 Turnstile**：在 `authorize()` 中根据 IP/邮箱在 Redis 中的失败计数，超过阈值后要求前端带 Turnstile Token 才能继续尝试
+
+**P3（架构优化）**
+
+9. **统一入口**：长期考虑将 NextAuth 迁移到 tRPC router（或在 Hono 层包装 NextAuth），使所有请求走同一中间件链，避免路径分裂导致的「忘记加保护」问题
+10. **双维度限流 Key**：将 tRPC 限流 Key 拆为两个独立计数器（IP 维度 + user 维度），取较小值通过；既能限制单点爆破，又能限制账号滥用，且对换 IP 不敏感
