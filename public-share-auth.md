@@ -18,12 +18,18 @@ Karakeep 对同一批列表/书签/资产存在 **五层视角**，每层通过�
 
 后两层（④⑤）都通过 `List.getPublicList()` 的 `OR(public=true, rssToken=token)` 分支进入，差异只在输出格式（HTML vs RSS XML）以及 RSS 渲染代码自身的 bug。
 
-资产（二进制文件）独立于列表权限体系，提供 **两条下载路由**：
+资产（二进制文件）独立于列表权限体系，存在**三条 URL 生成路径**和**两条下载路由**，它们之间的映射关系非常容易误读：
 
-| 路由 | 鉴权方式 | 适配层级 |
-|------|----------|----------|
-| `/api/assets/:id` | `authMiddleware` + `assets.read` scope → `Asset.canUserView()` | ①②③ |
-| `/api/public/assets/:id?token=xxx` | HMAC 签名验证 → DB `assetId + userId` | ④⑤，也被 ① 用于 admin debug 预览 |
+| URL 生成方式 | 适用场景 | 指向的下载路由 | 是否带签名 | 过期时间 | 是否做隐私过滤 |
+|-------------|----------|---------------|-----------|---------|--------------|
+| `ZBookmark.assets[]` 仅含 `{id, assetType, fileName}`，**无 URL 字段** | Dashboard 已登录用户 | `/api/assets/:id`（需登录） | 否（用 session cookie） | N/A | 路由层 `Asset.canUserView()` 做权限判断 |
+| `Asset.getPublicSignedAssetUrl()`（`getAlignedExpiry(3600, 900)`） | 公开书签 `asPublicBookmark()` 的 `content.assetUrl` / `bannerImageUrl` | `/public/assets/:id?token=xxx`（匿名） | 是（HMAC-SHA256） | 1 小时对齐 + 15 分钟宽限期 | **不过滤**，所有类型资产（含 USER_UPLOADED、BOOKMARK_ASSET）都签 |
+| `Asset.getPublicSignedAssetUrl()`（`Date.now() + 10*60*1000`） | Admin debug `buildDebugInfo()` 的 `assets[].url` | `/public/assets/:id?token=xxx`（匿名） | 是（HMAC-SHA256） | 10 分钟固定 | **过滤** `PRIVACY_REDACTED_ASSET_TYPES`，USER_UPLOADED / BOOKMARK_ASSET 返回 `null` |
+
+| 下载路由 | 鉴权方式 | 适配 URL 生成方式 |
+|---------|----------|-----------------|
+| `/api/assets/:id` | `authMiddleware`（session/API Key）→ `apiKeyScopeMiddleware("assets","read")` → `Asset.canUserView()` | Dashboard 里 `ZBookmark.assets[]` 的 `id`（无 URL，前端拼路径 + cookie 鉴权） |
+| `/public/assets/:id?token=xxx` | `unauthedMiddleware` → `verifySignedToken()` → assetId 一致性 → DB 存在性 | 公开书签的签名 URL / Admin debug 的签名 URL |
 
 ---
 
@@ -118,8 +124,9 @@ canUserManage(): owner ✔  editor ✗  viewer ✗  public ✗
 | 查看协作者列表和邀请 | — | ✔（含 pending 邀请） | ✔（仅已接受） | ✔（仅已接受） | ✗（ownerName 可见，协作者隐藏） | ✗ |
 
 **注意事项**：
-- Admin ① 的 debug view 只暴露单个书签（`getBookmarkDebugInfo`），不走 List 角色体系，直接 `SELECT * FROM bookmarks WHERE id = ?`（[admin.ts L708-L787](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/admin.ts#L708-L787)）。因此 **admin 可以查看任何用户的任何书签**，即使该书签所在的列表未公开、admin 也不是协作者。
-- Admin debug view 仍有一层隐私过滤：`PRIVACY_REDACTED_ASSET_TYPES = { USER_UPLOADED, BOOKMARK_ASSET }` 的资产不给签名 URL（[bookmarks.ts L285-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L285-L288)），但 LINK_SCREENSHOT、ASSET_SCREENSHOT、OCR_RESULT 等衍生资产会以 10 分钟过期的签名 URL 返回。
+- Admin ① 的 debug view **不是列表级入口**——`admin.getBookmarkDebugInfo` 只接受单条 `bookmarkId`，不走 List 角色体系，直接 `SELECT * FROM bookmarks WHERE id = ?`（[admin.ts L708-L787](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/admin.ts#L708-L787)）。没有"列出所有用户书签"接口，admin 必须通过其他渠道获知精确 bookmarkId 才能查询。
+- Admin debug view 的 `assets[]` 有隐私过滤：`PRIVACY_REDACTED_ASSET_TYPES = { USER_UPLOADED, BOOKMARK_ASSET }` → `url: null`（[bookmarks.ts L285-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L285-L288)），但 LINK_SCREENSHOT、LINK_BANNER_IMAGE、LINK_PDF 等衍生资产会以 10 分钟过期的签名 URL 返回。**这个过滤只在 Admin debug view 中生效**，公开书签 `asPublicBookmark()` 不过滤。
+- Dashboard ②/③ 中 `ZBookmark.assets[]` 完全不含 URL 字段，只给 `{id, assetType, fileName}`，前端自行拼 `/api/assets/:id` 走已登录路由。
 
 ### 3.4 各视角书签数据字段输出对比
 
@@ -138,26 +145,47 @@ canUserManage(): owner ✔  editor ✗  viewer ✗  public ✗
 | htmlContent | ✔（preview 前 1000 字符） | ✔（完整） | ✗ | ✗ |
 | crawlStatus / crawledAt | ✔ | ✔ | ✗ | ✗ |
 | bannerImageUrl | — | — | ✔（带签名） | ✗（RSS 未用 enclosure） |
-| ASSET 资产 URL | ✔（10 分钟过期签名，隐私类型为 null） | ✔（10 分钟过期签名，隐私类型为 null） | ✔（1 小时对齐 + 15 分钟宽限期签名） | ❌（误用 `/api/assets/:id` 需登录的 URL） |
+| ASSET 书签的主资产 URL | ✔（10 分钟过期签名，USER_UPLOADED/BOOKMARK_ASSET → null） | ✗（ZBookmark content.assetUrl 无此字段；assets[] 仅含 id，前端拼 `/api/assets/:id` 走已登录路由） | ✔（1 小时对齐 + 15 分钟宽限期签名，**所有类型不过滤**） | ❌（误用 `/api/assets/:id` 需登录的 URL） |
+| 其他衍生资产（screenshot/pdf/banner 等） | ✔（10 分钟过期签名） | ✗（仅 id + assetType + fileName，前端拼 `/api/assets/:id`） | bannerImageUrl 有签名；其他衍生资产 ID 在 content 中但不单独签 URL | ✗（未用 enclosure） |
 
-### 3.5 各视角的资产下载路径
+### 3.5 各视角的资产下载路径与 URL 生成（按代码顺序）
 
-| 视角 | 调用的下载路由 | 鉴权链 |
-|------|----------------|--------|
-| ① Admin（debug view assets） | `/api/public/assets/:id?token=xxx`（签名 URL，10 分钟过期） | HMAC 验证 → assetId 匹配 → DB `id + userId` 存在性 |
-| ②/③ 已登录用户 | `/api/assets/:id` | `authMiddleware` → `apiKeyScopeMiddleware("assets", "read")` → `Asset.canUserView()`（owner / avatar公开 / bookmark 的协作者可访问） |
-| ④ 公开网页 | `/api/public/assets/:id?token=xxx`（1 小时对齐 + 15 分钟宽限期） | HMAC 验证 → assetId 匹配 → DB 存在性 |
-| ⑤ RSS（理论修复后） | 同 ④ | 同 ④ |
-| ⑤ RSS（当前代码） | `/api/assets/:id`（无 token） | `authMiddleware` 阻断 → **401 失败** |
+**三条独立的 URL 生成路径，两个下载路由**：
 
-**`Asset.canUserView()` 完整逻辑**（[assets.ts L225-L251](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/assets.ts#L225-L251)），按优先级：
+| 视角 | 模型层如何返回资产信息 | 生成/使用的 URL 类型 | 指向的下载路由 | 代码位置 |
+|------|------------------------|---------------------|---------------|---------|
+| ②/③ 已登录 Dashboard | `Bookmark.toZodSchema()` 返回 `ZBookmark.assets[] = [{id, assetType, fileName}]`，**无 URL 字段** | 前端自行拼 `/api/assets/{id}`，用 session cookie 鉴权 | `/api/assets/:id`（authMiddleware） | [bookmarks.ts L224-L228](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L224-L228) + [zAssetSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/bookmarks.ts#L34-L38) |
+| ① Admin debug | `Bookmark.buildDebugInfo()` 对每个资产调 `Asset.getPublicSignedAssetUrl(id, userId, 10min)`，**过滤 `PRIVACY_REDACTED_ASSET_TYPES`**（USER_UPLOADED / BOOKMARK_ASSET → `url: null`） | 已签名 URL `/public/assets/{id}?token=xxx` | `/public/assets/:id?token=xxx`（unauthedMiddleware + 签名验证） | [bookmarks.ts L364-L379](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L364-L379) |
+| ④ 公开网页（`asPublicBookmark`） | 对 ASSET 书签的主文件、LINK 书签的 banner image，调 `Asset.getPublicSignedAssetUrl(id, userId, 1h对齐+15min)`，**不过滤隐私类型**（所有资产均签） | 已签名 URL `/public/assets/{id}?token=xxx` | `/public/assets/:id?token=xxx`（unauthedMiddleware + 签名验证） | [bookmarks.ts L770-L837](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L770-L837) |
+| ⑤ RSS（当前 bug） | RSS 渲染代码 `toRSS()` 不用 `asPublicBookmark()` 已签名的 `content.assetUrl`，改而用 `getAssetUrl(assetId)` 拼 `/api/assets/{id}` | 未签名 URL `/api/assets/{id}`（需登录） | `/api/assets/:id`（被 authMiddleware 阻断 → 401） | [rss/utils.ts L53-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/utils/rss.ts#L53-L54) |
 
-1. `asset.userId === ctx.user.id` → 放行（资产 owner）
-2. `assetType === "avatar"` → 放行（头像公开）
-3. `asset.bookmarkId` 存在 → 调用 `BareBookmark.bareFromId()` → `isAllowedToAccessBookmark()` → 查书签是否属于当前用户，或是否在任一用户可 view 的列表中 → 放行/拒绝
-4. 其他情况 → 拒绝
+**两条下载路由的鉴权链（按代码执行顺序）**：
 
-因此，**Viewer 可以下载列表中所有书签关联的资产**（因为 viewer 的 List.canUserView() 返回 true，会传递到 BareBookmark → Asset.canUserView 的判断链路中）。
+- **`GET /api/assets/:id`（已登录）**：
+  1. `authMiddleware`（[auth.ts L25-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/middlewares/auth.ts#L25-L45)）：`ctx.user` 必须存在
+  2. `apiKeyScopeMiddleware("assets", "read")`：如果是 API Key 调用，需带 `assets:read` scope；session 调用跳过
+  3. `Asset.fromId(ctx, assetId).ensureCanView()` → `Asset.canUserView()`（[assets.ts L225-L251](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/assets.ts#L225-L251)）：
+     - `asset.userId === ctx.user.id` → ✅ 放行（owner）
+     - `assetType === "avatar"` → ✅ 放行（头像全局公开）
+     - `asset.bookmarkId` 存在 → `BareBookmark.bareFromId()` → `isAllowedToAccessBookmark()` → 该书签属于当前用户，或在任一当前用户具有 view 权限的列表中 → ✅/❌
+     - 其他 → ❌ 拒绝
+  4. `serveAsset()` 流式响应
+
+- **`GET /public/assets/:id?token=xxx`（匿名签名 URL）**：
+  1. `unauthedMiddleware`（[auth.ts L9-L22](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/middlewares/auth.ts#L9-L22)）：只检查 `ctx` 存在，不校验 user
+  2. `verifySignedToken(token, NEXTAUTH_SECRET, zAssetSignedTokenSchema)`（[signedTokens.ts L79-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/signedTokens.ts#L79-L105)）：
+     - Base64 解码 → JSON 解析 → HMAC 签名验证 → 过期检查 → Zod schema 校验
+  3. `tokenPayload.assetId !== URL.assetId` → ❌ 403（防止 token 挪用于其他资产）
+  4. DB `SELECT * FROM assets WHERE id = ? AND userId = ?` 找不到 → ❌ 404（防止越权访问他人资产）
+  5. `serveAsset()` 流式响应
+
+**隐私过滤的精确语义（易误读点）**：
+
+- `PRIVACY_REDACTED_ASSET_TYPES = { USER_UPLOADED, BOOKMARK_ASSET }` 仅在 **Admin debug view** 中生效，目的是不让 admin 拿到用户直接上传的原始文件的签名 URL。
+- 在 **公开书签 `asPublicBookmark()` 中不生效**——公开分享的 ASSET 书签本身就是用户主动选择公开的，USER_UPLOADED / BOOKMARK_ASSET 也会被正常签名。
+- **`ZBookmark.assets[]`（Dashboard 视图）完全不过滤**，因为 `/api/assets/:id` 路由有 `Asset.canUserView()` 兜底，只有 owner 或协作者才能下载。
+
+**因此 Viewer 可以下载列表中所有书签关联的资产**（Viewer 的 `List.canUserView() === true`，传递到 `BareBookmark.isAllowedToAccessBookmark()` → `Asset.canUserView()` 的第 3 条判断链）。
 
 ### 3.6 冒充上下文（impersonating context）的权限边界
 
@@ -500,7 +528,7 @@ const expiresAt = Date.now() + 10 * 60 * 1000; // 10 分钟
 
 `unauthedMiddleware` 仅检查 `ctx` 是否存在，不校验用户登录状态（[auth.ts L9-L22](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/middlewares/auth.ts#L9-L22)）。
 
-### 5.4 隐私过滤 — PRIVACY_REDACTED_ASSET_TYPES
+### 5.4 隐私过滤与签名 URL 的关系（按代码顺序精确对应）
 
 **文件**: [bookmarks.ts L285-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L285-L288)
 
@@ -511,7 +539,25 @@ const PRIVACY_REDACTED_ASSET_TYPES = new Set<AssetTypes>([
 ]);
 ```
 
-认证用户查看书签时，这两种类型的资产 **不生成签名 URL**（`url: null`）。但在公开书签中，资产 URL 的生成逻辑不同——`asPublicBookmark()` 只对 ASSET 类型生成 `assetUrl`（用于 PDF/图片下载），banner image 的生成不受此过滤影响。
+**这个 Set 只在一个地方使用**——`Bookmark.buildDebugInfo()`（Admin 调试视图）。它控制的是**给 admin 看的 debug info 中，用户直接上传的原始文件要不要给签名 URL**。过滤逻辑在 [bookmarks.ts L369-L371](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L369-L371)：
+
+```ts
+const url = !PRIVACY_REDACTED_ASSET_TYPES.has(a.assetType)
+  ? Asset.getPublicSignedAssetUrl(a.id, bookmark.userId, expiresAt) // 10 分钟
+  : null;
+```
+
+**三条 URL 生成路径的精确对比（与 §1 概览、§3.5 一致）**：
+
+| 路径 | 是否使用 PRIVACY_REDACTED_ASSET_TYPES | 过滤结果 | 生成的 URL 指向 |
+|------|---------------------------------------|---------|---------------|
+| ① Admin debug `buildDebugInfo().assets[]` | ✅ 使用 | USER_UPLOADED、BOOKMARK_ASSET → `url: null`；其他类型（screenshot、banner、pdf 等）→ 10 分钟签名 URL | `/public/assets/:id?token=xxx` |
+| ②/③ Dashboard `ZBookmark.assets[]` | ❌ 不使用（完全无 URL 字段） | `{id, assetType, fileName}` 仅元数据，前端自行拼 `/api/assets/:id` + session cookie | `/api/assets/:id`（authMiddleware） |
+| ④ 公开 `asPublicBookmark()` content.assetUrl / bannerImageUrl | ❌ 不使用 | 所有类型（含 USER_UPLOADED、BOOKMARK_ASSET）→ 1 小时对齐 + 15 分钟宽限期签名 URL | `/public/assets/:id?token=xxx` |
+
+**为什么公开书签不过滤？** 设计上，公开分享的 ASSET 书签是用户主动把列表设为公开的，列表内的所有内容（包括用户上传的 PDF、图片）理应随列表一起公开。而 Admin debug view 是管理员排查问题用的，默认不让管理员获得用户原始文件的直接下载链接（除非用户明确通过公开分享暴露）。
+
+**注意老版本描述的错误**：之前说"认证用户查看书签时，这两种类型的资产不生成签名 URL"——这不对。认证用户在 Dashboard 中拿到的是 `ZBookmark.assets[]`，它**根本就没有 URL 字段**，不是"不生成签名 URL"，而是"根本不生成 URL，前端走独立的 `/api/assets/:id` 已登录路由"。
 
 ---
 
@@ -557,7 +603,7 @@ Next.js 页面使用 SSR（服务端渲染），无 `revalidate` 或 `dynamic` �
 | 10 | **RSS channel siteUrl 指向私有 Dashboard** | **中** | `<channel><link>`（`siteUrl`）写死为 `NEXTAUTH_URL/dashboard/lists/:listId`（需登录的私有 Dashboard），而非公开列表页。`feedUrl`（`<atom:link rel="self">`）是正确的 RSS 订阅 URL。注意：即使把 siteUrl 改为 `/public/lists/:listId`，对**仅 RSS Token 访问**的场景（`public=false`，只靠 token 访问）也不生效——公开列表页完全不认识 `?token=` 参数，调用 `publicBookmarks.*` 时 token 传 null，仍会被 `public=true` 条件挡住。 |
 | 11 | **RSS TEXT 类型书签被过滤** | **低** | TEXT 书签在 `toRSS()` 的 `.filter(b => LINK \|\| ASSET)` 中被完全过滤，RSS 客户端无法看到纯文本书签。 |
 | 12 | **RSS 无 enclosure 元素** | **低** | ASSET 类书签和 banner image 未使用 RSS 2.0 `<enclosure>` 或 `<media:thumbnail>` 扩展，RSS 阅读器无法渲染附件和缩略图。 |
-| 13 | **Admin debug view 可跨用户查看任何书签（但需精确 bookmarkId）** | **中** | `admin.getBookmarkDebugInfo` 走 `createAdminScopedProcedure("bookmarks")` 校验 `ctx.user.role === "admin"` + API Key `admin:bookmarks:read` scope，`Bookmark.buildDebugInfo()` 内部再冗余校验一次 admin 角色。核心限制：**必须知道精确 bookmarkId**——没有"列出所有用户书签"接口，无法枚举。但 admin 如果通过其他渠道（日志、support request）获得 bookmarkId，可直接 `SELECT * FROM bookmarks WHERE id = ?` 读取完整内容（含 htmlContent 前 1000 字符 preview），绕过 List 角色体系。 |
+| 13 | **Admin debug view 可跨用户查看任何书签（但需精确 bookmarkId）** | **中** | `admin.getBookmarkDebugInfo` 走 `createAdminScopedProcedure("bookmarks")` 校验 `ctx.user.role === "admin"` + API Key `admin:bookmarks:read` scope，`Bookmark.buildDebugInfo()` 内部再冗余校验一次 admin 角色。核心限制：**必须知道精确 bookmarkId**——没有"列出所有用户书签"接口，无法枚举。但 admin 如果通过其他渠道（日志、support request）获得 bookmarkId，可直接 `SELECT * FROM bookmarks WHERE id = ?` 读取完整内容（含 htmlContent 前 1000 字符 preview），绕过 List 角色体系。**资产隐私过滤仅在此处生效**：USER_UPLOADED / BOOKMARK_ASSET 返回 `url: null`（10 分钟签名 URL 不签发），但截图、banner、PDF 等衍生资产正常签发。 |
 | 14 | **Viewer 角色可下载列表中所有书签的关联资产** | **低** | `Asset.canUserView()` 通过 `BareBookmark.bareFromId` → `List.forBookmark` → `List.canUserView()` 级联判断。Viewer 对列表有 view 权限会自动传递到所有关联资产。符合预期，但与"viewer 不可写"的权限模型相比，资产下载算是 viewer 的隐藏能力。 |
 | 15 | **公开视角 impersonating context 以 owner 身份读全量书签** | **低** | `buildImpersonatingAuthedContext(listdb.userId)` 在层 ④/⑤ 内部构造以 owner 身份的 ctx，`Bookmark.loadMulti` 会因为 `ctx.user.id === bookmarkOwnerId` 放行所有书签。依赖后续 `asPublicBookmark()` 做数据脱敏。安全依赖于脱敏函数的完整性——如果有字段被加入 ZBookmark 但忘记在 asPublicBookmark 中裁剪，会直接泄漏。`listObj` 的 `userRole: "public"` 保证 `ensureCanManage()` / `ensureCanEdit()` 会在任何写操作前立刻抛 `FORBIDDEN`，深度防御。 |
 | 16 | **Token-only RSS 访问无法通过网页查看同一列表** | **低** | 对于 `public=false` 但持有正确 RSS Token 的用户，RSS feed 可以正常读取，但点击 `<channel><link>` 跳转的公开列表页 `/public/lists/:id` 无法识别 token，会报 `List not found`。两条通道的 token 体系没有打通。 |
@@ -622,6 +668,17 @@ E2E 测试覆盖了以下越权场景：
               → HMAC-SHA256 签名 → Base64 编码
     → 返回 HTML + 带签名 token 的资产 URL
 
+Admin 调试视图（单书签）:
+  Admin 浏览器 → GET /trpc/admin.getBookmarkDebugInfo?input={bookmarkId:xxx}
+    → authedProcedure (校验 ctx.user 存在)
+    → createAdminScopedProcedure("bookmarks") → ctx.user.role === "admin" ? + API Key scope admin:bookmarks:read
+    → Bookmark.buildDebugInfo(ctx, bookmarkId)
+      → 内部二次校验 ctx.user.role !== "admin" → FORBIDDEN
+      → SELECT * FROM bookmarks WHERE id=? （绕过 List 角色体系）
+      → PRIVACY_REDACTED_ASSET_TYPES 过滤: USER_UPLOADED / BOOKMARK_ASSET → url: null
+      → 其他资产: Asset.getPublicSignedAssetUrl(id, userId, Date.now()+10min)  (走 /public/assets/:id?token=xxx)
+      → LINK: htmlContent preview 前 1000 字符
+
 资产下载（正确路径）:
   浏览器 → GET /api/public/assets/{assetId}?token=xxx
     → unauthedMiddleware (仅检查 ctx 存在)
@@ -632,12 +689,16 @@ E2E 测试覆盖了以下越权场景：
     → serveAsset() → Cache-Control: private, max-age=31536000, immutable
 
 已登录 Dashboard 资产下载（/api/assets）:
-  浏览器 → GET /api/assets/{assetId}  (带 session cookie)
-    → authMiddleware (校验 ctx.user 存在)
-    → apiKeyScopeMiddleware("assets", "read")
-    → Asset.fromId(ctx, assetId) → ensureCanView()
-      → 资产 owner 可访问；avatar 公开；bookmark 的协作者可访问
-    → serveAsset()
+  Dashboard 前端 → 拿到 ZBookmark.assets[] = [{id, assetType, fileName}] （无 URL 字段）
+    → 浏览器发起 GET /api/assets/{assetId} （带 session cookie / Authorization 头）
+      → authMiddleware (校验 ctx.user 存在)
+      → apiKeyScopeMiddleware("assets", "read") （API Key 调用需 scope，session 调用跳过）
+      → Asset.fromId(ctx, assetId).ensureCanView()
+        → asset.userId === ctx.user.id ? ✅
+        → assetType === "avatar" ? ✅
+        → asset.bookmarkId 存在 ? BareBookmark.bareFromId → isAllowedToAccessBookmark → 检查该书签是否在 ctx.user 可 view 的列表中 ? ✅/❌
+        → 其他 ❌
+      → serveAsset()
 
 RSS Feed 生成（token 可选）:
   RSS 阅读器 → GET /api/v1/rss/lists/:listId?token=xxx（token 可省略，省略时仅公开列表可访问）
