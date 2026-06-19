@@ -647,7 +647,145 @@ const [section, setSection] = useQueryState("section", {
 
 **一句话总结**：视频下载不影响卡片缩略图，卡片缩略图也不依赖视频下载。两者是完全分离的数据流。
 
-### 7.5 抓取中状态的视觉反馈
+### 7.5 URL 状态边界：section query 参数与下拉禁用的非等价性
+
+`section` 是一个可以被 URL 直接篡改的状态（`?section=video`），而下拉菜单的 `disabled` 只是 UI 层的建议。两者的保护级别完全不同。
+
+#### 7.5.1 useQueryState 的原始值透传
+
+**关键代码**：[LinkContentSection.tsx#L128-L130](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L128-L130)
+
+```typescript
+const [section, setSection] = useQueryState("section", {
+  defaultValue: defaultSection,
+});
+```
+
+`nuqs` 的 `useQueryState`（未指定 `parseAs` 时）采用 **原始字符串透传** 策略：
+- 不做任何 parse/validate，URL 里写什么就返回什么
+- 如果 query 不存在，才返回 `defaultValue`
+- 所以用户手动访问 `?section=video`、`?section=garbage`、`?section=not_exist` 都会被原样接收
+
+**与下拉 Select 组件的交互**：
+- `Select` 的 `value={section}` 只负责显示当前选中值
+- 如果 `section` 值不在任何 `SelectItem` 的 `value` 中，Select 会显示空（不匹配任何选项），但内部状态 `section` 变量本身**不受影响**
+- 即：`disabled` 只阻止用户通过 UI 点击选择，**不阻止 URL 直接注入**
+
+#### 7.5.2 指定禁用视图时的渲染行为（以 `?section=video` 为例）
+
+假设某个书签**没有下载视频**（`videoAssetId === null`），但用户手动输入 `?section=video`：
+
+```
+步骤 1: section 值获取
+  useQueryState → "video"（URL 直接注入，绕过下拉 disabled）
+
+步骤 2: 内容分支匹配
+  [LinkContentSection.tsx#L166-L167]
+  } else if (section === "video") {
+    content = <VideoSection link={bookmark.content} />;
+  }
+  → 匹配成功，渲染 VideoSection
+
+步骤 3: VideoSection 内部渲染
+  [LinkContentSection.tsx#L94-L106]
+  <video controls>
+    <source src={`/api/assets/${link.videoAssetId}`} />
+  </video>
+  → videoAssetId 为 null，最终 src = "/api/assets/null"
+
+步骤 4: 浏览器请求 /api/assets/null
+  [assets.ts#L43-L50]
+  .get("/:assetId", ...)
+    const assetId = c.req.param("assetId");   // "null"
+    const asset = await Asset.fromId(ctx, assetId);
+
+步骤 5: Asset.fromId 查不到记录
+  [assets.ts#L28-L47]
+  db.query.assets.findFirst({ where: eq(assets.id, "null") })
+    → 返回 undefined
+    → throw new TRPCError({ code: "NOT_FOUND", message: "Asset not found" })
+
+步骤 6: 最终浏览器表现
+  → <video> 的 <source> 请求 404
+  → 视频区域显示为空白或浏览器默认的 "视频无法播放"
+  → 不抛 JS 错误，不触发 ErrorBoundary
+```
+
+**同样的模式适用于其他 asset 依赖视图**：
+
+| section 值 | assetId 为空时生成的 src | HTTP 状态 | 浏览器表现 |
+|-----------|-------------------------|----------|-----------|
+| `video` | `/api/assets/null` | 404 | 视频空白或 "无法播放" |
+| `screenshot` | `/api/assets/null` → `<Image src={...}>` | 404 | 图片区域空白 (next/image) |
+| `pdf` | `/api/assets/null` → `<iframe src={...}>` | 404 | iframe 显示 404 页面 |
+| `archive` | `/api/assets/undefined` (fullPageArchiveAssetId ?? precrawledArchiveAssetId) | 404 | iframe 显示 404 页面 |
+
+#### 7.5.3 指定过期/已删除资产视图的行为
+
+如果 `videoAssetId` **曾经存在**，但后来资产被删除（`silentDeleteAsset`）：
+
+```
+1. section = "video" → VideoSection 渲染
+2. src = "/api/assets/{valid-asset-id-but-deleted}"
+3. Asset.fromId → db 查询不到 → TRPCError NOT_FOUND (404)
+4. 同 7.5.2，表现为视频空白
+```
+
+后端在 [Asset.fromId](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/trpc/models/assets.ts#L28-L47) 层做了 **所有权双重校验**：
+- 先查 assets 表是否存在记录
+- 再调 `canUserView()` 校验 `userId === ctx.user.id` 或公开分享权限
+- 无论哪种失败，都统一抛 `NOT_FOUND`（不区分 "不存在" 和 "无权访问"，避免信息泄露）
+
+#### 7.5.4 指定完全无效值时的回退行为
+
+如果用户写 `?section=foobar`（既不是 ContentRenderer 的 id，也不是 5 个内置视图名）：
+
+```typescript
+// [LinkContentSection.tsx#L140-L172]
+
+const customRenderer = availableRenderers.find(r => r.id === section);
+if (customRenderer) {          // "foobar" 不在 renderer 列表里 → false
+  ...
+} else if (section === "cached") {    // false
+  ...
+} else if (section === "archive") {   // false
+  ...
+} else if (section === "video") {     // false
+  ...
+} else if (section === "pdf") {       // false
+  ...
+} else {                              // ← 走到 else 兜底
+  content = <ScreenshotSection link={bookmark.content} />;
+}
+```
+
+**回退到 ScreenshotSection**（即把 Screenshot 当作了"默认的兜底视图"）。如果 `screenshotAssetId` 也是 null，就会出现 7.5.2 里的 `/api/assets/null` 404 问题。
+
+#### 7.5.5 为什么下拉禁用 ≠ 渲染保护
+
+从上面的分析可以得出三层保护力度的差异：
+
+```
+层级 1（最弱）: 下拉菜单 disabled
+  作用: 仅阻止用户通过 UI 点击
+  绕过方式: 手动改 URL ?section=xxx
+  代码位置: LinkContentSection.tsx L205-L240 各 SelectItem 的 disabled 属性
+
+层级 2（缺失）: 渲染层空值校验
+  现状: VideoSection / ScreenshotSection / PDFSection / FullPageArchiveSection
+        都没有对 assetId === null 做前置判断，直接拼接 URL
+  结果: 生成 "/api/assets/null" 或 "/api/assets/undefined"
+  代码位置: LinkContentSection.tsx L65-L116 四个 section 组件
+
+层级 3（最强，存在）: 后端 API 权限校验
+  作用: Asset.fromId 校验记录存在 + 用户所有权
+  失败返回: 统一 404 NOT_FOUND（不区分不存在/无权）
+  代码位置: packages/trpc/models/assets.ts L28-L58
+```
+
+**一句话总结**：下拉 `disabled` 只是 UI 层的便利交互，不是安全边界。真正的保护在后端 `Asset.fromId`。但中间层（渲染组件）缺少空值判断会导致用户看到空白/404 的糟糕体验而非友好提示。
+
+### 7.6 抓取中状态的视觉反馈
 
 [BookmarkPreview.tsx#L47-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/BookmarkPreview.tsx#L47-L57) 当 `isBookmarkStillCrawling(bookmark)` 为 true 时:
 
