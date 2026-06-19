@@ -73,35 +73,77 @@ async function readImageText(buffer: Buffer) {
 代码位置：[assetPreprocessingWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/46-karakeep/apps/workers/workers/assetPreprocessingWorker.ts#L138-L168)
 
 ```typescript
-async function readImageTextWithLLM(buffer: Buffer, contentType: string) {
+async function readImageTextWithLLM(
+  buffer: Buffer,
+  contentType: string,
+): Promise<string | null> {
+  const inferenceClient = InferenceClientFactory.build();
+  if (!inferenceClient) {
+    logger.warn(
+      "[assetPreprocessing] LLM OCR is enabled but no inference client is configured. Falling back to Tesseract.",
+    );
+    return readImageText(buffer);
+  }
+
   const base64 = buffer.toString("base64");
   const prompt = buildOCRPrompt();
+
   const response = await inferenceClient.inferFromImage(
     prompt, contentType, base64, { schema: null }
   );
-  return response.response.trim() || null;
+
+  const extractedText = response.response.trim();
+  if (!extractedText) {
+    return null;
+  }
+
+  return extractedText;
 }
 ```
 
-**处理逻辑选择：** [assetPreprocessingWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/46-karakeep/apps/workers/workers/assetPreprocessingWorker.ts#L296-L318)
+> **重要：** `readImageTextWithLLM` 函数内部有**第一层回退机制**——当推理客户端未配置时，会直接调用 `readImageText()` 回退到 Tesseract。
+
+#### 2.2.3 OCR 引擎选择与回退逻辑
+代码位置：[assetPreprocessingWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/46-karakeep/apps/workers/workers/assetPreprocessingWorker.ts#L278-L335)
+
+**外层选择逻辑（`extractAndSaveImageText` 函数）：**
 
 ```typescript
+let imageText = null;
+
 if (serverConfig.ocr.useLLM) {
-  // 优先使用 LLM OCR，失败后静默回退
+  logger.info(`Attempting to extract text from image using LLM OCR.`);
   try {
     imageText = await readImageTextWithLLM(asset, contentType);
   } catch (e) {
     logger.error(`Failed to read image text with LLM: ${e}`);
   }
 } else {
-  // 使用 Tesseract OCR
+  logger.info(`Attempting to extract text from image using Tesseract.`);
   try {
     imageText = await readImageText(asset);
   } catch (e) {
     logger.error(`Failed to read image text: ${e}`);
   }
 }
+
+if (!imageText) {
+  return false;
+}
 ```
+
+**回退机制的真实行为：**
+
+| 场景 | 是否回退到 Tesseract | 行为 |
+|------|---------------------|------|
+| LLM 启用 + 推理客户端未配置 | ✅ 是 | 在 `readImageTextWithLLM` 内部直接调用 `readImageText()` 回退 |
+| LLM 启用 + 推理调用**抛出异常** | ❌ 否 | catch 后仅记录错误，`imageText` 保持为 null，不回退 |
+| LLM 启用 + 返回空文本 | ❌ 否 | 返回 null，不回退 |
+| LLM 启用 + 置信度不适用 | - | LLM OCR 没有置信度过滤机制 |
+| Tesseract 模式 + 置信度过低 | ❌ 否 | 返回 null，任务视为未提取到文本 |
+| Tesseract 模式 + 调用抛出异常 | ❌ 否 | catch 后仅记录错误，不回退 |
+
+> **关键澄清**：之前的"LLM OCR 失败后自动回退 Tesseract"的说法不准确。实际上**仅当推理客户端未配置时**才会自动回退。其他所有失败场景（调用异常、返回空文本等）都**不会**回退，而是直接返回 false，任务被视为"未提取到文本"但不报错。
 
 ### 2.3 OCR 相关配置
 配置文件：[config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/46-karakeep/packages/shared/config.ts)
