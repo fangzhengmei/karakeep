@@ -8,13 +8,13 @@
 
 Karakeep 对同一批列表/书签/资产存在 **五层视角**，每层通过不同的代码路径、不同的鉴权方式呈现不同的数据。下表从最高权限到最低权限排列：
 
-| 层级 | 身份 | 代码入口 | userRole 枚举值 |
-|------|------|----------|-----------------|
-| ① 管理员调试视图 | `users.role = "admin"` | `GET /trpc/admin.getBookmarkDebugInfo` | N/A（绕过列表权限） |
-| ② 已登录列表所有者 | session / API Key（lists scope） | `List.fromId(ctx, id)` 命中 `bookmarkLists.userId = ctx.user.id` | `"owner"` |
-| ③ 已登录协作者 | 被邀请加入列表 | `List.fromId()` 命中 `listCollaborators` 表 | `"editor"` 或 `"viewer"` |
-| ④ 公开列表网页访问 | 匿名浏览器 | `GET /public/lists/[listId]` → tRPC `publicBookmarks.*` | `"public"`（impersonate 上下文内） |
-| ⑤ 仅 RSS Token 访问 | 匿名 RSS 阅读器 | `GET /api/v1/rss/lists/:listId?token=xxx` | `"public"`（impersonate 上下文内） |
+| 层级 | 身份 | 代码入口 | userRole 枚举值 | 访问列表需要的条件 |
+|------|------|----------|-----------------|--------------------|
+| ① 管理员调试视图 | `users.role = "admin"` | `GET /trpc/admin.getBookmarkDebugInfo` | N/A（绕过列表权限） | 必须知道精确 bookmarkId，无列表级入口 |
+| ② 已登录列表所有者 | session / API Key（lists scope） | `List.fromId(ctx, id)` 命中 `bookmarkLists.userId = ctx.user.id` | `"owner"` | 列表存在 + owner 身份 |
+| ③ 已登录协作者 | 被邀请加入列表 | `List.fromId()` 命中 `listCollaborators` 表 | `"editor"` 或 `"viewer"` | 列表存在 + collaborator 角色 |
+| ④ 公开列表页 | 匿名浏览器 | `GET /public/lists/[listId]` → tRPC `publicBookmarks.*` | `"public"`（impersonate 上下文内） | `bookmarkLists.public = true` （硬编码 token=null） |
+| ⑤ RSS Feed 访问 | 匿名 RSS 阅读器 | `GET /api/v1/rss/lists/:listId?token=xxx` | `"public"`（impersonate 上下文内） | `public = true` **OR** `rssToken = token`（token 可选，省略时与 ④ 相同） |
 
 后两层（④⑤）都通过 `List.getPublicList()` 的 `OR(public=true, rssToken=token)` 分支进入，差异只在输出格式（HTML vs RSS XML）以及 RSS 渲染代码自身的 bug。
 
@@ -55,13 +55,30 @@ export const bookmarkLists = sqliteTable("bookmarkLists", {
 
 | # | 视角 | tRPC/HTTP 入口 | 第一层中间件 | 第二层中间件 | 模型层入口 |
 |---|------|----------------|--------------|--------------|------------|
-| ① | Admin 调试视图 | `admin.getBookmarkDebugInfo` | `authedProcedure`（校验 ctx.user 存在） | `createAdminScopedProcedure` → `isAdmin` 校验 `ctx.user.role === "admin"` | `Bookmark.buildDebugInfo()` 内部再校验一次 admin |
-| ② | List Owner | `lists.*` `bookmarks.*` 等 | `createScopedAuthedProcedure("lists"/"bookmarks")`（session 直接放行；API Key 校验 scope） | `ensureListAtLeastViewer` → `List.fromId(ctx, id)` 查 `bookmarkLists.userId = ctx.user.id` | `canUserManage() / canUserEdit() / canUserView()` |
+| ① | Admin 调试视图 | `admin.getBookmarkDebugInfo(bookmarkId)` | `authedProcedure`（校验 `ctx.user` 存在） | `createAdminScopedProcedure("bookmarks")` → 校验 `ctx.user.role === "admin"`，且 API Key 需带 `admin:bookmarks:read` scope | `Bookmark.buildDebugInfo()` 内部再校验一次 admin 角色 |
+| ② | List Owner | `lists.*` `bookmarks.*` 等 | `createScopedAuthedProcedure("lists"/"bookmarks")`（session 直接放行；API Key 校验对应 scope） | `ensureListAtLeastViewer` → `List.fromId(ctx, id)` 查 `bookmarkLists.userId = ctx.user.id` | `canUserManage() / canUserEdit() / canUserView()` |
 | ③ | List Collaborator | `lists.*` `bookmarks.*` 等 | 同上 | `ensureListAtLeastViewer` → `List.fromId()` 回退查 `listCollaborators` 表，取 `role` 字段 | `canUserView()` 对 viewer/editor 返回 true |
-| ④ | 公开列表页 | `publicBookmarks.getPublicListMetadata` / `getPublicBookmarksInList` | `publicProcedure`（仅限流，无 auth 校验） | 无 | `List.getPublicList(ctx, id, token=null)` → `WHERE ... OR public=true` |
-| ⑤ | RSS Token 访问 | `GET /api/v1/rss/lists/:id?token=xxx` (Hono) | `unauthedMiddleware`（仅检查 ctx 存在，不校验 user） | 无 | `List.getPublicListContents(ctx, id, token)` → `WHERE ... OR rssToken=token` |
+| ④ | 公开列表页 | `publicBookmarks.getPublicListMetadata` / `getPublicBookmarksInList` | `publicProcedure`（仅限流，无 auth 校验） | 无 | `List.getPublicList(ctx, id, token=null)` → `WHERE ... AND public=true` |
+| ⑤ | RSS 访问 | `GET /api/v1/rss/lists/:id?token=xxx` (Hono) | `unauthedMiddleware`（仅检查 ctx 存在，不校验 user） | 无 | `List.getPublicListContents(ctx, id, token)` → `WHERE ... AND (public=true OR rssToken=token)` |
 
-关键结论：**层 ④ 和 层 ⑤ 使用完全相同的模型层函数 `getPublicList()` / `getPublicListContents()`**，唯一差异是调用时 `token` 参数：层 ④ 传 `null`（仅 `public=true` 可过），层 ⑤ 传 RSS Token 值（`public=true` **或** `rssToken` 匹配都可过）。
+**关键澄清（易误读点）**：
+
+1. **RSS `token` 是可选参数**，不是必填。[rss.ts L17](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts#L17) 定义了 `token: z.string().min(1).optional()`。当 token 省略时，`token ?? null`，走与层 ④ 相同的 `public=true` 分支。所以**不带 token 也可以 RSS 订阅公开列表**。
+
+2. **OR 语义精确表达式**（[lists.ts L172-L179](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L172-L179)）：
+   ```
+   WHERE id = ? AND (
+     (public = true) OR
+     (token IS NOT NULL AND rssToken = token)
+   )
+   ```
+   当 token 为 null 时，第二个条件退化为 `false`，只剩 `public=true`。
+
+3. **Admin 调试视图必须知道 bookmarkId**：`admin.getBookmarkDebugInfo` 只接受单条 `bookmarkId` 作为输入，没有"列出所有用户书签"的接口。admin 必须通过其他渠道（如日志、support ticket）获知具体 bookmarkId 才能查询。
+
+4. **Admin 角色双重校验**：除了 `createAdminScopedProcedure` 中间件，`Bookmark.buildDebugInfo()` 内部（[bookmarks.ts L278-L280](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L278-L280)）还有一次冗余校验 `if (ctx.user.role !== "admin") throw new TRPCError({ code: "FORBIDDEN" })`，防御中间件被绕过的深度攻击。
+
+5. **层 ④ 和 层 ⑤ 使用完全相同的模型层函数** `getPublicList()` / `getPublicListContents()`，唯一差异是调用时 `token` 参数：层 ④ 硬编码传 `null`（仅 `public=true` 可过），层 ⑤ 传 URL 查询参数中的 token 值（`public=true` **或** `rssToken` 匹配都可过）。
 
 ### 3.2 List 角色矩阵与代码对应
 
@@ -330,16 +347,39 @@ RSS 2.0 标准中 `<enclosure>` 元素用于表示附件（图片/PDF等）。`t
 1. ASSET 类书签在 RSS 客户端中不会以附件形式渲染（需要用户点击跳转）。
 2. banner images（`bannerImageUrl` 字段中已经包含的签名图片 URL）不会作为缩略图在 RSS 阅读器中显示。
 
-#### 4.5.5 RSS 跳转链接指向私有 Dashboard
+#### 4.5.5 RSS feedUrl 与 siteUrl 的精确含义（易误读点）
 
-**文件**: [rss.ts L46-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts#L46-L47)
+**文件**: [rss.ts L44-L48](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts#L44-L48)
 
 ```ts
-feedUrl: `${serverConfig.publicApiUrl}/v1/rss/lists/${listId}`,
-siteUrl: `${serverConfig.publicUrl}/dashboard/lists/${listId}`,  // ← 需要登录
+const rssFeed = toRSS(
+  {
+    title: `Bookmarks from ${list.icon} ${list.name}`,
+    feedUrl: `${serverConfig.publicApiUrl}/v1/rss/lists/${listId}`,    // ← RSS 订阅 URL（正确）
+    siteUrl: `${serverConfig.publicUrl}/dashboard/lists/${listId}`,    // ← 私有 Dashboard 链接（问题所在）
+    description: list.description ?? undefined,
+  },
+  res.bookmarks,
+);
 ```
 
-`siteUrl`（RSS 2.0 `<channel><link>` 元素）指向的是 `/dashboard/lists/:listId`——这个是 **需要登录的 Dashboard 页面**，而不是公开分享页面 `/public/lists/:listId`。订阅者点击后会被弹到登录页。
+**两个 URL 的精确含义**：
+
+| 变量 | 生成规则 | RSS 元素 | 用途 | 是否正确 |
+|------|----------|----------|------|----------|
+| `feedUrl` | `NEXTAUTH_URL` + `/api/v1/rss/lists/{listId}` | `<atom:link rel="self" href="...">` | RSS 阅读器识别 feed 自身地址，用于去重和重新订阅 | ✅ 正确 |
+| `siteUrl` | `NEXTAUTH_URL` + `/dashboard/lists/{listId}` | `<channel><link>` | RSS 阅读器点击"访问原网站"时跳转的页面 | ❌ 错误（指向私有 Dashboard） |
+
+**配置来源**（[config.ts L264-L265](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/config.ts#L264-L265)）：
+- `publicUrl: NEXTAUTH_URL`（用户部署时配置的域名，如 `https://karakeep.example.com`）
+- `publicApiUrl: NEXTAUTH_URL + "/api"`
+
+**修复方向**：`siteUrl` 应改为 `${serverConfig.publicUrl}/public/lists/${listId}`，指向公开列表页面而非私有 Dashboard。
+
+特别注意：对于**仅 RSS Token 访问**的场景（`public=false` 但有正确的 `?token=xxx`），`/public/lists/${listId}` 公开页面本身无法打开（因为层 ④ 不走 OR 逻辑，只看 `public=true`）。此时需要考虑：
+- 对于 token-only 访问，`siteUrl` 应该仍然是 RSS feed 本身（附带 token），或者考虑公开页面是否也接受 token 参数。
+- 目前代码中，`/public/lists/:listId` 页面完全不认识 `?token=` 参数，也不会传递给 `publicBookmarks.*` tRPC 调用。
+
 
 #### 4.5.6 类型过滤副作用：TEXT 书签在 RSS 中不可见
 
@@ -514,12 +554,13 @@ Next.js 页面使用 SSR（服务端渲染），无 `revalidate` 或 `dynamic` �
 | 7 | **RSS ASSET 链接不可下载** | **高** | RSS Feed 中 ASSET 类书签的 URL 使用 `getAssetUrl()`（`/api/assets/:id`，需登录），**丢弃**了 `asPublicBookmark()` 中已生成的签名 `assetUrl`（`/api/public/assets/:id?token=xxx`）。RSS 订阅者点击会被弹到登录页。 |
 | 8 | **RSS description 永远为空** | **中** | `zPublicBookmarkSchema` 声明了 `description` 字段，但 `asPublicBookmark()` 的返回对象中没有该字段。RSS 渲染 `bookmark.description ?? ""` → 永远空字符串。 |
 | 9 | **RSS LINK author 永远缺失** | **低** | LINK 类型的公开 content schema 声明了 `author` 字段，但 `getContent(LINK)` 返回 `{type, url}` 不包含 author。RSS 的 `<author>` 元素永远不输出。 |
-| 10 | **RSS channel siteUrl 指向私有 Dashboard** | **中** | `<channel><link>` 指向 `/dashboard/lists/:listId`（需登录），订阅者点击会被弹到登录页。应改为 `/public/lists/:listId`。 |
+| 10 | **RSS channel siteUrl 指向私有 Dashboard** | **中** | `<channel><link>`（`siteUrl`）写死为 `NEXTAUTH_URL/dashboard/lists/:listId`（需登录的私有 Dashboard），而非公开列表页。`feedUrl`（`<atom:link rel="self">`）是正确的 RSS 订阅 URL。注意：即使把 siteUrl 改为 `/public/lists/:listId`，对**仅 RSS Token 访问**的场景（`public=false`，只靠 token 访问）也不生效——公开列表页完全不认识 `?token=` 参数，调用 `publicBookmarks.*` 时 token 传 null，仍会被 `public=true` 条件挡住。 |
 | 11 | **RSS TEXT 类型书签被过滤** | **低** | TEXT 书签在 `toRSS()` 的 `.filter(b => LINK \|\| ASSET)` 中被完全过滤，RSS 客户端无法看到纯文本书签。 |
 | 12 | **RSS 无 enclosure 元素** | **低** | ASSET 类书签和 banner image 未使用 RSS 2.0 `<enclosure>` 或 `<media:thumbnail>` 扩展，RSS 阅读器无法渲染附件和缩略图。 |
-| 13 | **Admin debug view 可跨用户查看任何书签** | **中** | `admin.getBookmarkDebugInfo` 直接 `SELECT * FROM bookmarks WHERE id = ?`，绕过 List 角色体系。任何 admin 都可以查看任何用户的任何书签内容（含 htmlContent 前 1000 字符 preview），即使列表未公开、admin 不是协作者。 |
+| 13 | **Admin debug view 可跨用户查看任何书签（但需精确 bookmarkId）** | **中** | `admin.getBookmarkDebugInfo` 走 `createAdminScopedProcedure("bookmarks")` 校验 `ctx.user.role === "admin"` + API Key `admin:bookmarks:read` scope，`Bookmark.buildDebugInfo()` 内部再冗余校验一次 admin 角色。核心限制：**必须知道精确 bookmarkId**——没有"列出所有用户书签"接口，无法枚举。但 admin 如果通过其他渠道（日志、support request）获得 bookmarkId，可直接 `SELECT * FROM bookmarks WHERE id = ?` 读取完整内容（含 htmlContent 前 1000 字符 preview），绕过 List 角色体系。 |
 | 14 | **Viewer 角色可下载列表中所有书签的关联资产** | **低** | `Asset.canUserView()` 通过 `BareBookmark.bareFromId` → `List.forBookmark` → `List.canUserView()` 级联判断。Viewer 对列表有 view 权限会自动传递到所有关联资产。符合预期，但与"viewer 不可写"的权限模型相比，资产下载算是 viewer 的隐藏能力。 |
-| 15 | **公开视角 impersonating context 以 owner 身份读全量书签** | **低** | `buildImpersonatingAuthedContext(listdb.userId)` 在层 ④/⑤ 内部构造以 owner 身份的 ctx，`Bookmark.loadMulti` 会因为 `ctx.user.id === bookmarkOwnerId` 放行所有书签。依赖后续 `asPublicBookmark()` 做数据脱敏。安全依赖于脱敏函数的完整性——如果有字段被加入 ZBookmark 但忘记在 asPublicBookmark 中裁剪，会直接泄漏。 |
+| 15 | **公开视角 impersonating context 以 owner 身份读全量书签** | **低** | `buildImpersonatingAuthedContext(listdb.userId)` 在层 ④/⑤ 内部构造以 owner 身份的 ctx，`Bookmark.loadMulti` 会因为 `ctx.user.id === bookmarkOwnerId` 放行所有书签。依赖后续 `asPublicBookmark()` 做数据脱敏。安全依赖于脱敏函数的完整性——如果有字段被加入 ZBookmark 但忘记在 asPublicBookmark 中裁剪，会直接泄漏。`listObj` 的 `userRole: "public"` 保证 `ensureCanManage()` / `ensureCanEdit()` 会在任何写操作前立刻抛 `FORBIDDEN`，深度防御。 |
+| 16 | **Token-only RSS 访问无法通过网页查看同一列表** | **低** | 对于 `public=false` 但持有正确 RSS Token 的用户，RSS feed 可以正常读取，但点击 `<channel><link>` 跳转的公开列表页 `/public/lists/:id` 无法识别 token，会报 `List not found`。两条通道的 token 体系没有打通。 |
 
 ### 7.2 越权防护验证（E2E 测试覆盖）
 
@@ -538,10 +579,13 @@ E2E 测试覆盖了以下越权场景：
 
 **当前 E2E 未覆盖**（需补充）：
 - RSS endpoint 返回 404 对错误 token
+- RSS endpoint 对无 token 请求返回 404 对非公开列表
 - RSS ASSET URL 是否为签名 URL（当前会失败，因为 bug）
-- Admin debug view 越权访问非 admin 用户书签
+- RSS `feedUrl` 和 `siteUrl` 的正确性
+- Admin debug view 越权访问非 admin 用户书签（需知道 bookmarkId）
 - Viewer 无法 edit/manage 列表
 - Collaborator 无法看到 rssToken（被 `columns: { rssToken: false }` 过滤）
+- 公开列表页不接受 token 参数（层 ④ 与层 ⑤ 能力差异）
 
 ### 7.3 未覆盖的边界场景
 
@@ -554,8 +598,9 @@ E2E 测试覆盖了以下越权场景：
 | RSS 中 ASSET 链接失效后，RSS 阅读器缓存的旧 XML 是否仍能访问？ | **链接会失效**，但已缓存的 XML 内容（不含二进制文件）阅读器仍会保留。 |
 | NEXTAUTH_SECRET 轮换后，仍在 RSS 阅读器缓存中的旧签名 assetUrl 会怎样？ | **全部失效**，点击会返回 403。由于 RSS 本身无缓存头，阅读器轮询时会重新拉取 feed，但中间窗口期内的链接会中断。 |
 | RSS 订阅时用的是 `?token=xxx`（RSS Token），但书签内的资产签名 Token 到期时间是 1 小时，会出现什么？ | feed 中每个 item 的资产 URL 在每次轮询时都会**重新签发**（对齐到小时+宽限期），所以 RSS 阅读器每次抓最新的 feed 时链接都是有效的。**但**如果阅读器缓存了 RSS item 的 URL（不重新拉取），1 小时后会失效。 |
-| Admin 账号被攻破后的数据暴露面 | **全部书签**。`admin.getBookmarkDebugInfo` 不需要知道 bookmark 属于哪个列表、是否公开，只需 bookmarkId 即可查看。攻击者如果掌握 admin session 并遍历 bookmarkId，可读取所有用户的书签内容（含 htmlContent preview）。 |
+| Admin 账号被攻破后的数据暴露面 | **受限于 bookmarkId 枚举难度**。`admin.getBookmarkDebugInfo` 需要知道精确 bookmarkId，且没有列出所有书签的接口。但攻击者如果掌握 admin session 并能够枚举有效的 bookmarkId（如通过日志泄漏、ID 预测、时序攻击等），可读取所有用户的书签内容（含 htmlContent preview）。注意：admin debug view 仍然有 PRIVACY_REDACTED_ASSET_TYPES 过滤，USER_UPLOADED 和 BOOKMARK_ASSET 类型资产不返回签名 URL。 |
 | Viewer 移除后仍持有书签关联资产的旧签名 URL | **仍可下载**，直到签名过期（最长 1 小时 15 分钟）。资产签名 token 不校验协作者关系，只校验 assetId + userId。 |
+| `public=false` + 持有 RSS Token 的用户，能否通过公开列表页查看？ | **不能**。公开列表页 `GET /public/lists/:id` 完全不识别 `?token=` 查询参数，调用 tRPC `publicBookmarks.*` 时 token 硬编码传 `null`，只走 `public=true` 分支。两条通道的 token 体系没有打通。 |
 
 ---
 
@@ -594,12 +639,13 @@ E2E 测试覆盖了以下越权场景：
       → 资产 owner 可访问；avatar 公开；bookmark 的协作者可访问
     → serveAsset()
 
-RSS Feed 生成:
-  RSS 阅读器 → GET /api/v1/rss/lists/:listId?token=xxx
+RSS Feed 生成（token 可选）:
+  RSS 阅读器 → GET /api/v1/rss/lists/:listId?token=xxx（token 可省略，省略时仅公开列表可访问）
     → unauthedMiddleware
-    → List.getPublicListContents(ctx, listId, token)
-      → List.getPublicList(ctx, listId, token)
-        → DB: WHERE id=? AND (public=true OR rssToken=token)
+    → List.getPublicListContents(ctx, listId, token ?? null)
+      → List.getPublicList(ctx, listId, token ?? null)
+        → DB: WHERE id=? AND (public=true OR (token IS NOT NULL AND rssToken=token))
+        → 无 token 时退化为: WHERE id=? AND public=true（与公开列表页相同）
       → buildImpersonatingAuthedContext(ownerId)
       → listObj.getBookmarkIds()
       → Bookmark.loadMulti() → asPublicBookmark()
