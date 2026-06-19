@@ -512,19 +512,140 @@ contentRendererRegistry.register(instagramRenderer);
 - Archive 视图使用 `<iframe sandbox="">` (空策略)，禁止脚本/表单/弹窗/同域访问
 - ReaderView 内容经过后端 DOMPurify 消毒
 
-### 7.4 视频前端渲染的三种模式
+### 7.4 视频前端渲染的两条路径
 
-1. **本地下载模式** (`video` 视图):
-   - 后端 VideoWorker 通过 yt-dlp 下载 → 存为 `LINK_VIDEO` 类型资产
-   - 前端 `<video><source src="/api/assets/{videoAssetId}">`
-   - 支持流式 Range 请求，拖动进度条无需全量加载
+视频在前端有**两条独立且正交**的渲染路径：
+- **路径 A**：平台嵌入模式（ContentRenderer 插件，可成为默认视图）
+- **路径 B**：本地下载模式（内置 `video` 视图，需手动切换）
 
-2. **平台嵌入模式** (如 YouTubeRenderer):
-   - 无需下载视频文件，直接 iframe embed
-   - 节省存储配额 + 避免版权风险
+两条路径互不依赖。一个 YouTube 书签可以同时有（也可以只有其中一条，或都没有）：
+1. `youTubeRenderer` 匹配 → 可直接 iframe 嵌入播放
+2. `videoAssetId` 存在 → 可切到本地 `<video>` 播放
 
-3. **原始链接模式** (外链打开):
-   - 右上角 "View Original" 链接，跳转原始 URL
+下面从四个角度逐点讲清代码机制。
+
+#### 7.4.1 平台嵌入如何成为默认视图
+
+**核心代码**：[LinkContentSection.tsx#L125-L130](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L125-L130)
+
+```typescript
+const availableRenderers = contentRendererRegistry.getRenderers(bookmark);
+const defaultSection =
+  availableRenderers.length > 0 ? availableRenderers[0].id : "cached";
+const [section, setSection] = useQueryState("section", {
+  defaultValue: defaultSection,
+});
+```
+
+**决策逻辑**（按执行顺序）：
+
+| 步骤 | 代码位置 | 行为 |
+|------|---------|------|
+| 1. 注册 Renderer | [content-renderers/index.ts#L8-L12](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/content-renderers/index.ts#L8-L12) | 5 个 renderer 依次注册到 Map 中：youTube → x → amazon → tikTok → instagram |
+| 2. 过滤+排序 | [registry.ts#L15-L19](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/content-renderers/registry.ts#L15-L19) | `getRenderers()` 遍历 Map → `filter(canRender)` → `sort(priority 降序)` |
+| 3. 取第一个 | [LinkContentSection.tsx#L126-L127](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L126-L127) | 数组非空则 `availableRenderers[0].id` 作为 `defaultSection` |
+| 4. 设为默认 | [LinkContentSection.tsx#L128-L130](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L128-L130) | `useQueryState("section", { defaultValue: defaultSection })` |
+| 5. 否则回退 | - | 数组为空则用 `"cached"`（Reader 正文视图） |
+
+**关键点**：
+- 所有现有 renderer 的 `priority` 都是 **10**（[YouTubeRenderer.tsx#L65](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/content-renderers/YouTubeRenderer.tsx#L65) 等），所以排序后顺序等于 Map 的插入顺序
+- 匹配到的 renderer 的 **id** 会直接出现在 URL 的 `?section=` query 参数中
+
+#### 7.4.2 本地视频视图何时可选
+
+**启用条件**：`bookmark.content.videoAssetId != null`
+
+这个值从后端传来，整条链路如下：
+
+```
+后端 (数据来源):
+  1. VideoWorker 下载成功 → 写入 assets 表，assetType = "linkVideo"
+     [videoWorker.ts#L210-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/workers/workers/videoWorker.ts#L210-L223)
+
+  2. tRPC 层拼装 bookmark 响应时，从 assets 数组中查找
+     [bookmarks.ts#L176-L177](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/trpc/models/bookmarks.ts#L176-L177)
+     videoAssetId: assets.find(a => a.assetType == AssetTypes.LINK_VIDEO)?.id
+
+前端 (判断可用):
+  3. 下拉菜单项 disabled 属性
+     [LinkContentSection.tsx#L232-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L232-L234)
+     <SelectItem value="video" disabled={!bookmark.content.videoAssetId}>
+
+  4. 内容渲染时不做空判断（用户手动切过来才渲染）
+     [LinkContentSection.tsx#L166-L167](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L166-L167)
+     } else if (section === "video") {
+       content = <VideoSection link={bookmark.content} />;
+     }
+```
+
+**重要结论**：
+- `video` 视图 **永远不会成为默认视图** —— 默认视图选择逻辑（§7.4.1）只在 ContentRenderer 和 `"cached"` 之间二选一，完全不考虑 `videoAssetId`
+- 即使 `videoAssetId` 存在，用户也必须**手动**从下拉菜单选择 "Video" 才能看到本地播放器
+
+#### 7.4.3 下拉菜单的完整顺序
+
+**代码**：[LinkContentSection.tsx#L184-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L184-L242)
+
+下拉菜单分为**两组**，顺序固定：
+
+```
+第一组：Custom Renderers（动态生成，按 priority 降序）
+  ├─ ? YouTube      (canRender=true 才出现)
+  ├─ ? X / Twitter  (canRender=true 才出现)
+  ├─ ? Amazon       (canRender=true 才出现)
+  ├─ ? TikTok       (canRender=true 才出现)
+  └─ ? Instagram    (canRender=true 才出现)
+
+第二组：Default Renderers（固定顺序，全部出现，不可用则 disabled）
+  ├─ Reader View     (cached)     — 永不禁用
+  ├─ Screenshot                   — disabled={!screenshotAssetId}
+  ├─ PDF                          — disabled={!pdfAssetId}
+  ├─ Archive                      — disabled={!fullPageArchiveAssetId && !precrawledArchiveAssetId}
+  └─ Video                        — disabled={!videoAssetId}
+```
+
+**代码证据**：
+- 第一组：`availableRenderers.map(...)` 循环渲染 [L186-L196](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L186-L196)
+- 第二组：按代码书写顺序静态渲染 5 个 `SelectItem` [L199-L241](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/preview/LinkContentSection.tsx#L199-L241)
+
+#### 7.4.4 本地视频资产与卡片缩略图的关系
+
+**结论先行：两者完全独立，互不影响。**
+
+卡片缩略图走一套独立的字段和选择逻辑，与 `videoAssetId` 没有任何关系。
+
+**卡片缩略图字段**（[zBookmarkedLinkSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/shared/types/bookmarks.ts#L40-L61)）：
+- `imageUrl` — 远程 URL（来自 og:image / twitter:image）
+- `imageAssetId` — 本地化后的横幅图（`LINK_BANNER_IMAGE` 类型资产）
+- `screenshotAssetId` — 浏览器截图（`LINK_SCREENSHOT` 类型资产）
+
+**视频资产字段**：
+- `videoAssetId` — 本地下载的视频文件（`LINK_VIDEO` 类型资产）
+
+**卡片取图顺序**（[getBookmarkLinkAssetIdOrUrl](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/shared/utils/bookmarkUtils.ts#L4-L14)）：
+
+```
+优先级从高到低:
+
+  1. imageAssetId     ← LINK_BANNER_IMAGE 类型资产
+     [bookmarkUtils.ts#L5-L7](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/shared/utils/bookmarkUtils.ts#L5-L7)
+
+  2. screenshotAssetId ← LINK_SCREENSHOT 类型资产
+     [bookmarkUtils.ts#L8-L10](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/shared/utils/bookmarkUtils.ts#L8-L10)
+
+  3. imageUrl        ← 远程 URL
+     [bookmarkUtils.ts#L11-L13](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/packages/shared/utils/bookmarkUtils.ts#L11-L13)
+
+  4. 都没有 → 透明 1x1 base64 占位图
+     [LinkCard.tsx#L72-L75](file:///d:/fz/0601-2/solo-dogfeeding/code/47-karakeep/apps/web/components/dashboard/bookmarks/LinkCard.tsx#L72-L75)
+```
+
+**为什么 videoAssetId 不参与？**
+- 视频是播放用的，不是"封面图"
+- 系统不会从视频文件中提取帧作为封面
+- 视频平台的 og:image（封面缩略图）已经通过 `metascraper-image` 提取到 `imageUrl`/`imageAssetId` 中了
+
+**一句话总结**：视频下载不影响卡片缩略图，卡片缩略图也不依赖视频下载。两者是完全分离的数据流。
 
 ### 7.5 抓取中状态的视觉反馈
 
