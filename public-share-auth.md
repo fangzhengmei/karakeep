@@ -185,6 +185,164 @@ RSS Feed 路由通过 `List.getPublicList()` 中的 `eq(bookmarkLists.rssToken, 
 - RSS 阅读器保存了旧 token URL → 下次轮询会得到 404（`List not found`）。
 - `public = true` 的列表即使 RSS token 被清除，公开列表页面仍然可访问。
 
+### 4.5 RSS Feed 附件资源鉴权问题（核心）
+
+这是最容易混淆的一段脉络：**RSS 订阅输出中的 ASSET 类型书签 URL 与公开资产签名 Token 是两条完全脱节的路径**。
+
+#### 4.5.1 双路由并行：`/assets` vs `/public/assets`
+
+**文件**: [api/index.ts L90-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/index.ts#L90-L91)
+
+```ts
+app
+  .route("/assets", assets)        // ← 需要登录 authMiddleware
+  .route("/public", publicRoute);  // ← /public/assets/* 需要签名 token
+```
+
+| 路由 | 路径 | 鉴权 | 用途 |
+|------|------|------|------|
+| assets route | `/api/assets/:assetId` | `authMiddleware` + `apiKeyScopeMiddleware("assets", "read")` | 已登录 Dashboard 用户下载 |
+| public route | `/api/public/assets/:assetId?token=xxx` | `unauthedMiddleware` + HMAC 签名校验 | 匿名公开分享下载 |
+
+**关键区别**: 两条路由最终都调用 `serveAsset()` 流式返回文件，但入口鉴权完全不同。
+
+#### 4.5.2 RSS Feed 生成时的 URL 生成 —— 断点所在
+
+**文件**: [rss.ts L33-L51](file:///d:/fz/0601-2\solo-dogfeeding\code\42-karakeep/packages/api/routes/rss.ts#L33-L51) 调用链：
+
+```
+rss.ts handler
+  → List.getPublicListContents()          // 返回 ZPublicBookmark[]
+    → asPublicBookmark()
+      → getContent(ASSET)
+        → assetUrl: getPublicSignedAssetUrl(assetId)  // ✅ 生成了签名 URL
+  → toRSS(list, bookmarks)
+```
+
+**文件**: [rss/utils.ts L40-L42](file:///d:/fz/0601-2\solo-dogfeeding/code/42-karakeep/packages/api/utils/rss.ts#L40-L42)
+
+```ts
+feed.item({
+  url:
+    bookmark.content.type === BookmarkTypes.LINK
+      ? bookmark.content.url
+      : bookmark.content.type === BookmarkTypes.ASSET
+        ? `${serverConfig.publicUrl}${getAssetUrl(bookmark.content.assetId)}`  // ❌ 丢弃已有的签名 URL，重新构造
+        : "",
+});
+```
+
+此处 `getAssetUrl()` 定义在 [assetUtils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/utils/assetUtils.ts#L1-L3):
+
+```ts
+export function getAssetUrl(assetId: string) {
+  return `/api/assets/${assetId}`;  // ← 无 token，走需登录的路由
+}
+```
+
+**实际结果**:
+
+- `bookmark.content.assetUrl`（签名的 `/api/public/assets/:id?token=xxx`）**已生成但未使用**
+- RSS 输出使用的是 `${publicUrl}/api/assets/:assetId`（**需要登录**），指向 `authMiddleware` 保护的路由
+- RSS 订阅者点击 ASSET 链接后会被重定向到登录页 → **下载失败**
+
+#### 4.5.3 ZPublicBookmark Schema 与实际输出的差异
+
+**文件**: [zPublicBookmarkSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/bookmarks.ts#L283-L310) 声明了以下字段：
+
+```ts
+export const zPublicBookmarkSchema = z.object({
+  id, createdAt, modifiedAt, title, tags,
+  description: z.string().nullish(),            // ← Schema 声明了
+  bannerImageUrl: z.string().nullable(),
+  content: z.discriminatedUnion("type", [
+    z.object({ type: LINK,   url, author: z.string().nullish(), ... }),  // ← author 声明了
+    z.object({ type: TEXT,   text, ... }),
+    z.object({ type: ASSET,  assetType, assetId, assetUrl, fileName, sourceUrl, ... }),
+  ]),
+});
+```
+
+但 **`asPublicBookmark()` 实际返回**（[bookmarks.ts L852-L860](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L852-L860)）：
+
+```ts
+return {
+  id, createdAt, modifiedAt, title, tags,
+  // ❌ description 缺失
+  content: getContent(content),
+  bannerImageUrl: getBannerImageUrl(content),
+};
+```
+
+并且 `getContent()` 的 LINK 分支（[bookmarks.ts L782-L786](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L782-L786)）：
+
+```ts
+case BookmarkTypes.LINK: {
+  return {
+    type: BookmarkTypes.LINK,
+    url: content.url,
+    // ❌ author 缺失
+  };
+}
+```
+
+**RSS Feed 中对应字段的表现**（[rss.ts L44-L49](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/utils/rss.ts#L44-L49)）：
+
+```ts
+author:
+  bookmark.content.type === BookmarkTypes.LINK
+    ? (bookmark.content.author ?? undefined)  // ← 永远 undefined
+    : undefined,
+categories: bookmark.tags,
+description: bookmark.description ?? "",    // ← 永远空字符串 ""
+```
+
+结论：**RSS 输出中 description 永远为空，LINK 类型 author 永远缺失**。原因是 `asPublicBookmark()` 没有把这两个字段写入返回对象，而 Zod schema 的 `nullish` 对缺失值只是"容忍"，不会补默认值。
+
+#### 4.5.4 ASSET 类型书签的 `<enclosure>` 元素缺失
+
+RSS 2.0 标准中 `<enclosure>` 元素用于表示附件（图片/PDF等）。`toRSS()` 没有调用 `feed.item({ enclosure: {...} })`，导致：
+
+1. ASSET 类书签在 RSS 客户端中不会以附件形式渲染（需要用户点击跳转）。
+2. banner images（`bannerImageUrl` 字段中已经包含的签名图片 URL）不会作为缩略图在 RSS 阅读器中显示。
+
+#### 4.5.5 RSS 跳转链接指向私有 Dashboard
+
+**文件**: [rss.ts L46-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts#L46-L47)
+
+```ts
+feedUrl: `${serverConfig.publicApiUrl}/v1/rss/lists/${listId}`,
+siteUrl: `${serverConfig.publicUrl}/dashboard/lists/${listId}`,  // ← 需要登录
+```
+
+`siteUrl`（RSS 2.0 `<channel><link>` 元素）指向的是 `/dashboard/lists/:listId`——这个是 **需要登录的 Dashboard 页面**，而不是公开分享页面 `/public/lists/:listId`。订阅者点击后会被弹到登录页。
+
+#### 4.5.6 类型过滤副作用：TEXT 书签在 RSS 中不可见
+
+**文件**: [rss/utils.ts L28-L32](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/utils/rss.ts#L28-L32)
+
+```ts
+bookmarks
+  .filter(
+    (b) =>
+      b.content.type === BookmarkTypes.LINK ||
+      b.content.type === BookmarkTypes.ASSET,
+  )
+```
+
+TEXT 类型书签在 RSS 中被**完全过滤掉**。虽然纯文本没有"链接地址"，但 RSS `<item>` 的 `<description>` 可以承载文本内容，所以理论上是可以输出的。
+
+#### 4.5.7 RSS Feed 缓存头
+
+**文件**: [rss.ts L53-L54](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts#L53-L54)
+
+```ts
+c.header("Content-Type", "application/rss+xml");
+return c.body(rssFeed);
+```
+
+RSS 响应**无任何 Cache-Control 头**，默认行为取决于 RSS 阅读器的实现。好处是任何改动（新增/删除书签、调整公开状态、轮换 token）立即生效；坏处是 RSS 阅读器的高频轮询（通常 10-30 分钟一次）会每次重新查询数据库 + 重新生成签名 token，带来一定的性能开销。
+
 ---
 
 ## 五、公开资产 — Signed Token 机制
@@ -329,6 +487,12 @@ Next.js 页面使用 SSR（服务端渲染），无 `revalidate` 或 `dynamic` �
 | 4 | 公开列表开关无确认步骤 | **低** | 从非公开切换为公开是即时生效的，没有二次确认或"预览即将公开的内容"步骤。 |
 | 5 | `public` 字段与 `rssToken` 独立 | **中** | 清除 RSS Token 不会关闭公开列表；关闭公开列表不会清除 RSS Token。两者是独立的访问通道，可能造成混淆。 |
 | 6 | NEXTAUTH_SECRET 双重用途 | **中** | 签名 Token 与 NextAuth 共用 `NEXTAUTH_SECRET`。如果该密钥被轮换，所有已签发的资产 token 立即失效（包括未过期的），可能导致用户体验中断。 |
+| 7 | **RSS ASSET 链接不可下载** | **高** | RSS Feed 中 ASSET 类书签的 URL 使用 `getAssetUrl()`（`/api/assets/:id`，需登录），**丢弃**了 `asPublicBookmark()` 中已生成的签名 `assetUrl`（`/api/public/assets/:id?token=xxx`）。RSS 订阅者点击链接会被弹到登录页。 |
+| 8 | **RSS description 永远为空** | **中** | `zPublicBookmarkSchema` 声明了 `description` 字段，但 `asPublicBookmark()` 的返回对象中没有该字段。RSS 渲染时 `bookmark.description ?? ""` → 永远空字符串。 |
+| 9 | **RSS LINK author 永远缺失** | **低** | LINK 类型的公开内容 schema 声明了 `author` 字段，但 `getContent(LINK)` 不包含它。RSS 的 `<author>` 元素永远不输出。 |
+| 10 | **RSS channel siteUrl 指向私有 Dashboard** | **中** | `<channel><link>` 指向 `/dashboard/lists/:listId`（需登录），订阅者点击会被弹到登录页。应改为 `/public/lists/:listId`。 |
+| 11 | **RSS TEXT 类型书签被过滤** | **低** | TEXT 书签在 `toRSS()` 中被完全过滤，RSS 客户端无法看到纯文本书签。 |
+| 12 | **RSS 无 enclosure 元素** | **低** | ASSET 类书签和 banner image 未使用 RSS 2.0 `<enclosure>` 或 `<media:thumbnail>` 标准扩展，导致 RSS 阅读器中无法渲染附件和缩略图。 |
 
 ### 7.2 越权防护验证（E2E 测试覆盖）
 
@@ -353,6 +517,9 @@ E2E 测试覆盖了以下越权场景：
 | RSS Token 泄露后的窗口期 | **无限大**。除非 owner 手动轮换，泄露的 token 永久有效。 |
 | 并发竞争：owner 正在关闭公开时，公开请求是否仍可通过？ | **可能**。数据库 UPDATE 和 SELECT 之间无事务隔离，存在极短的竞争窗口。 |
 | 删除列表后 RSS Token 是否残留？ | **不残留**。列表删除时 `rssToken` 随行删除（`onDelete: cascade` 作用于 userId 外键，列表整行删除）。 |
+| RSS 中 ASSET 链接失效后，RSS 阅读器缓存的旧 XML 是否仍能访问？ | **链接会失效**，但已缓存的 XML 内容（不含二进制文件）阅读器仍会保留。 |
+| NEXTAUTH_SECRET 轮换后，仍在 RSS 阅读器缓存中的旧签名 assetUrl 会怎样？ | **全部失效**，点击会返回 403。由于 RSS 本身无缓存头，阅读器轮询时会重新拉取 feed，但中间窗口期内的链接会中断。 |
+| RSS 订阅时用的是 `?token=xxx`（RSS Token），但书签内的资产签名 Token 到期时间是 1 小时，会出现什么？ | feed 中每个 item 的资产 URL 在每次轮询时都会**重新签发**（对齐到小时+宽限期），所以 RSS 阅读器每次抓最新的 feed 时链接都是有效的。**但**如果阅读器缓存了 RSS item 的 URL（不重新拉取），1 小时后会失效。 |
 
 ---
 
@@ -374,7 +541,7 @@ E2E 测试覆盖了以下越权场景：
               → HMAC-SHA256 签名 → Base64 编码
     → 返回 HTML + 带签名 token 的资产 URL
 
-资产下载:
+资产下载（正确路径）:
   浏览器 → GET /api/public/assets/{assetId}?token=xxx
     → unauthedMiddleware (仅检查 ctx 存在)
     → verifySignedToken(token, NEXTAUTH_SECRET, zAssetSignedTokenSchema)
@@ -383,14 +550,46 @@ E2E 测试覆盖了以下越权场景：
     → DB: SELECT * FROM assets WHERE id=? AND userId=?  → 404 if not found
     → serveAsset() → Cache-Control: private, max-age=31536000, immutable
 
-RSS Feed:
+已登录 Dashboard 资产下载（/api/assets）:
+  浏览器 → GET /api/assets/{assetId}  (带 session cookie)
+    → authMiddleware (校验 ctx.user 存在)
+    → apiKeyScopeMiddleware("assets", "read")
+    → Asset.fromId(ctx, assetId) → ensureCanView()
+      → 资产 owner 可访问；avatar 公开；bookmark 的协作者可访问
+    → serveAsset()
+
+RSS Feed 生成:
   RSS 阅读器 → GET /api/v1/rss/lists/:listId?token=xxx
     → unauthedMiddleware
     → List.getPublicListContents(ctx, listId, token)
       → List.getPublicList(ctx, listId, token)
         → DB: WHERE id=? AND (public=true OR rssToken=token)
-      → → buildImpersonatingAuthedContext → asPublicBookmark()
-    → toRSS() → RSS XML
+      → buildImpersonatingAuthedContext(ownerId)
+      → listObj.getBookmarkIds()
+      → Bookmark.loadMulti() → asPublicBookmark()
+          → getContent(ASSET): assetUrl = 签名 URL (/api/public/assets/:id?token=xxx)  ✅
+          → getContent(LINK):  只包含 url，不包含 author  ❌ (author 缺失)
+          → 返回对象缺失 description  ❌
+    → toRSS()
+        → filter 掉 TEXT 类型  ❌ (TEXT 不可见)
+        → LINK item.url = bookmark.content.url            ✅
+        → ASSET item.url = publicUrl + /api/assets/:id    ❌ 误用未签名的需登录 URL！
+            (丢弃了 bookmark.content.assetUrl 中的已签名 URL)
+        → author = bookmark.content.author  (永远 undefined) ❌
+        → description = bookmark.description  (永远 "")     ❌
+        → 无 enclosure 元素  ❌
+        → <channel><link> = /dashboard/lists/:id (需登录)  ❌
+    → 返回 RSS XML (无 Cache-Control 头)
+
+RSS 中 ASSET 链接的错误访问路径:
+  RSS 阅读器用户点击 ASSET 链接
+    → GET {publicUrl}/api/assets/:assetId (无 token)
+    → authMiddleware (无登录) → HTTP 401 Unauthorized → 登录页 ✗ 失败
+
+修复后 RSS 中 ASSET 链接的正确路径:
+  RSS 阅读器用户点击 ASSET 链接
+    → GET /api/public/assets/:assetId?token=xxx (使用 asPublicBookmark 已签发的 assetUrl)
+    → 走上面"资产下载（正确路径）"流程 → 成功下载 ✓
 ```
 
 ---
@@ -402,17 +601,22 @@ RSS Feed:
 | [schema.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/db/schema.ts#L475-L498) | `bookmarkLists` 表定义，`public` 和 `rssToken` 字段 |
 | [signedTokens.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/signedTokens.ts) | `createSignedToken` / `verifySignedToken` / `getAlignedExpiry` |
 | [zAssetSignedTokenSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/assets.ts) | 资产签名 token 的 payload schema |
+| [zPublicBookmarkSchema](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/types/bookmarks.ts#L283-L310) | 公开书签 schema（与实际返回存在字段差异） |
 | [lists.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/lists.ts#L161-L189) | `getPublicList()` 核心鉴权逻辑 |
 | [lists.ts (router)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/lists.ts#L204-L231) | RSS Token 签发/撤销/查询端点 |
-| [bookmarks.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L769-L861) | `asPublicBookmark()` 数据脱敏 |
+| [bookmarks.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/bookmarks.ts#L769-L861) | `asPublicBookmark()` 数据脱敏（含缺失字段问题） |
 | [assets.ts (model)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/models/assets.ts#L266-L281) | `getPublicSignedAssetUrl()` 签名 URL 生成 |
-| [public/assets.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/public/assets.ts) | 公开资产下载端点 + token 校验 |
+| [public/assets.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/public/assets.ts) | 公开资产下载端点 + token 校验（匿名） |
+| [assets.ts (route)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/assets.ts) | 已登录资产下载端点（需 authMiddleware） |
+| [api/index.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/index.ts#L86-L93) | 路由挂载点（/assets 与 /public/assets 并行） |
 | [impersonate.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/lib/impersonate.ts) | 冒充 owner 上下文构建 |
 | [publicBookmarks.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/trpc/routers/publicBookmarks.ts) | tRPC 公开列表端点 |
-| [rss.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts) | RSS Feed 端点 |
+| [rss.ts (handler)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/routes/rss.ts) | RSS Feed HTTP 端点 |
+| [rss.ts (utils)](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/utils/rss.ts) | `toRSS()` — RSS XML 生成（含 URL 误用问题） |
+| [assetUtils.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/utils/assetUtils.ts) | `getAssetUrl()` 生成需登录的 URL（RSS 误用的函数） |
 | [serveAsset](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/utils/assets.ts) | 资产响应 + Cache-Control 头 |
 | [auth.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/api/middlewares/auth.ts) | `unauthedMiddleware` / `authMiddleware` |
 | [PublicListLink.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/apps/web/components/dashboard/lists/PublicListLink.tsx) | 前端公开开关 UI |
 | [public list page.tsx](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/apps/web/app/public/lists/[listId]/page.tsx) | 公开列表 SSR 页面 |
 | [config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/shared/config.ts#L266-L271) | `signingSecret()` → `NEXTAUTH_SECRET` |
-| [public.test.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/e2e_tests/tests/api/public.test.ts) | 公开 API E2E 测试 |
+| [public.test.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/42-karakeep/packages/e2e_tests/tests/api/public.test.ts) | 公开 API E2E 测试（当前未覆盖 RSS） |
