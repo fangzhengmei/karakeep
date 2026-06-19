@@ -66,9 +66,9 @@ export const createContext = async (database?, ip?) => {
 8. （回退到）socket 的 `remoteAddress`
 
 **⚠️ 安全注意事项**:
-- 项目未对 `request-ip` 配置可信代理范围（`trustProxy`），默认会信任所有代理头
-- 若部署在未受信任的反向代理后，攻击者可通过伪造 `X-Forwarded-For` 头绕过 IP 限流
-- 建议在生产部署前配置可信代理列表
+- `request-ip` 库**本身没有 `trustProxy` / 可信代理配置选项**，无法像 `proxy-addr` 或 Express `trust proxy` 那样配置"只信任特定代理 IP、并从 `X-Forwarded-For` 中取第 N 个真实客户端 IP"
+- 它总是按优先级取头，且 `X-Forwarded-For` 取最左值，攻击者只要在请求中添加 `X-Forwarded-For: &lt;伪造IP&gt;` 头，就能欺骗 IP 识别
+- 需自行实现可信代理逻辑，或在上游 CDN/反向代理层覆盖伪造头
 
 ### 2.3 Context 传递链
 
@@ -286,6 +286,18 @@ const key = `${ip}${userSegment}:${config.name}`;
 | 未登录用户访问 tRPC | `192.168.1.1:bookmarks.list` |
 | 已登录用户（u123）访问 tRPC | `192.168.1.1:user:u123:bookmarks.createBookmark` |
 | Hono API 资产上传（已登录） | `192.168.1.1:user:u123:assets.upload` |
+
+#### pre-auth / publicProcedure 的 Key 特征
+
+> ⚠️ **`publicProcedure` 限流 Key 无 user 段**
+>
+> `publicProcedure` 的限流中间件**在认证之前执行**（早于任何业务 handler），此时 `ctx.user` 为 `null`。因此注册、忘记密码、邮箱验证等匿名接口的限流 Key 只有 `ip + path`，**不包含用户维度**，攻击者换 IP 即可重置计数。
+>
+> 以 `users.create` 注册接口为例：
+> - 限流检查时刻：procedure 中间件链中，业务 handler 之前
+> - `ctx.user` 值：`null`（尚未创建用户）
+> - 实际 Key：`&lt;ip&gt;:users.create`
+> - 即使 handler 执行后创建了用户，限流计数也不受影响
 
 ### 4.4 IP 变化对已登录用户限流的影响
 
@@ -722,7 +734,7 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 | 过程类型 | 继承关系 | 全局默认限流 | 典型接口 |
 |----------|----------|-------------|----------|
 | `procedure` | 最底层 | - | - |
-| `publicProcedure` | procedure → rateLimit | 60s/1000次 (globalPublic) | 注册、忘记密码、邮箱验证、邀请验证、API Key 交换/验证（注：登录走 NextAuth 独立路由，不经过此过程） |
+| `publicProcedure` | procedure → rateLimit | 60s/1000次 (globalPublic) | 注册、忘记密码、邮箱验证、邀请验证、API Key 交换/验证（注：登录走 NextAuth 独立路由，不经过此过程；限流 Key 仅含 IP，无 user 段） |
 | `authedProcedure` | procedure → rateLimit → isAuthed | 60s/3000次 (globalAuthed) | 所有需要登录的接口 |
 | `sessionProcedure` | authedProcedure → isSession | 继承 globalAuthed | 修改密码、管理 API Key |
 | `*Procedure` (scoped) | authedProcedure → createScopedAuthedProcedure | 继承 globalAuthed | bookmarksProcedure、usersProcedure 等 |
@@ -731,7 +743,7 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 
 | 入口/接口 | 认证方式 | IP 绑定 | 全局限流 | 接口级限流 | 业务配额 | 其他防护 |
 |-----------|----------|---------|----------|-----------|----------|----------|
-| **用户注册** `users.create` | 无（tRPC publicProcedure） | ✅ IP+userID（创建前仅 IP） | 60s/1000次 (globalPublic) | 60s/3次 | - | Turnstile CAPTCHA |
+| **用户注册** `users.create` | 无（tRPC publicProcedure） | ✅ 仅 IP（Key 无 user 段） | 60s/1000次 (globalPublic) | 60s/3次 | - | Turnstile CAPTCHA |
 | **密码登录** `POST /api/auth/callback/credentials` | 无（NextAuth 独立路由） | ❌ 无（未提取 IP） | ❌ 无（不走 tRPC） | ❌ 无 | - | bcrypt 时序防护（仅防枚举） |
 | **OAuth 登录** `GET /api/auth/signin/custom` + callback | 无（NextAuth 独立路由） | ❌ 无（未提取 IP） | ❌ 无（不走 tRPC） | ❌ 无 | - | OAuth 协议本身防护 |
 | **查询 Session** `GET /api/auth/session` | 无（Cookie） | ❌ 无（未提取 IP） | ❌ 无（不走 tRPC） | ❌ 无 | - | JWT 签名验证 |
@@ -764,7 +776,7 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 | NextAuth 路径完全无限流（密码登录、OAuth、session、signout） | [route.tsx#L1-L3](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/app/api/auth/[...nextauth]/route.tsx#L1-L3) | 高 (Critical) | 所有 `/api/auth/*` 走独立路由，完全绕过 Hono 中间件 + tRPC 限流体系，攻击者可无限制爆破密码、刷 session、枚举 OAuth |
 | NextAuth 路径无 IP 识别 | [route.tsx#L1-L3](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/app/api/auth/[...nextauth]/route.tsx#L1-L3) | 高 (Critical) | 未调用 `createContextFromRequest()`，不提取 `X-Forwarded-For` 等，无法做 IP 维度限流/封禁/溯源，撞库攻击不留痕 |
 | 限流默认关闭 | [config.ts#L182](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/shared/config.ts#L182) | 高 | `RATE_LIMITING_ENABLED` 默认为 `false`，部署时需显式开启；若忘记，全 tRPC 路径也无限流 |
-| 代理头无条件信任 | [client.ts#L13-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/server/api/client.ts#L13-L15) | 高 | `request-ip` 未配置 `trustProxy`，攻击者伪造 `X-Forwarded-For` 可绕过所有 tRPC 路径的 IP 维度限流 |
+| 代理头无条件信任 | [client.ts#L13-L15](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/apps/web/server/api/client.ts#L13-L15) | 高 | `request-ip` 库**无可信代理机制**，总是取 `X-Forwarded-For` 最左值，攻击者伪造该头即可绕过所有 tRPC 路径的 IP 维度限流 |
 | 已登录用户限流可通过换 IP 绕过 | [rateLimit.ts#L38-L39](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L38-L39) | 中 | tRPC Key 格式为 `${ip}:user:${id}:${path}`，攻击者通过代理池换 IP 即可重置计数（书签高容量检测除外，其 Key 仅 user.id） |
 | IP 缺失时 tRPC 限流直接放行 | [rateLimit.ts#L25-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/trpc/lib/rateLimit.ts#L25-L28) | 中 | IP 为 null 时 `return next()` 直接跳过，若 request-ip 解析失败等同于无限流 |
 | Redis 故障时 Fail-Open | [ratelimit-redis/index.ts#L96-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/45-karakeep/packages/plugins/ratelimit-redis/src/index.ts#L96-L103) | 中 | Redis 不可用全部放行（可用性优先），此时若遭遇攻击无限流保护 |
@@ -784,8 +796,10 @@ if (!apiKey.lastUsedAt || apiKey.lastUsedAt < tenMinutesAgo) {
 
 **P1（安全加固）**
 
-3. **配置 `request-ip` 可信代理范围**：
-   - 在 `createContextFromRequest()` 中给 `requestIp.getClientIp()` 传 `{ headers, trustProxy: [...] }` 或配置上游 CDN 的 IP 白名单
+3. **实现可信代理 IP 解析**：
+   - `request-ip` 库本身无 `trustProxy` 选项，需自行实现可信代理逻辑
+   - **方案 A（推荐）**：改用 [`proxy-addr`](https://www.npmjs.com/package/proxy-addr) 库，支持配置 `trust` 列表（可信代理 IP/CIDR），自动从 `X-Forwarded-For` 中取到正确的客户端 IP
+   - **方案 B**：在上游 CDN / 反向代理层确保伪造的 `X-Forwarded-For` 被覆盖（如 Cloudflare 用 `True-Client-IP`，Nginx 用 `real_ip_header`），代码侧直接读取特定头
    - 否则伪造 `X-Forwarded-For` 可绕过所有 tRPC 限流
 4. **tRPC 已登录用户接口增加纯 user.id 维度限流**：
    - 与书签高容量检测一致，对敏感写接口（createBookmark、summarize、addCollaborator 等）加一层 Key 仅为 `${config.name}:user:${userId}` 的限流
