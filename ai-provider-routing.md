@@ -1,153 +1,164 @@
 # Karakeep AI Provider 抽象与模型切换代码分析
 
-本文档深入分析 Karakeep 项目中 AI Provider 的抽象设计、模型选择、超时处理、失败兜底、Token 计费和 Worker 分层架构。
+本文档基于代码逐行核对，深入分析 Karakeep 项目中 AI Provider 的接口抽象、模型选择、超时处理、失败兜底、Token 计费和 Worker 分层架构。
 
 ---
 
-## 1. Provider 接口定义与抽象层
+## 1. Provider 接口抽象层
 
 ### 1.1 核心接口 `InferenceClient`
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L115-L127)
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L115-L127)
 
-`InferenceClient` 是整个 AI 推理抽象的核心接口，定义了三个能力：
+`InferenceClient` 是 AI 推理能力的统一抽象，定义了三个核心方法：
 
 ```typescript
 export interface InferenceClient {
   // 纯文本推理（打标 / 摘要）
-  inferFromText(prompt: string, opts: Partial<InferenceOptions>): Promise<InferenceResponse>;
-  
+  inferFromText(
+    prompt: string,
+    opts: Partial<InferenceOptions>,
+  ): Promise<InferenceResponse>;
+
   // 图像推理（图片打标）
-  inferFromImage(prompt: string, contentType: string, image: string, opts: Partial<InferenceOptions>): Promise<InferenceResponse>;
-  
+  inferFromImage(
+    prompt: string,
+    contentType: string,
+    image: string,
+    opts: Partial<InferenceOptions>,
+  ): Promise<InferenceResponse>;
+
   // 文本嵌入向量生成
   generateEmbeddingFromText(inputs: string[]): Promise<EmbeddingResponse>;
 }
 ```
 
+> **注意**：`generateEmbeddingFromText` 方法没有 `opts` 参数，也不支持 `abortSignal`。
+
 ### 1.2 返回值结构
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L11-L20)
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L11-L20)
 
 ```typescript
-// 推理响应：文本+Token
+// 文本推理响应
 export interface InferenceResponse {
-  response: string;                // LLM 原始返回文本
-  totalTokens: number | undefined;    // 本次调用总 Token 数
+  response: string;                // LLM 返回的原始文本
+  totalTokens: number | undefined; // 本次调用消耗的总 Token 数
 }
 
-// 嵌入响应：向量数组+Token
+// 嵌入向量响应
 export interface EmbeddingResponse {
-  embeddings: number[][];             // 嵌入向量数组（多个输入对应多个向量）
-  totalTokens: number | undefined;       // 总 Token 数
-  promptTokens: number | undefined;    // prompt Token 数
+  embeddings: number[][];             // 嵌入向量数组（多输入对应多向量）
+  totalTokens: number | undefined;    // 总 Token 数
+  promptTokens: number | undefined;   // Prompt Token 数
 }
 ```
 
 ### 1.3 推理选项 `InferenceOptions`
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L105-L109)
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L105-L109)
 
 ```typescript
 export interface InferenceOptions {
-  schema: z.ZodSchema<any> | null;        // 结构化输出 Schema（Zod）
-  abortSignal?: AbortSignal;                     // 外部传入的取消信号
+  schema: z.ZodSchema<any> | null;  // 结构化输出 Schema（Zod 定义）
+  abortSignal?: AbortSignal;           // 取消信号（仅文本/图像推理支持）
 }
 ```
 
 ---
 
-## 2. 模型选择与工厂模式
+## 2. Provider 选择与工厂模式
 
-### 2.1 Provider 工厂 `InferenceClientFactory`
+### 2.1 选择优先级
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L154-L165)
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L154-L165)
 
-```typescript
-export class InferenceClientFactory {
-  static build(): InferenceClient | null {
-    // 优先级 1：OpenAI API Key 已配置 → 使用 OpenAI 兼容客户端
-    if (serverConfig.inference.openAIApiKey) {
-      return OpenAIInferenceClient.fromConfig();
-    }
+`InferenceClientFactory.build()` 按以下优先级选择 Provider：
 
-    // 优先级 2：Ollama Base URL 已配置 → 使用本地 Ollama
-    if (serverConfig.inference.ollamaBaseUrl) {
-      return OllamaInferenceClient.fromConfig();
-    }
-
-    // 均未配置 → 返回 null（AI 功能不可用）
-    return null;
-  }
-}
+```
+优先级 1: openAIApiKey 已配置 → OpenAIInferenceClient
+优先级 2: ollamaBaseUrl 已配置 → OllamaInferenceClient
+都未配置  → 返回 null（AI 功能不可用）
 ```
 
-> **设计决策**：优先顺序是 OpenAI → Ollama → null。OpenAI 兼容客户端可对接任何 OpenAI API 兼容服务（如 Groq、Together、OpenRouter 等），通过 `OPENAI_BASE_URL` 切换。
+> 若两者同时配置，**OpenAI 优先**。OpenAI 兼容客户端可对接任何 OpenAI API 兼容服务（Groq、Together、OpenRouter 等），通过 `OPENAI_BASE_URL` 切换端点。
 
-### 2.2 配置驱动的模型选择
+### 2.2 配置驱动的模型参数
 
-**文件位置**: [config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/config.ts#L305-L340)
+[packages/shared/config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/config.ts#L305-L340)
 
-```typescript
-inference: {
-  isConfigured: !!val.OPENAI_API_KEY || !!val.OLLAMA_BASE_URL,
-  textModel: val.INFERENCE_TEXT_MODEL,       // 默认 "gpt-4.1-mini"
-  imageModel: val.INFERENCE_IMAGE_MODEL,     // 默认 "gpt-4o-mini"
-  contextLength: val.INFERENCE_CONTEXT_LENGTH, // 默认 2048
-  maxOutputTokens: val.INFERENCE_MAX_OUTPUT_TOKENS, // 默认 2048
-  outputSchema: ...                           // structured / json / plain
-  // ...
-},
-embedding: {
-  textModel: val.EMBEDDING_TEXT_MODEL,         // 默认 "text-embedding-3-small"
-  dimensions: val.EMBEDDING_DIMENSIONS,         // 默认 1536
-  // ...
-}
-```
+模型相关的核心配置项：
 
-### 2.3 输出 Schema 映射
-
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L129-L137)
-
-通过 `mapInferenceOutputSchema` 统一适配不同 Provider 的结构化输出方式：
-
-| outputSchema 模式 | OpenAI 实现 | Ollama 实现 |
+| 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `structured` | `zodResponseFormat(schema)` 原生结构化输出 | `z.toJSONSchema(schema)` Zod 4 JSON Schema |
-| `json` | `{ type: "json_object" }` | `"json"` 字符串格式 |
-| `plain` | undefined（无格式约束） | undefined（无格式约束） |
+| `textModel` | `"gpt-4.1-mini"` | 文本推理模型名 |
+| `imageModel` | `"gpt-4o-mini"` | 图像推理模型名 |
+| `contextLength` | `2048` | 上下文长度（用于 Prompt 截断） |
+| `maxOutputTokens` | `2048` | 最大输出 Token 数 |
+| `outputSchema` | `"structured"` | 输出模式：`structured` / `json` / `plain` |
+| `embedding.textModel` | `"text-embedding-3-small"` | 嵌入模型名 |
+| `embedding.dimensions` | `1536` | 嵌入向量维度 |
+
+### 2.3 结构化输出 Schema 映射
+
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L129-L137)
+
+`mapInferenceOutputSchema` 是一个类型安全的映射函数，根据 `outputSchema` 配置和 Provider 特性，返回不同的结构化输出参数：
+
+| `outputSchema` | OpenAI 实现 | Ollama 实现 |
+|---|---|---|
+| `"structured"` | `zodResponseFormat(schema, "schema")` | `z.toJSONSchema(schema)` |
+| `"json"` | `{ type: "json_object" }` | `"json"` 字符串 |
+| `"plain"` | `undefined`（无格式约束） | `undefined`（无格式约束） |
 
 ### 2.4 OpenAI Provider 实现
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L167-L317)
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L167-L317)
 
 `OpenAIInferenceClient` 关键特性：
-- 支持 `serviceTier`（`auto`/`default`/`flex`）用于不同服务层级
-- 支持 `reasoningEffort`（`none`~`xhigh`）控制推理深度
-- 支持 HTTP 代理（`undici.ProxyAgent`）
-- 区分 `max_tokens` 与 `max_completion_tokens` 两种 API 参数
-- 默认携带 `X-Title` 和 `HTTP-Referer` 请求头（标识 Karakeep 应用）
+
+- 支持 `serviceTier`（`auto` / `default` / `flex`）用于不同服务层级
+- 支持 `reasoningEffort`（`none` ~ `xhigh`）控制推理深度
+- 支持 HTTP 代理（通过 `undici.ProxyAgent`）
+- 区分 `max_tokens` 与 `max_completion_tokens` 两种 API 参数（由 `useMaxCompletionTokens` 配置切换）
+- 默认携带 `X-Title` 和 `HTTP-Referer` 请求头
+
+构造时设置 **SDK 级全局超时**：
+
+```typescript
+this.openAI = new OpenAI({
+  apiKey: config.apiKey,
+  baseURL: config.baseURL,
+  timeout: config.timeoutSec !== undefined
+    ? config.timeoutSec * 1000  // 来自 OPENAI_TIMEOUT_SEC
+    : undefined,
+  // ...
+});
+```
 
 ### 2.5 Ollama Provider 实现
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L329-L473)
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L329-L473)
 
 `OllamaInferenceClient` 关键特性：
-- 使用 `customFetch`（自定义超时 fetch）
-- 使用流式模式（`stream: true`）+ 逐块累积响应
-- **Ollama Bug 兼容**：流式处理中即使抛出异常也尝试使用已累积的响应
+
+- 使用 `customFetch`（自定义超时 fetch）注入 SDK
+- 采用**流式模式**（`stream: true`）逐块累积响应
 - `keep_alive` 参数控制模型在内存中的保留时间
 - 嵌入生成支持 `truncate: true` 自动截断超长输入
+- 对 Ollama JS SDK 已知 Bug 做了兼容（流式异常时仍尝试使用已累积响应）
 
 ---
 
-## 3. 超时处理机制（四层超时）
+## 3. 超时处理机制
 
-Karakeep 采用 **四层嵌套超时** 设计，从外到内逐层收敛：
+Karakeep 的超时设计是**分层嵌套**的，但 OpenAI 和 Ollama 走的路径不同。
 
-### 3.1 第一层：Worker 级 Job 超时
+### 3.1 共有层：队列 Job 级超时
 
-**文件位置**: [inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L72-L76)
+[apps/workers/workers/inference/inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L72-L76)
+
+最外层是队列 Runner 级别的 Job 超时：
 
 ```typescript
 {
@@ -157,49 +168,37 @@ Karakeep 采用 **四层嵌套超时** 设计，从外到内逐层收敛：
 }
 ```
 
-由队列执行器在 Job 级别强制中止，超时后 Job 进入重试流程。
+超时后 Job 中止并进入重试流程。这一层对所有 Provider 都生效。
 
-### 3.2 第二层：AbortSignal 级联取消
+### 3.2 共有层：`AbortSignal` 级联取消（仅推理）
 
-**文件位置**: [queueing.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/queueing.ts#L34-L40)
+[packages/shared/queueing.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/queueing.ts#L34-L40)
 
-```typescript
-export interface DequeuedJob<T> {
-  id: string;
-  data: T;
-  priority: number;
-  runNumber: number;
-  abortSignal: AbortSignal;  // 由队列 Runner 注入的取消信号
-}
-```
-
-队列 Runner 将 Job 的 `abortSignal` 传递到业务代码，再层层传入推理客户端：
+队列 Runner 为每个 Job 注入 `abortSignal`，沿调用链传递：
 
 ```
-Job.abortSignal
-  └─> runOpenAI(job)
-        └─> runTagging(bookmarkId, job, inferenceClient)
-              └─> inferenceClient.inferFromText(..., { abortSignal: job.abortSignal })
-                    └─> OpenAI SDK / Ollama SDK abort
+job.abortSignal
+  └─ runOpenAI(job)
+       └─ runTagging(bookmarkId, job, inferenceClient)
+            └─ inferenceClient.inferFromText(prompt, { abortSignal })
+                 └─ OpenAI / Ollama SDK 接收 signal
 ```
 
-### 3.3 第三层：OpenAI SDK 级超时
+> **注意**：`generateEmbeddingFromText` 方法没有 `abortSignal` 参数，嵌入生成不走这一层取消。
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L174-L186)
+### 3.3 OpenAI 专属：SDK 级超时
 
-```typescript
-this.openAI = new OpenAI({
-  apiKey: config.apiKey,
-  timeout: config.timeoutSec !== undefined 
-    ? config.timeoutSec * 1000  // OPENAI_TIMEOUT_SEC（可独立配置）
-    : undefined,
-  // ...
-});
-```
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L174-L186)
 
-### 3.4 第四层：Ollama 自定义 Fetch 超时
+OpenAI SDK 在构造时设置全局超时（`OPENAI_TIMEOUT_SEC`），所有请求（包括 `chat.completions.create` 和 `embeddings.create`）都受此超时约束。
 
-**文件位置**: [customFetch.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/customFetch.ts#L1-L24)
+调用时还可额外传入 `signal`（来自 `abortSignal`），两者是**或关系**——任一触发即取消。
+
+### 3.4 Ollama 专属：`customFetch` 级超时
+
+[packages/shared/customFetch.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/customFetch.ts#L1-L24)
+
+Ollama SDK 在构造时注入 `customFetch`，每次请求都会加上 `AbortSignal.timeout()`：
 
 ```typescript
 export function createCustomFetch(fetchImpl = globalThis.fetch) {
@@ -213,75 +212,85 @@ export function createCustomFetch(fetchImpl = globalThis.fetch) {
 }
 ```
 
-Ollama SDK 在构造时注入此 `customFetch`：
+Ollama 还有一层特殊的 AbortSignal 处理：
 
-```typescript
-this.ollama = new Ollama({
-  host: config.baseUrl,
-  fetch: customFetch,
-});
-```
-
-> **注意**：Ollama 的 AbortSignal 处理还有特殊逻辑：
-
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L364-L370)
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L364-L370)
 
 ```typescript
 let newAbortSignal = undefined;
 if (optsWithDefaults.abortSignal) {
-  // 将外部传入的 signal 合并（any = 任一触发即取消）
   newAbortSignal = AbortSignal.any([optsWithDefaults.abortSignal]);
   newAbortSignal.onabort = () => {
-    this.ollama.abort();  // 显式调用 ollama.abort() 取消当前生成
+    this.ollama.abort();  // 显式调用 SDK 的 abort() 方法
   };
 }
+```
+
+将外部传入的 `abortSignal` 包装一层，触发时调用 `ollama.abort()` 取消当前流式生成。
+
+### 3.5 超时路径总览
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  队列 Job 超时 (30s)                         │
+│            (所有 Provider，所有任务类型)                     │
+└────────────────┬─────────────────────────────────────────────┘
+                 │
+                 ├─【文本/图像推理】─ AbortSignal 级联取消
+                 │                   (embedding 不走这一层)
+                 │
+                 ▼
+┌─────────────────────────────┐    ┌─────────────────────────────┐
+│    OpenAI SDK 超时          │    │  Ollama customFetch 超时    │
+│  (OPENAI_TIMEOUT_SEC)       │    │  (INFERENCE_FETCH_TIMEOUT) │
+│  所有请求(含 embedding)     │    │  所有请求(含 embedding)     │
+│                             │    │                             │
+│  + 调用级 AbortSignal       │    │  + 调用级 AbortSignal       │
+│    (仅 inferFromText/Image) │    │    → ollama.abort()        │
+│                             │    │    (仅 inferFromText/Image) │
+└─────────────────────────────┘    └─────────────────────────────┘
 ```
 
 ---
 
 ## 4. 失败兜底与重试策略
 
-### 4.1 队列级重试（Queue + numRetries）
+### 4.1 队列级重试
 
-**文件位置**: [queues.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/queues.ts#L130-L135)
+[packages/shared-server/src/queues.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/queues.ts#L130-L135)
+
+两个 AI 相关队列都配置了重试：
 
 ```typescript
+// 推理队列（打标 + 摘要）
 export const OpenAIQueue = createDeferredQueue<ZOpenAIRequest>("openai_queue", {
-  defaultJobArgs: {
-    numRetries: 3,   // 最多重试 3 次
-  },
+  defaultJobArgs: { numRetries: 3 },
+  keepFailedJobs: false,
+});
+
+// 嵌入队列
+export const EmbeddingsQueue = createDeferredQueue<ZEmbeddingsRequest>("embeddings_queue", {
+  defaultJobArgs: { numRetries: 3 },
   keepFailedJobs: false,
 });
 ```
 
-`EmbeddingsQueue` 同样配置 `numRetries: 3`。
+### 4.2 状态标记与永久失败
 
-### 4.2 错误回调与状态标记
+[apps/workers/workers/inference/inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L54-L70)
 
-**文件位置**: [inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L54-L70)
+`onError` 回调中，通过 `job.numRetriesLeft` 判断是否为最后一次重试：
 
-```typescript
-onComplete: async (job) => {
-  workerStatsCounter.labels("inference", "completed").inc();
-  await attemptMarkStatus(job.data, "success"); // 标记 bookmark 状态为 success
-},
-onError: async (job) => {
-  workerStatsCounter.labels("inference", "failed").inc();
-  if (job.numRetriesLeft == 0) {
-    // 最后一次重试也失败，永久失败
-    workerStatsCounter.labels("inference", "failed_permanent").inc();
-    await attemptMarkStatus(job?.data, "failure"); // 标记 bookmark 状态为 failure
-  }
-},
-```
+- 每次失败：`failed` 计数 +1
+- 最后一次重试也失败：`failed_permanent` 计数 +1，并将 bookmark 对应状态标记为 `"failure"`
 
-`attemptMarkStatus` 更新 `bookmarks` 表的 `taggingStatus` / `summarizationStatus` 字段。
+`attemptMarkStatus` 会更新 `bookmarks` 表的 `taggingStatus` 或 `summarizationStatus` 字段。
 
 ### 4.3 Embedding → Tagging 降级兜底
 
-**文件位置**: [embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L47-L64)
+[apps/workers/workers/embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L53-L64)
 
-这是最关键的兜底逻辑：当 Embedding 永久失败时，**仍然调度不带 embedding 的 tagging**，避免 bookmark 处于无标签状态：
+这是最关键的兜底设计：**Embedding 永久失败时，仍然调度不带向量的 Tagging，确保 bookmark 不会处于无标签状态**。
 
 ```typescript
 onError: async (job) => {
@@ -289,225 +298,219 @@ onError: async (job) => {
   if (job.numRetriesLeft == 0) {
     workerStatsCounter.labels("embeddings", "failed_permanent").inc();
     await attemptMarkEmbeddingStatus(job.data, "failure");
-    // 降级兜底：即使 embedding 永久失败，也要打标签（无相似性上下文）
+    // 降级兜底
     if (
       job.data?.type === "embed" &&
       job.data.runTaggingOnComplete !== false
     ) {
-      await enqueueTaggingFallback(job);  // ← 关键兜底逻辑
+      await enqueueTaggingFallback(job);
     }
   }
 },
 ```
 
-`enqueueTaggingFallback` 从数据库查找 bookmark 的 userId，然后提交不携带 embedding 的 tagging job：
+`enqueueTaggingFallback` 从数据库查询 bookmark 的 `userId`，然后提交一个**不携带 `embedding` 参数**的 tagging job：
 
-**文件位置**: [embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L127-L147)
+[apps/workers/workers/embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L127-L147)
 
 ```typescript
 async function enqueueTaggingFallback(job) {
   const bookmarkId = job.data?.bookmarkId;
-  // 查库获取 userId
-  const bookmark = await db.query.bookmarks.findFirst({ where: eq(bookmarks.id, bookmarkId) });
-  // 提交不带 embedding 的 tagging job
+  const bookmark = await db.query.bookmarks.findFirst({
+    where: eq(bookmarks.id, bookmarkId),
+  });
   await enqueueTagging(bookmarkId, bookmark.userId, job.priority);
+  // 注意：这里不传 embedding 参数
 }
 ```
 
-### 4.4 正常流程 vs 降级流程对比
+### 4.4 Tagging 内部：JSON 解析多层兜底
 
+[apps/workers/workers/inference/tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts#L45-L79)
+
+当 LLM 不遵守结构化输出 Schema 时，`parseJsonFromLLMResponse` 提供 4 层解析兜底：
+
+1. **直接解析**：`JSON.parse(trimmedResponse)`
+2. **Markdown 代码块提取**：用正则匹配 `\`\`\`json ... \`\`\`` 中的内容
+3. **边界匹配**：用正则 `\{[\s\S]*\}` 查找最外层 JSON 对象边界
+4. **最终重试**：再用原始响应 `JSON.parse` 一次，抛出原始错误
+
+### 4.5 Ollama 流式异常兜底
+
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L396-L416)
+
+Ollama JS SDK 存在已知 Bug：流式返回部分成功结果后仍可能抛出异常。代码通过 `try-catch` 包裹迭代，异常时保留已累积的响应：
+
+```typescript
+try {
+  for await (const part of chatCompletion) {
+    response += part.response;
+    // ... 累加 token
+  }
+} catch (e) {
+  if (e instanceof Error && e.name === "AbortError") {
+    throw e;  // AbortError 正常向上抛
+  }
+  totalTokens = NaN;  // 异常时 token 不可信，设为 NaN
+  logger.warn(`Got an exception from ollama, will still attempt to deserialize...`);
+}
 ```
-正常流程（Embedding 成功）:
-  Crawler ──> EmbeddingsQueue(embed)
-                ├─> 生成 embedding 成功
-                ├─> EmbeddingsQueue(index)    ──> 向量入库
-                └─> OpenAIQueue(tag + embedding) ──> 带相似性上下文打标签
-
-降级流程（Embedding 永久失败）:
-  Crawler ──> EmbeddingsQueue(embed)
-                ├─> 重试 3 次全部失败
-                ├─> embeddingStatus = "failure"
-                └─> enqueueTaggingFallback()
-                     └─> OpenAIQueue(tag) ──> 不带相似性上下文打标签
-```
-
-### 4.5 Tagging 内部 JSON 解析兜底
-
-**文件位置**: [tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts#L45-L79)
-
-当 LLM 不遵守结构化输出 Schema 时（即使 LLM 返回了非预期格式，`parseJsonFromLLMResponse` 提供 4 层解析兜底：
-
-1. 直接 `JSON.parse(response)
-2. 从 Markdown 代码块 ```json ... ``` 中提取
-3. 用正则查找最外层 `{...}` 边界匹配
-4. 最后尝试原始 parse 抛原始错误
 
 ---
 
-## 5. Token 计费与可观测性
+## 5. Token 统计
 
-### 5.1 Token 数据采集
+### 5.1 文本推理 Token 采集
 
-#### 文本推理 Token
+#### OpenAI 路径
 
-**OpenAI**: 直接使用 SDK 返回的 `usage.total_tokens`
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L241-L245)
 
-[inference.ts L245, L302
+直接使用 SDK 返回的 `usage.total_tokens`：
 
 ```typescript
 return { response, totalTokens: chatCompletion.usage?.total_tokens };
 ```
 
-**Ollama**: 流式逐块累加 `eval_count` + `prompt_eval_count`
+#### Ollama 路径
 
-[inference.ts L394-L405
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L394-L405)
+
+流式逐块累加 `eval_count` 和 `prompt_eval_count`：
 
 ```typescript
 let totalTokens = 0;
 for await (const part of chatCompletion) {
   response += part.response;
   if (!isNaN(part.eval_count)) {
-    totalTokens += part.eval_count;       // 生成 Token
+    totalTokens += part.eval_count;        // 生成 Token 数
   }
   if (!isNaN(part.prompt_eval_count)) {
-    totalTokens += part.prompt_eval_count; // Prompt Token
+    totalTokens += part.prompt_eval_count; // Prompt Token 数
   }
 }
 ```
 
-#### 嵌入 Token 采集
+> **注意**：若流式迭代中发生非 Abort 异常，`totalTokens` 会被设为 `NaN`。
 
-**文件位置**: [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L76-L103)
+### 5.2 嵌入 Token 采集
 
-`parseEmbeddingUsage` 兼容多种响应格式：
+[packages/shared/inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts#L76-L103)
 
-```typescript
-// 优先从 response.usage.prompt_tokens / total_tokens
-// 兜底从 response.prompt_eval_count / eval_count
-```
+`parseEmbeddingUsage` 函数兼容多种响应格式，按优先级读取：
 
-### 5.2 Token 字段与事件日志关联
+1. 优先从 `response.usage.prompt_tokens` / `response.usage.total_tokens` 读取（OpenAI 风格）
+2. 兜底从 `response.prompt_eval_count` / `response.eval_count` 读取（Ollama 风格）
 
-**文件位置**: [eventLogTypes.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/eventLogTypes.ts#L10-L27)
+两个 Provider 的 `generateEmbeddingFromText` 都调用此函数统一解析。
 
-`inferenceWorker.run` 事件类型包含完整的 Token 与计费相关字段：
+### 5.3 Token 与事件日志关联
 
-```typescript
-{
-  ["event.name"]: "inferenceWorker.run";
-  "inference.model"?: string;               // 使用的模型名
-  "inference.total_tokens"?: number;          // 总 Token 数
-  "inference.prompt.custom_count"?: number;  // 自定义 Prompt 数量
-  "inference.prompt.size"?: number;        // Prompt 字节数
-  "inference.summary.size"?: number;         // 摘要结果字节数
-  "inference.tagging.num_generated_tags"?: number;
-  "inference.tagging.num_potential_relevant_tags"?: number;
-}
-```
+[packages/shared-server/src/eventLogTypes.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/eventLogTypes.ts#L10-L27)
+
+`inferenceWorker.run` 事件包含的 Token / 计费字段：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `inference.model` | `string` | 使用的模型名 |
+| `inference.total_tokens` | `number` | 本次调用总 Token 数 |
+| `inference.prompt.custom_count` | `number` | 自定义 Prompt 数量 |
+| `inference.prompt.size` | `number` | Prompt 字节数 |
+| `inference.summary.size` | `number` | 摘要结果字节数（仅 summarize） |
+| `inference.tagging.num_generated_tags` | `number` | 生成的标签数（仅 tag） |
+| `inference.tagging.num_potential_relevant_tags` | `number` | 相似性推荐标签数（仅 tag） |
 
 `embeddingsWorker.run` 事件：
 
-```typescript
-{
-  ["event.name"]: "embeddingsWorker.run";
-  "embedding.prompt_tokens"?: number;
-  "embedding.total_tokens"?: number;
-  "embedding.text_size"?: number;
-}
-```
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `embedding.prompt_tokens` | `number` | Prompt Token 数 |
+| `embedding.total_tokens` | `number` | 总 Token 数 |
+| `embedding.text_size` | `number` | 输入文本字符数 |
 
-### 5.3 日志注入方式
+### 5.4 日志注入方式
 
-通过 `addLogFields<T>()` 渐进式填充，在执行过程中任何位置都可以追加字段：
+[packages/shared-server/src/eventLogger.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/eventLogger.ts#L211-L220)
 
-**示例（tagging.ts L399-L402
+通过 `addLogFields<T>()` 渐进式填充事件日志字段，执行过程中任意位置均可追加：
 
 ```typescript
 addLogFields<"inferenceWorker.run">({
-  "inference.tagging.num_generated_tags": tags.length,
   "inference.total_tokens": response.totalTokens,
+  "inference.tagging.num_generated_tags": tags.length,
 });
 ```
 
-最后 `withEventLog` 在函数结束时统一输出到 OTLP / Console。
-
-### 5.4 端到端链路追踪
-
-**文件位置**: [tracing.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/tracing.ts)
-
-OpenTelemetry Tracing + Event Logging 结合，实现：
-- `workerTracing wrapper 自动创建 Span
-- `setSpanAttributes` 设置属性
-- 错误自动 `recordException`
-- 与日志与 Trace 关联
+`withEventLog` wrapper 在函数结束时统一输出（OTLP 或 Console）。
 
 ---
 
 ## 6. Worker 分层架构
 
-### 6.1 整体分层图
+### 6.1 整体流水线
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      tRPC / Web API 层                           │
-│  (用户创建 bookmark → 提交 Crawler Job)                            │
-└────────────────────┬────────────────────────────────────────────┘
-                     │ enqueue
-                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   LinkCrawlerQueue / LowPriorityCrawlerQueue    │
-│                   (numRetries=5, 抓取网页内容)                     │
-└────────────────────┬────────────────────────────────────────────┘
-                     │ 抓取完成后触发
-                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   EmbeddingsQueue                        │
-│  ┌───────────────────────────────────────────────────┐     │
-│  │  type: "embed" (入口点)                     │     │
-│  │  ├─ 生成 embedding 向量                         │     │
-│  │  ├─ EmbeddingsQueue.enqueue(type: "index")    │     │
-│  │  └─ OpenAIQueue.enqueue(type: "tag" + embedding)│  │
-│  │                                              │     │
-│  │  type: "index" (向量入库，重试隔离)               │     │
-│  │  └─ vectorStoreClient.addVectors()           │     │
-│  │                                              │     │
-│  │  type: "delete"                              │     │
-│  │  └─ vectorStoreClient.deleteVectors()           │     │
-│  └───────────────────────────────────────────────────┘     │
-└────────────────────┬────────────────────────────────────┘
-                     │ 或降级 (embed 成功 / fallback
-                     ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      OpenAIQueue                          │
-│  ┌───────────────────────────────────────────────────┐     │
-│  │  type: "tag"                                   │     │
-│  │  ├─ runTagging()                            │     │
-│  │  │   ├─ inferFromText / inferFromImage       │     │
-│  │  │   ├─ parseJsonFromLLMResponse()        │     │
-│  │  │   └─ connectTags() (DB 事务)              │     │
-│  │  │       ├─ 匹配现有标签                      │     │
-│  │  │       ├─ 创建新标签                         │     │
-│  │  │       ├─ 删除旧 AI 标签                    │     │
-│  │  │       └─ 关联新标签                         │     │
-│  │  │                                             │     │
-│  │  └─ triggerSearchReindex()                    │     │
-│  │                                               │     │
-│  │  type: "summarize"                            │     │
-│  │  └─ runSummarization()                    │     │
-│  │      └─ inferFromText() → 写入 summary 字段     │     │
-│  └───────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
+用户创建 bookmark
+     │
+     ▼
+tRPC / API 层
+     │ enqueue
+     ▼
+LinkCrawlerQueue (numRetries=5)
+     │ 抓取完成后触发
+     ▼
+┌──────────────────────────────────────────────────────┐
+│  分支 1: enableAutoIndexing = true                    │
+│    EmbeddingsQueue(embed) ──┐                        │
+│    ├─ 成功 → EmbeddingsQueue(index)  [独立重试域]     │
+│    │       └─ vectorStoreClient.addVectors()         │
+│    ├─ 成功 → OpenAIQueue(tag + embedding)            │
+│    │       └─ 带相似性上下文打标签                    │
+│    └─ 永久失败 → enqueueTaggingFallback()            │
+│            └─ OpenAIQueue(tag)  [不带 embedding]     │
+│                                                       │
+│  分支 2: enableAutoIndexing = false                   │
+│    OpenAIQueue(tag)  [直接触发，不带 embedding]       │
+└──────────────────────────────────────────────────────┘
+     │
+     └─ OpenAIQueue(summarize)  ← 始终独立触发，与 embedding 无关
+          └─ 生成摘要，写入 bookmarks.summary
 ```
 
-### 6.2 Inference Worker 调度层
+> 关键点：`summarize` 任务始终由 Crawler 直接触发，不经过 Embedding Worker，与 embedding 开关无关。
 
-**文件位置**: [inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L44-L124)
+### 6.2 触发点代码核对
 
-`OpenAiWorker.build()` 负责：
-1. 构建推理客户端（`InferenceClientFactory.build()`）
-2. 校验 Job 数据（`zOpenAIRequestSchema`）
-3. 根据 `type` 分发到 `runTagging` 或 `runSummarization`
-4. 包装 tracing + event log middleware
+Crawler 完成后的触发逻辑：
+
+[apps/workers/workers/crawlerWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/crawlerWorker.ts#L2312-L2338)
+
+```typescript
+if (job.data.runInference !== false) {
+  if (serverConfig.embedding.enableAutoIndexing) {
+    // 走 embedding 路径
+    await EmbeddingsQueue.enqueue(
+      { bookmarkId, type: "embed", runTaggingOnComplete: true },
+      enqueueOpts,
+    );
+  } else {
+    // 直接触发 tagging
+    await OpenAIQueue.enqueue({ bookmarkId, type: "tag" }, enqueueOpts);
+  }
+  // summarize 始终独立触发
+  await OpenAIQueue.enqueue({ bookmarkId, type: "summarize" }, enqueueOpts);
+}
+```
+
+### 6.3 Inference Worker 调度层
+
+[apps/workers/workers/inference/inferenceWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/inferenceWorker.ts#L44-L124)
+
+`OpenAiWorker.build()` 职责：
+
+1. 创建队列 Runner，配置并发数、轮询间隔、Job 超时
+2. 包装 `withWorkerTracing` + `withWorkerEventLog` middleware
+3. `runOpenAI` 内部构建 `InferenceClientFactory.build()`，按 `type` 分发
 
 ```typescript
 run: withWorkerTracing(
@@ -516,17 +519,17 @@ run: withWorkerTracing(
 ),
 ```
 
-### 6.3 Tagging 业务层
+### 6.4 Tagging 业务层
 
-**文件位置**: [tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts#L619-L728)
+[apps/workers/workers/inference/tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts#L619-L728)
 
 `runTagging` 执行流程：
 
 ```
 1. 全局开关检查 (enableAutoTagging)
 2. 用户级开关检查 (autoTaggingEnabled)
-3. 解析用户偏好:
-   ├─ tagStyle: as-generated / curated
+3. 读取用户偏好:
+   ├─ tagStyle: "as-generated" / "curated"
    ├─ inferredTagLang: 语言
    └─ curatedTagIds: 精选标签 ID 列表
 4. 构建 Prompt 上下文:
@@ -534,58 +537,48 @@ run: withWorkerTracing(
    └─ 无 → getPotentiallyRelevantTags() 向量相似性推荐
       ├─ 有 embedding 参数 → search({vector}) 无需等待索引
       └─ 无 → findSimilar({id}) 需已索引
-5. 根据内容类型分发:
+5. 按内容类型分发:
    ├─ link/text → inferTagsFromText()
    ├─ asset:image → inferTagsFromImage()
    └─ asset:pdf → inferTagsFromPDF()
 6. parseJsonFromLLMResponse() 解析 + Zod 校验
-7. connectTags() 数据库事务（标签匹配/创建/解绑/重绑）
+7. connectTags() 数据库事务:
+   ├─ 匹配现有标签（按 normalizedName）
+   ├─ 创建不存在的新标签
+   ├─ 删除旧的 AI 标签关联
+   └─ 插入新的 AI 标签关联
 8. 触发 RuleEngine + Webhook + Search 重索引
 ```
 
-关键设计：**向量相似性推荐标签** 通过 `getPotentiallyRelevantTags` 实现 few-shot 上下文增强，使用 Meilisearch 向量搜索找到最多 10 个相似 bookmark，提取它们的标签作为 few-shot 参考。
+### 6.5 Embeddings Worker 层（重试隔离设计）
 
-### 6.4 Summarization 业务层
+[apps/workers/workers/embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L394-L498)
 
-**文件位置**: [summarize.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/summarize.ts#L47-L192)
+这是最精巧的设计——**将向量生成与向量入库解耦为两个独立 Job，各自拥有独立的重试域**：
 
-与 Tagging 类似，但输出自由文本（`schema: null`），结果直接写入 `bookmarks.summary` 字段。
+| Job 类型 | 职责 | 失败影响 |
+|---|---|---|
+| `type: "embed"` | 调用 LLM 生成 embedding 向量，然后分发 `index` 和 `tag` | 失败会触发 fallback tagging |
+| `type: "index"` | 将预生成的向量写入向量存储（Meilisearch） | 失败仅影响向量搜索，不影响 tagging |
+| `type: "delete"` | 从向量存储中删除向量 | - |
 
-### 6.5 Embeddings Worker 分层（重试隔离设计）
-
-**文件位置**: [embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts#L394-L498)
-
-这是整个 AI 流水线中最精巧的设计：**将向量生成与向量索引解耦**。
-
-```
-type: "embed" Job:
-  ├─ 生成 embedding 向量 (调用 LLM)
-  ├─ 成功 →
-  │   ├─ EmbeddingsQueue.enqueue(type: "index")  // 独立重试
-  │   └─ OpenAIQueue.enqueue(type: "tag" + embedding)  // 立即携带 embedding
-  └─ 失败 →
-      └─ enqueueTaggingFallback() // 兜底，依然打标签
-
-type: "index" Job:
-  └─ 单独负责 vectorStoreClient.addVectors()
-  └─ 即使 Meilisearch 很慢 / 挂掉，也不会影响 tagging
-```
-
-> 这样设计的好处：向量索引（通常依赖外部 Meilisearch，可能很慢）即使失败重试，也**绝不会重复触发 tagging**，避免重复消费 Token。
+> 设计收益：向量入库（通常依赖外部 Meilisearch，可能很慢）即使失败重试，也**绝不会重复触发 tagging**，避免重复消费 Token 和产生重复标签。
 
 ### 6.6 插件化的 Queue Provider
 
-**文件位置**: [plugins.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/plugins.ts)
+[packages/shared/plugins.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/plugins.ts)
 
-Queue 本身也是通过 PluginManager 插件化的：
+队列本身也是插件化的，通过 `PluginManager` 管理：
+
+[packages/shared-server/src/plugins.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/plugins.ts#L16-L43)
 
 ```typescript
-// loadAllPlugins() 加载顺序（后者优先）
+// 加载顺序（后者优先，Last one wins）
 await import("@karakeep/plugins/queue-liteque");   // 内存队列（默认）
 await import("@karakeep/plugins/queue-restate");   // Restate 分布式队列
 ```
 
-`PluginManager.getClient(PluginType.Queue)` 返回最后注册的 provider，实现队列后端可插拔。
+`PluginManager.getClient(PluginType.Queue)` 返回最后注册的 provider，实现队列后端可插拔切换。
 
 ---
 
@@ -594,46 +587,50 @@ await import("@karakeep/plugins/queue-restate");   // Restate 分布式队列
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
 | `OPENAI_API_KEY` | - | OpenAI 兼容 API Key（存在则优先使用 OpenAI Provider） |
-| `OPENAI_BASE_URL` | - | 兼容 API Base URL（可切换 Groq/Together 等） |
+| `OPENAI_BASE_URL` | - | 兼容 API Base URL（切换 Groq/Together 等） |
 | `OPENAI_PROXY_URL` | - | HTTP 代理 URL |
-| `OPENAI_TIMEOUT_SEC` | - | OpenAI SDK 级超时（秒） |
-| `OPENAI_SERVICE_TIER` | - | `auto`/`default`/`flex` |
-| `OPENAI_REASONING_EFFORT` | - | `none`~`xhigh` 推理深度 |
+| `OPENAI_TIMEOUT_SEC` | - | OpenAI SDK 级超时（秒），所有请求生效 |
+| `OPENAI_SERVICE_TIER` | - | `auto` / `default` / `flex` |
+| `OPENAI_REASONING_EFFORT` | - | `none` ~ `xhigh` 推理深度 |
 | `OLLAMA_BASE_URL` | - | Ollama 本地服务 URL（存在则次优先） |
 | `OLLAMA_KEEP_ALIVE` | - | 模型内存保活时间 |
-| `INFERENCE_JOB_TIMEOUT_SEC` | 30 | Worker 级 Job 超时（秒） |
-| `INFERENCE_FETCH_TIMEOUT_SEC` | 300 | Ollama Fetch 级超时（秒） |
-| `INFERENCE_TEXT_MODEL` | `gpt-4.1-mini` | 文本推理模型 |
-| `INFERENCE_IMAGE_MODEL` | `gpt-4o-mini` | 图像推理模型 |
-| `INFERENCE_CONTEXT_LENGTH` | 2048 | Prompt 上下文长度 |
-| `INFERENCE_MAX_OUTPUT_TOKENS` | 2048 | 最大输出 Token |
-| `INFERENCE_OUTPUT_SCHEMA` | `structured` | 输出模式 |
-| `INFERENCE_NUM_WORKERS` | 1 | 推理并发 Worker 数 |
-| `EMBEDDING_TEXT_MODEL` | `text-embedding-3-small` | 嵌入模型 |
-| `EMBEDDING_DIMENSIONS` | 1536 | 嵌入维度 |
-| `EMBEDDING_JOB_TIMEOUT_SEC` | 60 | Embedding Job 超时 |
-| `EMBEDDING_NUM_WORKERS` | 1 | Embedding Worker 数 |
+| `INFERENCE_JOB_TIMEOUT_SEC` | `30` | Worker 级 Job 超时（秒） |
+| `INFERENCE_FETCH_TIMEOUT_SEC` | `300` | Ollama Fetch 级超时（秒） |
+| `INFERENCE_TEXT_MODEL` | `"gpt-4.1-mini"` | 文本推理模型 |
+| `INFERENCE_IMAGE_MODEL` | `"gpt-4o-mini"` | 图像推理模型 |
+| `INFERENCE_CONTEXT_LENGTH` | `2048` | Prompt 上下文长度 |
+| `INFERENCE_MAX_OUTPUT_TOKENS` | `2048` | 最大输出 Token |
+| `INFERENCE_OUTPUT_SCHEMA` | `"structured"` | 输出模式 |
+| `INFERENCE_NUM_WORKERS` | `1` | 推理并发 Worker 数 |
+| `INFERENCE_ENABLE_AUTO_TAGGING` | `"true"` | 是否启用自动打标 |
+| `INFERENCE_ENABLE_AUTO_SUMMARIZATION` | `"false"` | 是否启用自动摘要 |
+| `EMBEDDING_TEXT_MODEL` | `"text-embedding-3-small"` | 嵌入模型 |
+| `EMBEDDING_DIMENSIONS` | `1536` | 嵌入维度 |
+| `EMBEDDING_ENABLE_AUTO_INDEXING` | `"false"` | 是否启用自动向量索引 |
+| `EMBEDDING_JOB_TIMEOUT_SEC` | `60` | Embedding Job 超时 |
+| `EMBEDDING_NUM_WORKERS` | `1` | Embedding Worker 数 |
 
 ---
 
-## 8. 总结：核心设计思想
+## 8. 核心设计思想总结
 
-### 8.1 关注点分离
+### 8.1 分层关注点分离
 
 | 层次 | 职责 | 关键文件 |
 |---|---|---|
-| **接口抽象层** | `InferenceClient` 统一三个能力 | [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts) |
+| **接口抽象层** | `InferenceClient` 统一三能力接口 | [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts) |
 | **Provider 实现层** | OpenAI / Ollama 差异封装 | [inference.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/inference.ts) |
 | **配置驱动层** | 环境变量 → 强类型配置 | [config.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared/config.ts) |
 | **队列调度层** | 重试 / 超时 / 并发控制 | [queues.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/queues.ts) |
-| **Worker 执行层** | 业务逻辑（打标/摘要/嵌入） | [tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts) / [summarize.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/summarize.ts) / [embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts) |
+| **Worker 执行层** | 业务逻辑（打标/摘要/嵌入） | [tagging.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/tagging.ts) · [summarize.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/inference/summarize.ts) · [embeddingsWorker.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/apps/workers/workers/embeddingsWorker.ts) |
 | **可观测性层** | Token 统计 / 链路追踪 / 事件日志 | [eventLogger.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/eventLogger.ts) + [tracing.ts](file:///d:/fz/0601-2/solo-dogfeeding/code/41-karakeep/packages/shared-server/src/tracing.ts) |
 
-### 8.2 弹性设计亮点
+### 8.2 弹性设计要点
 
-1. **四层超时** 确保无死角的超时保护（Job → AbortSignal → SDK → Fetch，每层独立可控
-2. **Embedding-Tagging 解耦** 重试互不干扰，Embedding 失败不阻断 Tagging
-3. **Index/Embed 职责拆分** 向量入库慢操作与 Tagging 生成操作的重试域隔离
-4. **相似性上下文增强** 通过向量搜索实现动态 few-shot，提升打标签质量
-5. **JSON 解析多层兜底** 对 LLM 不遵守 Schema 的场景做了充分容错
-6. **插件化 Provider** Queue/RateLimit/Search/VectorStore 全部可热插拔切换后端
+1. **分层超时**：Job 级 → AbortSignal → SDK/Fetch 级，每层独立可控，覆盖不同故障场景
+2. **Embed / Index 职责拆分**：向量生成与向量入库分属两个 Job，重试域隔离，避免慢操作拖累快速路径
+3. **Embedding → Tagging 降级**：Embedding 永久失败时自动降级为无向量 Tagging，功能不中断
+4. **JSON 解析多层兜底**：对 LLM 不遵守 Schema 的常见问题做了充分容错
+5. **Ollama 流式异常兼容**：针对已知 SDK Bug 做了 Graceful Degrade
+6. **插件化 Provider**：Queue / VectorStore / Search / RateLimit 全部可热插拔切换后端
+7. **summarize 独立触发**：与 embedding 解耦，不受 embedding 开关和失败影响
